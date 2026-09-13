@@ -7,7 +7,10 @@ license.workspace = true
 [dependencies]
 static-crypto = { path = "../static-crypto" }
 static-sphinx = { path = "../static-sphinx" }
+blake3.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+rand.workspace = true
+tracing.workspace = true
