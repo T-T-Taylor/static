@@ -17,6 +17,9 @@ pub mod swap;
 /// Lease and heartbeat protocol
 pub mod heartbeat;
 
+/// Chunk retrieval protocol
+pub mod retrieval;
+
 use static_crypto::{SymmetricKey, NonceBytes, encrypt, decrypt};
 use blake3;
 use reed_solomon_erasure::galois_8::ReedSolomon;
