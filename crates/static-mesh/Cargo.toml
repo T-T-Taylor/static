@@ -1,0 +1,13 @@
+[package]
+name = "static-mesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+static-crypto = { path = "../static-crypto" }
+static-sphinx = { path = "../static-sphinx" }
+tokio.workspace = true
+bytes.workspace = true
+serde.workspace = true
+thiserror.workspace = true

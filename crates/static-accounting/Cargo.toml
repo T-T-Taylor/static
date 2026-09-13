@@ -1,0 +1,11 @@
+[package]
+name = "static-accounting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+static-crypto = { path = "../static-crypto" }
+blake3.workspace = true
+serde.workspace = true
+thiserror.workspace = true

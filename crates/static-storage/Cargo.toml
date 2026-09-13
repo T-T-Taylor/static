@@ -1,0 +1,17 @@
+[package]
+name = "static-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+static-crypto = { path = "../static-crypto" }
+static-sphinx = { path = "../static-sphinx" }
+blake3.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+reed-solomon-erasure.workspace = true
+tokio.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
