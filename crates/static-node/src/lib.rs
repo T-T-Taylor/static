@@ -12,6 +12,9 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+/// Async node runner
+pub mod runner;
+
 use static_crypto::SymmetricKey;
 use static_mesh::{MeshState, CoverTrafficConfig};
 use static_sphinx::MixNode;
