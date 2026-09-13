@@ -14,6 +14,9 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+/// Wire protocol module
+pub mod wire;
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use rand::rngs::OsRng;

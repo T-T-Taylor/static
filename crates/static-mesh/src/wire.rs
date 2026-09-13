@@ -1,0 +1,487 @@
+//! Wire protocol for Static network messages
+//!
+//! Defines the message format for communication between Static nodes.
+//! All messages are length-prefixed and serialized as binary.
+//!
+//! Message format:
+//!   [1 byte: message type] [4 bytes: payload length] [N bytes: payload]
+//!
+//! Message types:
+//!   0x01 - Handshake (exchange node ID and public key)
+//!   0x02 - Sphinx packet (real or cover, indistinguishable)
+
+use static_sphinx::{
+    SphinxPacket, SphinxHeader, NodeId,
+    BODY_SIZE, ROUTING_INFO_SIZE, EPHEMERAL_KEY_SIZE, MAC_SIZE,
+};
+use bytes::{BufMut, BytesMut};
+
+/// Handshake message type
+pub const MSG_HANDSHAKE: u8 = 0x01;
+
+/// Sphinx packet message type
+pub const MSG_SPHINX: u8 = 0x02;
+
+/// Maximum message size (header + body + framing overhead)
+pub const MAX_MESSAGE_SIZE: usize = 1 + 4 + EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE;
+
+/// A handshake message exchanged when peers connect
+#[derive(Debug, Clone)]
+pub struct Handshake {
+    /// The sending node's ID
+    pub node_id: NodeId,
+    /// The sending node's public key (Montgomery point bytes)
+    pub public_key: [u8; 32],
+}
+
+/// A wire message
+#[derive(Debug, Clone)]
+pub enum WireMessage {
+    /// Handshake message
+    Handshake(Handshake),
+    /// Sphinx packet (real or cover, indistinguishable on the wire)
+    Sphinx(SphinxPacket),
+}
+
+/// Errors that can occur during wire protocol operations
+#[derive(Debug, thiserror::Error)]
+pub enum WireError {
+    /// Message is too large
+    #[error("message too large: {size} bytes (max {max})")]
+    MessageTooLarge {
+        /// Actual size
+        size: usize,
+        /// Maximum allowed size
+        max: usize,
+    },
+    /// Invalid message type
+    #[error("invalid message type: {0}")]
+    InvalidMessageType(u8),
+    /// Buffer too short to read
+    #[error("buffer too short: need {needed} bytes, have {have}")]
+    BufferTooShort {
+        /// Bytes needed
+        needed: usize,
+        /// Bytes available
+        have: usize,
+    },
+    /// Invalid Sphinx packet structure
+    #[error("invalid sphinx packet structure")]
+    InvalidSphinxPacket,
+    /// I/O error
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Serialize a handshake message into a bytes buffer
+fn serialize_handshake(handshake: &Handshake) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16 + 32);
+    buf.extend_from_slice(&handshake.node_id);
+    buf.extend_from_slice(&handshake.public_key);
+    buf
+}
+
+/// Deserialize a handshake message from a bytes buffer
+fn deserialize_handshake(data: &[u8]) -> Result<Handshake, WireError> {
+    if data.len() < 16 + 32 {
+        return Err(WireError::BufferTooShort {
+            needed: 48,
+            have: data.len(),
+        });
+    }
+
+    let mut node_id = [0u8; 16];
+    node_id.copy_from_slice(&data[..16]);
+
+    let mut public_key = [0u8; 32];
+    public_key.copy_from_slice(&data[16..48]);
+
+    Ok(Handshake { node_id, public_key })
+}
+
+/// Serialize a Sphinx packet into a bytes buffer
+fn serialize_sphinx(packet: &SphinxPacket) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(
+        EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE
+    );
+
+    // Ephemeral key (32 bytes)
+    buf.extend_from_slice(&packet.header.ephemeral_key);
+
+    // Routing info (fixed size)
+    buf.extend_from_slice(&packet.header.routing_info);
+
+    // MAC (16 bytes)
+    buf.extend_from_slice(&packet.header.mac);
+
+    // Body (fixed size)
+    buf.extend_from_slice(&packet.body);
+
+    buf
+}
+
+/// Deserialize a Sphinx packet from a bytes buffer
+fn deserialize_sphinx(data: &[u8]) -> Result<SphinxPacket, WireError> {
+    let expected_len = EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE;
+    if data.len() < expected_len {
+        return Err(WireError::BufferTooShort {
+            needed: expected_len,
+            have: data.len(),
+        });
+    }
+
+    let mut offset = 0;
+
+    let mut ephemeral_key = [0u8; EPHEMERAL_KEY_SIZE];
+    ephemeral_key.copy_from_slice(&data[offset..offset + EPHEMERAL_KEY_SIZE]);
+    offset += EPHEMERAL_KEY_SIZE;
+
+    let routing_info = data[offset..offset + ROUTING_INFO_SIZE].to_vec();
+    offset += ROUTING_INFO_SIZE;
+
+    let mut mac = [0u8; MAC_SIZE];
+    mac.copy_from_slice(&data[offset..offset + MAC_SIZE]);
+    offset += MAC_SIZE;
+
+    let body = data[offset..offset + BODY_SIZE].to_vec();
+
+    let header = SphinxHeader {
+        ephemeral_key,
+        routing_info,
+        mac,
+    };
+
+    Ok(SphinxPacket { header, body })
+}
+
+/// Serialize a wire message into a framed byte buffer
+///
+/// Format: [1 byte type] [4 bytes payload length] [N bytes payload]
+pub fn serialize_message(msg: &WireMessage) -> Result<Vec<u8>, WireError> {
+    let (msg_type, payload) = match msg {
+        WireMessage::Handshake(hs) => (MSG_HANDSHAKE, serialize_handshake(hs)),
+        WireMessage::Sphinx(pkt) => (MSG_SPHINX, serialize_sphinx(pkt)),
+    };
+
+    let total_len = 1 + 4 + payload.len();
+    if total_len > MAX_MESSAGE_SIZE {
+        return Err(WireError::MessageTooLarge {
+            size: total_len,
+            max: MAX_MESSAGE_SIZE,
+        });
+    }
+
+    let mut buf = Vec::with_capacity(total_len);
+    buf.push(msg_type);
+    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&payload);
+
+    Ok(buf)
+}
+
+/// Deserialize a wire message from a framed byte buffer
+///
+/// Expects the full message including type byte and length prefix.
+/// Returns the message and the number of bytes consumed.
+pub fn deserialize_message(data: &[u8]) -> Result<(WireMessage, usize), WireError> {
+    if data.len() < 5 {
+        return Err(WireError::BufferTooShort {
+            needed: 5,
+            have: data.len(),
+        });
+    }
+
+    let msg_type = data[0];
+    let payload_len = u32::from_be_bytes([
+        data[1], data[2], data[3], data[4],
+    ]) as usize;
+
+    let total_len = 5 + payload_len;
+    if data.len() < total_len {
+        return Err(WireError::BufferTooShort {
+            needed: total_len,
+            have: data.len(),
+        });
+    }
+
+    let payload = &data[5..total_len];
+
+    let message = match msg_type {
+        MSG_HANDSHAKE => {
+            WireMessage::Handshake(deserialize_handshake(payload)?)
+        }
+        MSG_SPHINX => {
+            WireMessage::Sphinx(deserialize_sphinx(payload)?)
+        }
+        _ => return Err(WireError::InvalidMessageType(msg_type)),
+    };
+
+    Ok((message, total_len))
+}
+
+/// Read a framed message from a BytesMut buffer.
+///
+/// This is used by the async transport to parse incoming data.
+/// Returns Ok(Some(message)) if a complete message is available,
+/// Ok(None) if more data is needed, or Err on protocol error.
+pub fn try_read_message(buf: &mut BytesMut) -> Result<Option<WireMessage>, WireError> {
+    if buf.len() < 5 {
+        return Ok(None);
+    }
+
+    // Peek at the length without consuming
+    let payload_len = u32::from_be_bytes([
+        buf[1], buf[2], buf[3], buf[4],
+    ]) as usize;
+
+    let total_len = 5 + payload_len;
+    if buf.len() < total_len {
+        return Ok(None);
+    }
+
+    // Extract the message bytes
+    let message_bytes = buf.split_to(total_len);
+    let (message, _) = deserialize_message(&message_bytes)?;
+
+    Ok(Some(message))
+}
+
+/// Write a framed message into a BytesMut buffer.
+///
+/// This is used by the async transport to queue outgoing messages.
+pub fn write_message(buf: &mut BytesMut, msg: &WireMessage) -> Result<(), WireError> {
+    let serialized = serialize_message(msg)?;
+    buf.put_slice(&serialized);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
+    use rand::RngCore;
+
+    fn random_node_id() -> NodeId {
+        let mut id = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut id);
+        id
+    }
+
+    fn create_test_route(n: usize) -> (Vec<MixNode>, Route) {
+        let mut nodes = Vec::with_capacity(n);
+        let mut hops = Vec::with_capacity(n);
+        for _ in 0..n {
+            let node = MixNode::new();
+            hops.push(RouteHop {
+                public_key: node.public_key,
+                node_id: node.node_id,
+            });
+            nodes.push(node);
+        }
+        let destination = random_node_id();
+        let route = Route { hops, destination };
+        (nodes, route)
+    }
+
+    #[test]
+    fn test_handshake_serialization() {
+        let hs = Handshake {
+            node_id: [0x42u8; 16],
+            public_key: [0xABu8; 32],
+        };
+
+        let serialized = serialize_handshake(&hs);
+        assert_eq!(serialized.len(), 48);
+
+        let deserialized = deserialize_handshake(&serialized).unwrap();
+        assert_eq!(deserialized.node_id, hs.node_id);
+        assert_eq!(deserialized.public_key, hs.public_key);
+    }
+
+    #[test]
+    fn test_handshake_too_short() {
+        let result = deserialize_handshake(&[0u8; 10]);
+        assert!(matches!(result, Err(WireError::BufferTooShort { .. })));
+    }
+
+    #[test]
+    fn test_sphinx_serialization_roundtrip() {
+        let (_nodes, route) = create_test_route(3);
+        let body = b"wire protocol test";
+        let packet = create_packet(&route, body).unwrap();
+
+        let serialized = serialize_sphinx(&packet);
+        let deserialized = deserialize_sphinx(&serialized).unwrap();
+
+        assert_eq!(deserialized.header.ephemeral_key, packet.header.ephemeral_key);
+        assert_eq!(deserialized.header.routing_info, packet.header.routing_info);
+        assert_eq!(deserialized.header.mac, packet.header.mac);
+        assert_eq!(deserialized.body, packet.body);
+    }
+
+    #[test]
+    fn test_sphinx_packet_still_works_after_wire() {
+        let (mut nodes, route) = create_test_route(3);
+        let body = b"end-to-end wire test";
+        let packet = create_packet(&route, body).unwrap();
+
+        // Serialize and deserialize through wire protocol
+        let serialized = serialize_sphinx(&packet);
+        let deserialized = deserialize_sphinx(&serialized).unwrap();
+
+        // Process through the mixnet - should still work
+        let result0 = process_packet(&mut nodes[0], deserialized).unwrap();
+        assert_eq!(result0.flag, static_sphinx::RoutingFlag::Forward);
+
+        let result1 = process_packet(&mut nodes[1], result0.forward_packet.unwrap()).unwrap();
+        assert_eq!(result1.flag, static_sphinx::RoutingFlag::Forward);
+
+        let result2 = process_packet(&mut nodes[2], result1.forward_packet.unwrap()).unwrap();
+        assert_eq!(result2.flag, static_sphinx::RoutingFlag::Destination);
+
+        let decrypted = result2.body.unwrap();
+        assert_eq!(&decrypted[..body.len()], body);
+    }
+
+    #[test]
+    fn test_message_serialization_handshake() {
+        let hs = Handshake {
+            node_id: [0x42u8; 16],
+            public_key: [0xABu8; 32],
+        };
+        let msg = WireMessage::Handshake(hs);
+
+        let serialized = serialize_message(&msg).unwrap();
+        assert_eq!(serialized[0], MSG_HANDSHAKE);
+
+        let (deserialized, consumed) = deserialize_message(&serialized).unwrap();
+        assert_eq!(consumed, serialized.len());
+
+        match deserialized {
+            WireMessage::Handshake(hs2) => {
+                assert_eq!(hs2.node_id, [0x42u8; 16]);
+                assert_eq!(hs2.public_key, [0xABu8; 32]);
+            }
+            _ => panic!("expected handshake"),
+        }
+    }
+
+    #[test]
+    fn test_message_serialization_sphinx() {
+        let (_nodes, route) = create_test_route(2);
+        let packet = create_packet(&route, b"sphinx wire test").unwrap();
+        let msg = WireMessage::Sphinx(packet);
+
+        let serialized = serialize_message(&msg).unwrap();
+        assert_eq!(serialized[0], MSG_SPHINX);
+
+        let (deserialized, consumed) = deserialize_message(&serialized).unwrap();
+        assert_eq!(consumed, serialized.len());
+
+        match deserialized {
+            WireMessage::Sphinx(_) => {}
+            _ => panic!("expected sphinx"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_message_type() {
+        let mut buf = vec![0xFFu8; 10];
+        buf[1..5].copy_from_slice(&5u32.to_be_bytes());
+
+        let result = deserialize_message(&buf);
+        assert!(matches!(result, Err(WireError::InvalidMessageType(0xFF))));
+    }
+
+    #[test]
+    fn test_try_read_message_partial() {
+        let hs = Handshake {
+            node_id: [0x42u8; 16],
+            public_key: [0xABu8; 32],
+        };
+        let msg = WireMessage::Handshake(hs);
+        let serialized = serialize_message(&msg).unwrap();
+
+        // Only first 3 bytes available
+        let mut buf = BytesMut::from(&serialized[..3]);
+        let result = try_read_message(&mut buf);
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn test_try_read_message_complete() {
+        let hs = Handshake {
+            node_id: [0x42u8; 16],
+            public_key: [0xABu8; 32],
+        };
+        let msg = WireMessage::Handshake(hs);
+        let serialized = serialize_message(&msg).unwrap();
+
+        let mut buf = BytesMut::from(&serialized[..]);
+        let result = try_read_message(&mut buf);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+        assert_eq!(buf.len(), 0); // Buffer should be consumed
+    }
+
+    #[test]
+    fn test_try_read_message_multiple() {
+        let hs1 = Handshake {
+            node_id: [0x01u8; 16],
+            public_key: [0x01u8; 32],
+        };
+        let hs2 = Handshake {
+            node_id: [0x02u8; 16],
+            public_key: [0x02u8; 32],
+        };
+
+        let mut buf = BytesMut::new();
+        write_message(&mut buf, &WireMessage::Handshake(hs1)).unwrap();
+        write_message(&mut buf, &WireMessage::Handshake(hs2)).unwrap();
+
+        // Read first message
+        let msg1 = try_read_message(&mut buf).unwrap().unwrap();
+        match msg1 {
+            WireMessage::Handshake(hs) => assert_eq!(hs.node_id, [0x01u8; 16]),
+            _ => panic!("expected handshake"),
+        }
+
+        // Read second message
+        let msg2 = try_read_message(&mut buf).unwrap().unwrap();
+        match msg2 {
+            WireMessage::Handshake(hs) => assert_eq!(hs.node_id, [0x02u8; 16]),
+            _ => panic!("expected handshake"),
+        }
+
+        // No more messages
+        let msg3 = try_read_message(&mut buf).unwrap();
+        assert!(msg3.is_none());
+    }
+
+    #[test]
+    fn test_write_and_read_sphinx() {
+        let (_nodes, route) = create_test_route(2);
+        let packet = create_packet(&route, b"buf test").unwrap();
+        let msg = WireMessage::Sphinx(packet);
+
+        let mut buf = BytesMut::new();
+        write_message(&mut buf, &msg).unwrap();
+
+        let read_msg = try_read_message(&mut buf).unwrap().unwrap();
+        match read_msg {
+            WireMessage::Sphinx(_) => {}
+            _ => panic!("expected sphinx"),
+        }
+    }
+
+    #[test]
+    fn test_max_message_size() {
+        // Sphinx packet should be within max message size
+        let (_nodes, route) = create_test_route(3);
+        let packet = create_packet(&route, &[0u8; BODY_SIZE]).unwrap();
+        let msg = WireMessage::Sphinx(packet);
+
+        let serialized = serialize_message(&msg).unwrap();
+        assert!(serialized.len() <= MAX_MESSAGE_SIZE);
+    }
+}
