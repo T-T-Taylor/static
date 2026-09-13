@@ -14,6 +14,9 @@
 /// Storage swap barter protocol
 pub mod swap;
 
+/// Lease and heartbeat protocol
+pub mod heartbeat;
+
 use static_crypto::{SymmetricKey, NonceBytes, encrypt, decrypt};
 use blake3;
 use reed_solomon_erasure::galois_8::ReedSolomon;
