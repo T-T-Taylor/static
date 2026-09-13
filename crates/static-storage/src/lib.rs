@@ -11,6 +11,9 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+/// Storage swap barter protocol
+pub mod swap;
+
 use static_crypto::{SymmetricKey, NonceBytes, encrypt, decrypt};
 use blake3;
 use reed_solomon_erasure::galois_8::ReedSolomon;
