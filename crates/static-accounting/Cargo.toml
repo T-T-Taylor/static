@@ -9,3 +9,4 @@ static-crypto = { path = "../static-crypto" }
 blake3.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+rand.workspace = true
