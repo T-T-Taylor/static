@@ -10,6 +10,7 @@
 //!   0x01 - Handshake (exchange node ID and public key)
 //!   0x02 - Sphinx packet (real or cover, indistinguishable)
 
+use crate::routing::PeerGossip;
 use static_sphinx::{
     SphinxPacket, SphinxHeader, NodeId,
     BODY_SIZE, ROUTING_INFO_SIZE, EPHEMERAL_KEY_SIZE, MAC_SIZE,
@@ -21,6 +22,9 @@ pub const MSG_HANDSHAKE: u8 = 0x01;
 
 /// Sphinx packet message type
 pub const MSG_SPHINX: u8 = 0x02;
+
+/// Peer gossip message type
+pub const MSG_GOSSIP: u8 = 0x03;
 
 /// Maximum message size (header + body + framing overhead)
 pub const MAX_MESSAGE_SIZE: usize = 1 + 4 + EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE;
@@ -41,6 +45,8 @@ pub enum WireMessage {
     Handshake(Handshake),
     /// Sphinx packet (real or cover, indistinguishable on the wire)
     Sphinx(SphinxPacket),
+    /// Peer gossip message (network maintenance)
+    Gossip(PeerGossip),
 }
 
 /// Errors that can occur during wire protocol operations
@@ -161,6 +167,7 @@ pub fn serialize_message(msg: &WireMessage) -> Result<Vec<u8>, WireError> {
     let (msg_type, payload) = match msg {
         WireMessage::Handshake(hs) => (MSG_HANDSHAKE, serialize_handshake(hs)),
         WireMessage::Sphinx(pkt) => (MSG_SPHINX, serialize_sphinx(pkt)),
+        WireMessage::Gossip(g) => (MSG_GOSSIP, serde_json::to_vec(g).map_err(|_| WireError::InvalidMessageType(0))?),
     };
 
     let total_len = 1 + 4 + payload.len();
@@ -213,6 +220,9 @@ pub fn deserialize_message(data: &[u8]) -> Result<(WireMessage, usize), WireErro
         MSG_SPHINX => {
             WireMessage::Sphinx(deserialize_sphinx(payload)?)
         }
+        MSG_GOSSIP => {
+            WireMessage::Gossip(serde_json::from_slice(payload).map_err(|_| WireError::InvalidMessageType(msg_type))?)
+        }
         _ => return Err(WireError::InvalidMessageType(msg_type)),
     };
 
@@ -258,7 +268,7 @@ pub fn write_message(buf: &mut BytesMut, msg: &WireMessage) -> Result<(), WireEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
+use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
     use rand::RngCore;
 
     fn random_node_id() -> NodeId {

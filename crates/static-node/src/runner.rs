@@ -14,7 +14,7 @@ use static_accounting::AccountingState;
 use static_crypto::SymmetricKey;
 use static_mesh::transport::{
     TransportState, InboundMessage, create_transport_state,
-    start_listener, connect_to_peer, get_stats,
+    start_listener, connect_to_peer, get_stats, gossip_loop,
 };
 use static_mesh::wire::WireMessage;
 use static_sphinx::{MixNode, NodeId};
@@ -116,6 +116,12 @@ impl NodeRunner {
             lease_expiration_loop(leases, chunks).await;
         });
 
+        // Start peer gossip loop
+        let transport_for_gossip = self.transport.clone();
+        tokio::spawn(async move {
+            gossip_loop(transport_for_gossip, 60).await;
+        });
+
         // Main inbound message processing loop
         info!("Node running. Processing inbound messages.");
         
@@ -142,6 +148,9 @@ impl NodeRunner {
             }
             WireMessage::Handshake(_) => {
                 // Handshakes are handled by the transport layer
+            }
+            WireMessage::Gossip(_) => {
+                // Gossip is handled by the transport layer (peers added to routing table)
             }
         }
         Ok(())

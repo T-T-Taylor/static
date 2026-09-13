@@ -12,6 +12,7 @@
 //! a cover traffic loop that sends dummy packets at a fixed rate,
 //! multiplexing real traffic in with the cover traffic.
 
+use crate::routing::{RoutingTable, KnownNode};
 use crate::wire::{
     self, WireMessage, Handshake,
     try_read_message, write_message, MAX_MESSAGE_SIZE,
@@ -73,6 +74,8 @@ pub struct TransportState {
     pub total_cover_bytes_sent: Arc<std::sync::atomic::AtomicU64>,
     /// Inbound message channel (for the node to process)
     pub inbound_tx: mpsc::Sender<InboundMessage>,
+    /// Routing table for known nodes
+    pub routing_table: Arc<RwLock<RoutingTable>>,
 }
 
 /// An inbound message from a peer
@@ -168,6 +171,13 @@ pub async fn handle_incoming_connection(
                     }
                     let _ = writer.flush().await;
 
+                    // Add to routing table
+                    state.routing_table.write().await.add_node(KnownNode {
+                        node_id: hs.node_id,
+                        public_key: hs.public_key,
+                        address: addr.to_string(),
+                    });
+
                     // Set up connection
                     let (tx, rx) = mpsc::channel::<WireMessage>(CHANNEL_BUFFER);
                     state.connections.write().await.insert(hs.node_id, tx.clone());
@@ -185,6 +195,10 @@ pub async fn handle_incoming_connection(
                 }
                 WireMessage::Sphinx(_) => {
                     warn!("Expected handshake, got Sphinx from {}", addr);
+                    return;
+                }
+                WireMessage::Gossip(_) => {
+                    warn!("Expected handshake, got Gossip from {}", addr);
                     return;
                 }
             }
@@ -231,6 +245,13 @@ pub async fn connect_to_peer(
                 WireMessage::Handshake(hs) => {
                     debug!("Handshake from {}: node_id={:02x?}", addr, hs.node_id);
                     
+                    // Add to routing table
+                    state.routing_table.write().await.add_node(KnownNode {
+                        node_id: hs.node_id,
+                        public_key: hs.public_key,
+                        address: addr.to_string(),
+                    });
+
                     let (tx, rx) = mpsc::channel::<WireMessage>(CHANNEL_BUFFER);
                     state.connections.write().await.insert(hs.node_id, tx.clone());
                     
@@ -248,6 +269,9 @@ pub async fn connect_to_peer(
                 }
                 WireMessage::Sphinx(_) => {
                     return Err(TransportError::HandshakeFailed("expected handshake".into()));
+                }
+                WireMessage::Gossip(_) => {
+                    return Err(TransportError::HandshakeFailed("expected handshake, got gossip".into()));
                 }
             }
         }
@@ -310,6 +334,12 @@ async fn handle_message(
     match msg {
         WireMessage::Handshake(_) => {
             warn!("Unexpected handshake from connected peer {:02x?}", from);
+        }
+        WireMessage::Gossip(gossip) => {
+            let new_peers = state.routing_table.write().await.process_gossip(&gossip);
+            if new_peers > 0 {
+                debug!("Added {} new peers from gossip by {:02x?}", new_peers, from);
+            }
         }
         WireMessage::Sphinx(packet) => {
             // Process the Sphinx packet through our mix node
@@ -450,6 +480,30 @@ fn generate_cover_packet(size: usize) -> Vec<u8> {
     packet
 }
 
+/// Background loop to periodically gossip known peers to connected peers
+pub async fn gossip_loop(state: Arc<TransportState>, interval_secs: u64) {
+    let mut interval = time::interval(Duration::from_secs(interval_secs));
+    
+    loop {
+        interval.tick().await;
+        
+        let table = state.routing_table.read().await;
+        let gossip = table.create_gossip(50);
+        drop(table);
+        
+        let connections = state.connections.read().await;
+        if connections.is_empty() {
+            continue;
+        }
+        
+        debug!("Gossiping {} peers to {} connected peers", gossip.peers.len(), connections.len());
+        
+        for sender in connections.values() {
+            let _ = sender.send(WireMessage::Gossip(gossip.clone())).await;
+        }
+    }
+}
+
 /// Start the TCP listener
 pub async fn start_listener(
     addr: SocketAddr,
@@ -480,6 +534,7 @@ pub fn create_transport_state(
     cover_config: crate::CoverTrafficConfig,
 ) -> (Arc<TransportState>, mpsc::Receiver<InboundMessage>) {
     let (inbound_tx, inbound_rx) = mpsc::channel(CHANNEL_BUFFER);
+    let routing_table = RoutingTable::new(node_id);
 
     let state = Arc::new(TransportState {
         node_id,
@@ -491,6 +546,7 @@ pub fn create_transport_state(
         total_real_bytes_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         total_cover_bytes_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         inbound_tx,
+        routing_table: Arc::new(RwLock::new(routing_table)),
     });
 
     (state, inbound_rx)
