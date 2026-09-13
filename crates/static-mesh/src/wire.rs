@@ -11,6 +11,7 @@
 //!   0x02 - Sphinx packet (real or cover, indistinguishable)
 
 use crate::routing::PeerGossip;
+use static_storage::swap::{SwapProposal, SwapAccept, SwapReject};
 use static_sphinx::{
     SphinxPacket, SphinxHeader, NodeId,
     BODY_SIZE, ROUTING_INFO_SIZE, EPHEMERAL_KEY_SIZE, MAC_SIZE,
@@ -25,6 +26,15 @@ pub const MSG_SPHINX: u8 = 0x02;
 
 /// Peer gossip message type
 pub const MSG_GOSSIP: u8 = 0x03;
+
+/// Swap proposal message type
+pub const MSG_SWAP_PROPOSAL: u8 = 0x04;
+
+/// Swap accept message type
+pub const MSG_SWAP_ACCEPT: u8 = 0x05;
+
+/// Swap reject message type
+pub const MSG_SWAP_REJECT: u8 = 0x06;
 
 /// Maximum message size (header + body + framing overhead)
 pub const MAX_MESSAGE_SIZE: usize = 1 + 4 + EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE;
@@ -47,6 +57,12 @@ pub enum WireMessage {
     Sphinx(SphinxPacket),
     /// Peer gossip message (network maintenance)
     Gossip(PeerGossip),
+    /// Swap proposal (storage barter negotiation)
+    SwapProposal(SwapProposal),
+    /// Swap acceptance (storage barter negotiation)
+    SwapAccept(SwapAccept),
+    /// Swap rejection (storage barter negotiation)
+    SwapReject(SwapReject),
 }
 
 /// Errors that can occur during wire protocol operations
@@ -168,6 +184,9 @@ pub fn serialize_message(msg: &WireMessage) -> Result<Vec<u8>, WireError> {
         WireMessage::Handshake(hs) => (MSG_HANDSHAKE, serialize_handshake(hs)),
         WireMessage::Sphinx(pkt) => (MSG_SPHINX, serialize_sphinx(pkt)),
         WireMessage::Gossip(g) => (MSG_GOSSIP, serde_json::to_vec(g).map_err(|_| WireError::InvalidMessageType(0))?),
+        WireMessage::SwapProposal(s) => (MSG_SWAP_PROPOSAL, serde_json::to_vec(s).map_err(|_| WireError::InvalidMessageType(0))?),
+        WireMessage::SwapAccept(s) => (MSG_SWAP_ACCEPT, serde_json::to_vec(s).map_err(|_| WireError::InvalidMessageType(0))?),
+        WireMessage::SwapReject(s) => (MSG_SWAP_REJECT, serde_json::to_vec(s).map_err(|_| WireError::InvalidMessageType(0))?),
     };
 
     let total_len = 1 + 4 + payload.len();
@@ -222,6 +241,15 @@ pub fn deserialize_message(data: &[u8]) -> Result<(WireMessage, usize), WireErro
         }
         MSG_GOSSIP => {
             WireMessage::Gossip(serde_json::from_slice(payload).map_err(|_| WireError::InvalidMessageType(msg_type))?)
+        }
+        MSG_SWAP_PROPOSAL => {
+            WireMessage::SwapProposal(serde_json::from_slice(payload).map_err(|_| WireError::InvalidMessageType(msg_type))?)
+        }
+        MSG_SWAP_ACCEPT => {
+            WireMessage::SwapAccept(serde_json::from_slice(payload).map_err(|_| WireError::InvalidMessageType(msg_type))?)
+        }
+        MSG_SWAP_REJECT => {
+            WireMessage::SwapReject(serde_json::from_slice(payload).map_err(|_| WireError::InvalidMessageType(msg_type))?)
         }
         _ => return Err(WireError::InvalidMessageType(msg_type)),
     };

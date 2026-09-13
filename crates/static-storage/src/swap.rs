@@ -46,7 +46,7 @@ fn current_timestamp() -> u64 {
 }
 
 /// A swap proposal from one node to another
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SwapProposal {
     /// The proposing node's ID
     pub from_node: NodeId,
@@ -60,7 +60,7 @@ pub struct SwapProposal {
 }
 
 /// A swap acceptance
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SwapAccept {
     /// The accepting node's ID
     pub from_node: NodeId,
@@ -75,7 +75,7 @@ pub struct SwapAccept {
 }
 
 /// A swap rejection
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SwapReject {
     /// The rejecting node's ID
     pub from_node: NodeId,
@@ -86,7 +86,7 @@ pub struct SwapReject {
 }
 
 /// Reasons for rejecting a swap
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SwapRejectReason {
     /// No storage capacity available
     NoCapacity = 0,

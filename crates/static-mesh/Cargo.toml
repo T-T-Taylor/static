@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 static-crypto = { path = "../static-crypto" }
 static-sphinx = { path = "../static-sphinx" }
+static-storage = { path = "../static-storage" }
 blake3.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt", "sync", "time"] }
 bytes.workspace = true

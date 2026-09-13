@@ -932,6 +932,7 @@ dependencies = [
  "serde_json",
  "static-crypto",
  "static-sphinx",
+ "static-storage",
  "thiserror",
  "tokio",
  "tracing",

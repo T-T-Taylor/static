@@ -152,6 +152,15 @@ impl NodeRunner {
             WireMessage::Gossip(_) => {
                 // Gossip is handled by the transport layer (peers added to routing table)
             }
+            WireMessage::SwapProposal(_) => {
+                // Swap proposals are handled by the transport layer
+            }
+            WireMessage::SwapAccept(_) => {
+                // Swap acceptances are handled by the transport layer
+            }
+            WireMessage::SwapReject(_) => {
+                // Swap rejections are handled by the transport layer
+            }
         }
         Ok(())
     }

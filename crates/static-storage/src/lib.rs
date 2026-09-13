@@ -53,7 +53,7 @@ pub type ContentId = [u8; CONTENT_ID_SIZE];
 pub type NodeId = [u8; NODE_ID_SIZE];
 
 /// An encrypted chunk with its ID
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EncryptedChunk {
     /// The chunk ID (blake3 hash of the ciphertext)
     pub id: ChunkId,
@@ -62,7 +62,7 @@ pub struct EncryptedChunk {
 }
 
 /// A lease on a chunk held by a storage node
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChunkLease {
     /// The chunk ID this lease covers
     pub chunk_id: ChunkId,

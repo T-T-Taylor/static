@@ -13,6 +13,7 @@
 //! multiplexing real traffic in with the cover traffic.
 
 use crate::routing::{RoutingTable, KnownNode};
+use static_storage::swap::{SwapState, StorageCapacity, decide_on_swap, create_swap_accept, create_swap_reject};
 use crate::wire::{
     self, WireMessage, Handshake,
     try_read_message, write_message, MAX_MESSAGE_SIZE,
@@ -76,6 +77,12 @@ pub struct TransportState {
     pub inbound_tx: mpsc::Sender<InboundMessage>,
     /// Routing table for known nodes
     pub routing_table: Arc<RwLock<RoutingTable>>,
+    /// Swap state for tracking pending and active swaps
+    pub swap_state: Arc<Mutex<SwapState>>,
+    /// Storage capacity for swap decisions
+    pub storage_capacity: Arc<Mutex<StorageCapacity>>,
+    /// Storage master key for our chunks
+    pub storage_key: Arc<Mutex<static_crypto::SymmetricKey>>,
 }
 
 /// An inbound message from a peer
@@ -201,6 +208,18 @@ pub async fn handle_incoming_connection(
                     warn!("Expected handshake, got Gossip from {}", addr);
                     return;
                 }
+                WireMessage::SwapProposal(_) => {
+                    warn!("Expected handshake, got SwapProposal from {}", addr);
+                    return;
+                }
+                WireMessage::SwapAccept(_) => {
+                    warn!("Expected handshake, got SwapAccept from {}", addr);
+                    return;
+                }
+                WireMessage::SwapReject(_) => {
+                    warn!("Expected handshake, got SwapReject from {}", addr);
+                    return;
+                }
             }
         }
     }
@@ -273,6 +292,15 @@ pub async fn connect_to_peer(
                 WireMessage::Gossip(_) => {
                     return Err(TransportError::HandshakeFailed("expected handshake, got gossip".into()));
                 }
+                WireMessage::SwapProposal(_) => {
+                    return Err(TransportError::HandshakeFailed("expected handshake, got swap proposal".into()));
+                }
+                WireMessage::SwapAccept(_) => {
+                    return Err(TransportError::HandshakeFailed("expected handshake, got swap accept".into()));
+                }
+                WireMessage::SwapReject(_) => {
+                    return Err(TransportError::HandshakeFailed("expected handshake, got swap reject".into()));
+                }
             }
         }
     }
@@ -340,6 +368,84 @@ async fn handle_message(
             if new_peers > 0 {
                 debug!("Added {} new peers from gossip by {:02x?}", new_peers, from);
             }
+        }
+        WireMessage::SwapProposal(proposal) => {
+            debug!("Received swap proposal from {:02x?} for chunk {:02x?}", from, proposal.chunk.id);
+            
+            // Validate the proposal
+            let current_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            
+            let capacity = state.storage_capacity.lock().await;
+            let result = decide_on_swap(
+                &proposal,
+                &capacity,
+                0, // peer_chunks - would track this in a real implementation
+                static_storage::CHUNK_SIZE + 16,
+                current_time,
+            );
+            drop(capacity);
+            
+            match result {
+                Ok(()) => {
+                    // Accept the swap - create a return chunk
+                    // In a real implementation, we'd select one of our chunks to offer
+                    // For now, create a dummy chunk
+                    let master_key = state.storage_key.lock().await.clone();
+                    let nonce = static_crypto::NonceBytes::random();
+                    let dummy_data = vec![0u8; 100];
+                    let return_chunk = static_storage::encrypt_chunk(
+                        &master_key, &nonce, 0, &dummy_data,
+                    ).unwrap();
+                    
+                    let proposal_id = static_storage::swap::proposal_id(&proposal);
+                    let accept = create_swap_accept(
+                        state.node_id,
+                        return_chunk,
+                        &master_key,
+                        proposal_id,
+                        86400,
+                    );
+                    
+                    // Record the swap
+                    state.swap_state.lock().await.record_swap(
+                        proposal.chunk.id,
+                        from,
+                        proposal.chunk.data.len() as u64,
+                    );
+                    
+                    // Send the acceptance back
+                    let connections = state.connections.read().await;
+                    if let Some(sender) = connections.get(&from) {
+                        let _ = sender.send(WireMessage::SwapAccept(accept)).await;
+                        debug!("Sent swap acceptance to {:02x?}", from);
+                    }
+                }
+                Err(reason) => {
+                    let proposal_id = static_storage::swap::proposal_id(&proposal);
+                    let reject = create_swap_reject(state.node_id, proposal_id, reason);
+                    
+                    let connections = state.connections.read().await;
+                    if let Some(sender) = connections.get(&from) {
+                        let _ = sender.send(WireMessage::SwapReject(reject)).await;
+                        debug!("Sent swap rejection to {:02x?}: {:?}", from, reason);
+                    }
+                }
+            }
+        }
+        WireMessage::SwapAccept(accept) => {
+            debug!("Received swap acceptance from {:02x?}", from);
+            state.swap_state.lock().await.record_swap(
+                accept.chunk.id,
+                from,
+                accept.chunk.data.len() as u64,
+            );
+        }
+        WireMessage::SwapReject(reject) => {
+            debug!("Received swap rejection from {:02x?}: {:?}", from, reject.reason);
+            state.swap_state.lock().await.rejected_swaps += 1;
         }
         WireMessage::Sphinx(packet) => {
             // Process the Sphinx packet through our mix node
@@ -535,6 +641,9 @@ pub fn create_transport_state(
 ) -> (Arc<TransportState>, mpsc::Receiver<InboundMessage>) {
     let (inbound_tx, inbound_rx) = mpsc::channel(CHANNEL_BUFFER);
     let routing_table = RoutingTable::new(node_id);
+    let swap_state = SwapState::new();
+    let storage_capacity = StorageCapacity::new(10 * 1024 * 1024 * 1024); // 10 GB default
+    let storage_key = static_crypto::SymmetricKey::random();
 
     let state = Arc::new(TransportState {
         node_id,
@@ -547,6 +656,9 @@ pub fn create_transport_state(
         total_cover_bytes_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         inbound_tx,
         routing_table: Arc::new(RwLock::new(routing_table)),
+        swap_state: Arc::new(Mutex::new(swap_state)),
+        storage_capacity: Arc::new(Mutex::new(storage_capacity)),
+        storage_key: Arc::new(Mutex::new(storage_key)),
     });
 
     (state, inbound_rx)
