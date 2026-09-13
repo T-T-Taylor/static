@@ -17,6 +17,9 @@
 /// Wire protocol module
 pub mod wire;
 
+/// Async TCP transport module
+pub mod transport;
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use rand::rngs::OsRng;

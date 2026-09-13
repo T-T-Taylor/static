@@ -8,9 +8,10 @@ license.workspace = true
 static-crypto = { path = "../static-crypto" }
 static-sphinx = { path = "../static-sphinx" }
 blake3.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt", "sync", "time"] }
 bytes.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 rand.workspace = true
 tracing.workspace = true
+futures = "0.3"
