@@ -687,3 +687,6 @@ mod tests {
         assert!(!state.peers.contains_key(&peer2));
     }
 }
+
+/// Routing table and peer discovery
+pub mod routing;
