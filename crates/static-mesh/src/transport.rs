@@ -13,6 +13,7 @@
 //! multiplexing real traffic in with the cover traffic.
 
 use crate::routing::{RoutingTable, KnownNode};
+use crate::retrieval::handle_retrieval_request;
 use static_storage::swap::{SwapState, StorageCapacity, decide_on_swap, create_swap_accept, create_swap_reject};
 use static_storage::retrieval::ChunkHolder;
 use crate::wire::{
@@ -343,6 +344,7 @@ async fn read_loop(
                 break;
             }
             Ok(n) => {
+                println!("[READ_LOOP] Read {} bytes from peer", n);
                 read_buf.extend_from_slice(&buf[..n]);
             }
             Err(e) => {
@@ -362,6 +364,7 @@ async fn handle_message(
     state: &Arc<TransportState>,
     from: NodeId,
 ) -> Result<(), TransportError> {
+    println!("[HANDLE_MSG] Received message from {:02x?}", from);
     match msg {
         WireMessage::Handshake(_) => {
             warn!("Unexpected handshake from connected peer {:02x?}", from);
@@ -458,22 +461,60 @@ async fn handle_message(
 
             match result.flag {
                 RoutingFlag::Destination => {
-                    // We are the destination - send to inbound channel
+                    // We are the destination - try to handle as chunk request
                     if let Some(body) = result.body {
-                        debug!("Received Sphinx packet (destination), body len: {}", body.len());
-                        // In a real implementation, this would be handled by
-                        // the storage/service layer. For now, just log it.
-                        let _ = state.inbound_tx.send(InboundMessage {
-                            from,
-                            message: WireMessage::Sphinx(SphinxPacket {
-                                header: static_sphinx::SphinxHeader {
-                                    ephemeral_key: [0u8; 32],
-                                    routing_info: vec![],
-                                    mac: [0u8; 16],
-                                },
-                                body,
-                            }),
-                        }).await;
+                        println!("[HANDLE_MSG] Destination reached, body len: {}", body.len());
+                        
+                        // Try to parse as a chunk request
+                        match static_storage::retrieval::deserialize_request(&body) {
+                            Ok(request) => {
+                                println!("[HANDLE_MSG] Parsed as ChunkRequest for chunk {:02x?}", request.chunk_id);
+                                
+                                // Look up the chunk in our holder
+                                let chunk_data = {
+                                    let holder = state.chunk_holder.lock().await;
+                                    holder.get_chunk(&request.chunk_id).map(|d| d.clone())
+                                };
+                                
+                                // Handle the retrieval request
+                                match handle_retrieval_request(&body, chunk_data.as_deref()) {
+                                    Ok(response_packets) => {
+                                        println!("[HANDLE_MSG] Generated {} response packets", response_packets.len());
+                                        
+                                        // Send each response packet to the first hop of the return route
+                                        let first_hop = request.return_route.hops[0].node_id;
+                                        println!("[HANDLE_MSG] Sending response to first hop: {:02x?}", first_hop);
+                                        for resp_packet in response_packets {
+                                            let connections = state.connections.read().await;
+                                            if let Some(sender) = connections.get(&first_hop) {
+                                                println!("[HANDLE_MSG] Found connection, sending packet...");
+                                                let _ = sender.send(WireMessage::Sphinx(resp_packet)).await;
+                                            } else {
+                                                println!("[HANDLE_MSG] No connection to first hop {:02x?}!", first_hop);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!("[HANDLE_MSG] Failed to handle retrieval request: {}", e);
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                println!("[HANDLE_MSG] Not a chunk request, sending to inbound channel");
+                                // Not a chunk request - send to inbound channel
+                                let _ = state.inbound_tx.send(InboundMessage {
+                                    from,
+                                    message: WireMessage::Sphinx(SphinxPacket {
+                                        header: static_sphinx::SphinxHeader {
+                                            ephemeral_key: [0u8; 32],
+                                            routing_info: vec![],
+                                            mac: [0u8; 16],
+                                        },
+                                        body,
+                                    }),
+                                }).await;
+                            }
+                        }
                     }
                 }
                 RoutingFlag::Forward => {
@@ -489,7 +530,6 @@ async fn handle_message(
                             }
                         } else {
                             warn!("No connection to next hop {:02x?}", next_hop);
-                            // In a real implementation, we'd queue this or find a route
                         }
                     }
                 }
@@ -521,6 +561,7 @@ async fn write_loop(
         tokio::select! {
             // Real message to send
             Some(msg) = rx.recv() => {
+                println!("[WRITE_LOOP] Received message to send to peer");
                 let mut buf = bytes::BytesMut::new();
                 if let Err(e) = write_message(&mut buf, &msg) {
                     warn!("Failed to serialize message to {:02x?}: {}", peer_id, e);
@@ -675,6 +716,7 @@ pub async fn send_sphinx(
     peer: NodeId,
     packet: SphinxPacket,
 ) -> Result<(), TransportError> {
+    println!("[SPHINX] Attempting to send to peer {:02x?}", peer);
     let connections = state.connections.read().await;
     let sender = connections.get(&peer)
         .ok_or(TransportError::ConnectionNotFound(peer))?;

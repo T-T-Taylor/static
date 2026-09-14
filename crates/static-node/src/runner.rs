@@ -35,8 +35,6 @@ pub struct NodeRunner {
     pub transport: Arc<TransportState>,
     /// Lease manager (protected by mutex)
     pub leases: Arc<Mutex<LeaseManager>>,
-    /// Chunk holder (protected by mutex)
-    pub chunks: Arc<Mutex<ChunkHolder>>,
     /// Swap state (protected by mutex)
     pub swaps: Arc<Mutex<SwapState>>,
     /// Storage capacity (protected by mutex)
@@ -65,7 +63,6 @@ impl NodeRunner {
         Self {
             transport,
             leases: Arc::new(Mutex::new(LeaseManager::new())),
-            chunks: Arc::new(Mutex::new(ChunkHolder::new())),
             swaps: Arc::new(Mutex::new(SwapState::new())),
             capacity: Arc::new(Mutex::new(StorageCapacity::new(config.max_storage_bytes))),
             accounting: Arc::new(Mutex::new(AccountingState::default())),
@@ -111,7 +108,7 @@ impl NodeRunner {
 
         // Start lease expiration loop
         let leases = self.leases.clone();
-        let chunks = self.chunks.clone();
+        let chunks = self.transport.chunk_holder.clone();
         tokio::spawn(async move {
             lease_expiration_loop(leases, chunks).await;
         });
@@ -179,7 +176,7 @@ impl NodeRunner {
                     Ok(request) => {
                         debug!("Received chunk request for chunk: {:02x?}", request.chunk_id);
                         
-                        let holder = self.chunks.lock().await;
+                        let holder = self.transport.chunk_holder.lock().await;
                         if let Some(response) = holder.handle_request(&request) {
                             debug!("Responding to chunk request (found: {})", response.found);
                             // In a real implementation, we'd send this response back
@@ -225,7 +222,7 @@ impl NodeRunner {
     pub async fn status(&self) -> NodeStatus {
         let transport_stats = get_stats(&self.transport).await;
         let _leases = self.leases.lock().await;
-        let chunks = self.chunks.lock().await;
+        let chunks = self.transport.chunk_holder.lock().await;
         let _swaps = self.swaps.lock().await;
         let accounting = self.accounting.lock().await;
 
@@ -267,7 +264,7 @@ impl NodeRunner {
 
         // Add chunks to our holder
         {
-            let mut holder = self.chunks.lock().await;
+            let mut holder = self.transport.chunk_holder.lock().await;
             for chunk in &chunks {
                 holder.add_chunk(chunk.id, chunk.data.clone(), content_id);
             }
@@ -291,12 +288,12 @@ impl NodeRunner {
 
         // In a real implementation, we'd send chunk requests through the mixnet
         // For now, just check if we have all chunks locally
-        let holder = self.chunks.lock().await;
+        let holder = self.transport.chunk_holder.lock().await;
         let pending_ids: Vec<ChunkId> = retriever.pending.keys().cloned().collect();
         drop(holder);
         
         for chunk_id in &pending_ids {
-            let holder = self.chunks.lock().await;
+            let holder = self.transport.chunk_holder.lock().await;
             if let Some(data) = holder.get_chunk(chunk_id) {
                 let chunk = EncryptedChunk {
                     id: *chunk_id,
@@ -405,7 +402,7 @@ mod tests {
         assert_eq!(manifest.original_size, 100);
         assert_eq!(manifest.chunk_ids.len(), 1);
 
-        let chunks = runner.chunks.lock().await;
+        let chunks = runner.transport.chunk_holder.lock().await;
         assert_eq!(chunks.chunk_count(), 1);
     }
 

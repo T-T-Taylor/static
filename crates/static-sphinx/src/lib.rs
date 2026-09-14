@@ -250,7 +250,8 @@ fn random_bytes(len: usize) -> Vec<u8> {
     bytes
 }
 
-fn random_node_id() -> NodeId {
+/// Generate a random node ID
+pub fn random_node_id() -> NodeId {
     let mut id = [0u8; NODE_ID_SIZE];
     OsRng.fill_bytes(&mut id);
     id
