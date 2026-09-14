@@ -86,7 +86,7 @@ impl DhKeypair {
 }
 
 /// A nonce for ChaCha20-Poly1305 encryption
-#[derive(Clone)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NonceBytes {
     /// The raw nonce bytes
     pub bytes: [u8; NONCE_SIZE],

@@ -21,6 +21,9 @@ pub mod heartbeat;
 /// Chunk retrieval protocol
 pub mod retrieval;
 
+/// Hidden service discovery and encrypted manifests
+pub mod hidden_service;
+
 use static_crypto::{SymmetricKey, NonceBytes, encrypt, decrypt};
 use blake3;
 use reed_solomon_erasure::galois_8::ReedSolomon;
@@ -199,6 +202,18 @@ pub enum StorageError {
     /// Content not found
     #[error("content not found")]
     ContentNotFound,
+    /// Manifest encryption failed
+    #[error("manifest encryption failed")]
+    ManifestEncryptionFailed,
+    /// Manifest decryption failed
+    #[error("manifest decryption failed")]
+    ManifestDecryptionFailed,
+    /// Manifest serialization failed
+    #[error("manifest serialization failed")]
+    ManifestSerializationFailed,
+    /// Manifest deserialization failed
+    #[error("manifest deserialization failed")]
+    ManifestDeserializationFailed,
 }
 
 // ---- Chunk encryption ----
