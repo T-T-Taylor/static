@@ -101,3 +101,16 @@
 - Nodes must prove they hold chunks without revealing content
 - ZK proof of storage (Proof of Space-Time already exists)
 - Extend to include content integrity checks
+
+## Core Architecture (Future Discussions)
+
+### 15. Compute Network & Dynamic Hidden Services
+- Current state: Static is an anonymous *storage* network. Compute stays local.
+- Goal: Allow nodes to offer both storage AND compute (for higher fees/priority).
+- Proposed mechanics:
+  - Compute requests (WASM payloads + data) routed via Sphinx mixnet.
+  - Sandbox execution (e.g., Wasmtime) on provider nodes.
+  - Results returned via Sphinx SURBs (Single-Use Reply Blocks).
+  - Compute providers earn higher accounting credit/tier.
+  - Confidentiality options: Trusted Execution Environments (TEEs) or Homomorphic Encryption if the compute provider shouldn't see the data.
+  - Routing logic for compute requests vs. storage requests.
