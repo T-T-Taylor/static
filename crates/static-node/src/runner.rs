@@ -17,7 +17,7 @@ use static_mesh::transport::{
     start_listener, connect_to_peer, get_stats, gossip_loop,
 };
 use static_mesh::wire::WireMessage;
-use static_sphinx::{MixNode, NodeId};
+use static_sphinx::{MixNode, NodeId, Route, RouteHop};
 use static_storage::{
     EncryptedChunk, ChunkId, ContentId, ContentManifest,
     heartbeat::LeaseManager,
@@ -43,6 +43,12 @@ pub struct NodeRunner {
     pub accounting: Arc<Mutex<AccountingState>>,
     /// Storage master key for this node's published content
     pub storage_keys: Arc<Mutex<HashMap<ContentId, SymmetricKey>>>,
+    /// Content retriever for assembling files from chunks
+    /// Content retriever for assembling files from chunks
+    pub content_retriever: Arc<Mutex<ContentRetriever>>,
+    /// Content retriever for tracking pending chunk retrievals
+    /// Retrieval manager for tracking pending network fragments
+    pub retriever: Arc<Mutex<static_mesh::retrieval::RetrievalManager>>,
     /// Inbound message receiver
     pub inbound_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<InboundMessage>>>,
     /// Node configuration
@@ -67,6 +73,8 @@ impl NodeRunner {
             capacity: Arc::new(Mutex::new(StorageCapacity::new(config.max_storage_bytes))),
             accounting: Arc::new(Mutex::new(AccountingState::default())),
             storage_keys: Arc::new(Mutex::new(HashMap::new())),
+            retriever: Arc::new(Mutex::new(static_mesh::retrieval::RetrievalManager::new())),
+            content_retriever: Arc::new(Mutex::new(ContentRetriever::new())),
             inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
             config,
         }
@@ -145,87 +153,29 @@ impl NodeRunner {
     async fn handle_inbound(&self, inbound: InboundMessage) -> anyhow::Result<()> {
         match inbound.message {
             WireMessage::Sphinx(packet) => {
-                // This is a decrypted Sphinx body that we are the destination for
                 debug!("Received Sphinx packet (destination) from {:02x?}", inbound.from);
                 
-                // Try to parse as a chunk request or response
-                // In a real implementation, we'd have a more sophisticated dispatch
-                self.handle_sphinx_body(&inbound.from, &packet.body).await?;
+                // Feed the fragment to the retrieval manager
+                let mut manager = self.retriever.lock().await;
+                if let Ok(Some(response)) = manager.process_fragment(&packet.body) {
+                    if response.found {
+                        let chunk = EncryptedChunk {
+                            id: response.chunk_id,
+                            data: response.chunk_data,
+                        };
+                        let mut content_retriever = self.content_retriever.lock().await;
+                        if content_retriever.record_chunk(chunk).unwrap_or(false) {
+                            debug!("Successfully retrieved chunk {:02x?}", response.chunk_id);
+                        }
+                    }
+                }
             }
-            WireMessage::Handshake(_) => {
-                // Handshakes are handled by the transport layer
-            }
-            WireMessage::Gossip(_) => {
-                // Gossip is handled by the transport layer (peers added to routing table)
-            }
-            WireMessage::SwapProposal(_) => {
-                // Swap proposals are handled by the transport layer
-            }
-            WireMessage::SwapAccept(_) => {
-                // Swap acceptances are handled by the transport layer
-            }
-            WireMessage::SwapReject(_) => {
-                // Swap rejections are handled by the transport layer
-            }
+            _ => {}
         }
         Ok(())
     }
 
     /// Handle a decrypted Sphinx body
-    async fn handle_sphinx_body(&self, _from: &NodeId, body: &[u8]) -> anyhow::Result<()> {
-        if body.is_empty() {
-            return Ok(());
-        }
-
-        // Check message type byte
-        match body[0] {
-            static_storage::retrieval::MSG_CHUNK_REQUEST => {
-                // Parse as chunk request
-                match static_storage::retrieval::deserialize_request(body) {
-                    Ok(request) => {
-                        debug!("Received chunk request for chunk: {:02x?}", request.chunk_id);
-                        
-                        let holder = self.transport.chunk_holder.lock().await;
-                        if let Some(response) = holder.handle_request(&request) {
-                            debug!("Responding to chunk request (found: {})", response.found);
-                            // In a real implementation, we'd send this response back
-                            // through the mixnet using the return_route
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to parse chunk request: {}", e);
-                    }
-                }
-            }
-            static_storage::retrieval::MSG_CHUNK_RESPONSE => {
-                // Parse as chunk response
-                match static_storage::retrieval::deserialize_response(body) {
-                    Ok(response) => {
-                        debug!("Received chunk response for chunk: {:02x?} (found: {})", 
-                               response.chunk_id, response.found);
-                        
-                        if response.found {
-                            let chunk = EncryptedChunk {
-                                id: response.chunk_id,
-                                data: response.chunk_data,
-                            };
-                            
-                            // In a real implementation, this would feed into the ContentRetriever
-                            debug!("Received chunk data ({} bytes)", chunk.data.len());
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to parse chunk response: {}", e);
-                    }
-                }
-            }
-            _ => {
-                debug!("Unknown message type: {}", body[0]);
-            }
-        }
-
-        Ok(())
-    }
 
     /// Get node status
     pub async fn status(&self) -> NodeStatus {
@@ -252,7 +202,7 @@ impl NodeRunner {
     pub async fn publish_content(
         &self,
         file_data: &[u8],
-    ) -> anyhow::Result<(ContentId, ContentManifest)> {
+    ) -> anyhow::Result<(ContentId, ContentManifest, SymmetricKey)> {
         let master_key = SymmetricKey::random();
         let nonce = static_crypto::NonceBytes::random();
 
@@ -267,7 +217,7 @@ impl NodeRunner {
         let chunk_ids: Vec<ChunkId> = manifest.chunk_ids.clone();
         self.leases.lock().await.register_owned_content(
             content_id,
-            master_key,
+            master_key.clone(),
             chunk_ids.clone(),
         );
 
@@ -283,7 +233,7 @@ impl NodeRunner {
         // chunks across the network. For now, we just hold them locally.
         info!("Published content: {:02x?} ({} chunks)", content_id, chunks.len());
 
-        Ok((content_id, manifest))
+        Ok((content_id, manifest, master_key))
     }
 
     /// Retrieve content from the network
@@ -292,31 +242,86 @@ impl NodeRunner {
         manifest: ContentManifest,
         master_key: SymmetricKey,
     ) -> anyhow::Result<Vec<u8>> {
-        let mut retriever = ContentRetriever::new();
-        retriever.start_retrieval(manifest, master_key);
+        let mut content_retriever = self.content_retriever.lock().await;
+        content_retriever.start_retrieval(manifest.clone(), master_key);
 
-        // In a real implementation, we'd send chunk requests through the mixnet
-        // For now, just check if we have all chunks locally
-        let holder = self.transport.chunk_holder.lock().await;
-        let pending_ids: Vec<ChunkId> = retriever.pending.keys().cloned().collect();
-        drop(holder);
-        
-        for chunk_id in &pending_ids {
+        // First check locally
+        {
             let holder = self.transport.chunk_holder.lock().await;
-            if let Some(data) = holder.get_chunk(chunk_id) {
-                let chunk = EncryptedChunk {
-                    id: *chunk_id,
-                    data: data.clone(),
-                };
-                drop(holder);
-                retriever.record_chunk(chunk)?;
+            let pending_ids: Vec<ChunkId> = content_retriever.pending.keys().cloned().collect();
+            drop(holder);
+            
+            for chunk_id in &pending_ids {
+                let holder = self.transport.chunk_holder.lock().await;
+                if let Some(data) = holder.get_chunk(chunk_id) {
+                    let chunk = EncryptedChunk {
+                        id: *chunk_id,
+                        data: data.clone(),
+                    };
+                    drop(holder);
+                    content_retriever.record_chunk(chunk)?;
+                }
             }
         }
 
-        if retriever.is_complete() {
-            Ok(retriever.assemble()?)
-        } else {
-            Err(anyhow::anyhow!("Not all chunks available locally"))
+        if content_retriever.is_complete() {
+            return Ok(content_retriever.assemble()?);
+        }
+        drop(content_retriever);
+
+        // For missing chunks, send requests to peers
+        let pending_ids: Vec<ChunkId> = {
+            let r = self.content_retriever.lock().await;
+            r.pending.keys().cloned().collect()
+        };
+        
+        let routing_table = self.transport.routing_table.read().await;
+        let known_nodes: Vec<static_mesh::routing::KnownNode> = routing_table.nodes.values().cloned().collect();
+        drop(routing_table);
+
+        if known_nodes.is_empty() {
+            return Err(anyhow::anyhow!("No known peers to request chunks from"));
+        }
+
+        let our_pubkey = self.transport.mix_node.lock().await.public_key;
+        let our_node_id = self.transport.node_id;
+        let return_route = Route {
+            hops: vec![RouteHop { public_key: our_pubkey, node_id: our_node_id }],
+            destination: our_node_id,
+        };
+
+        let peer = &known_nodes[0];
+        let forward_route = Route {
+            hops: vec![RouteHop { public_key: peer.public_key, node_id: peer.node_id }],
+            destination: peer.node_id,
+        };
+
+        // Register pending retrievals in the manager so handle_inbound can reassemble them
+        let mut manager = self.retriever.lock().await;
+        for chunk_id in &pending_ids {
+            manager.start_retrieval(*chunk_id);
+        }
+        drop(manager);
+
+        for chunk_id in &pending_ids {
+            let request_packet = static_mesh::retrieval::create_anonymous_request(*chunk_id, &return_route, &forward_route)?;
+            static_mesh::transport::send_sphinx(&self.transport, peer.node_id, request_packet).await?;
+        }
+
+        // Wait for the content retriever to complete
+        loop {
+            let r = self.content_retriever.lock().await;
+            if r.is_complete() {
+                let result = r.assemble()?;
+                drop(r);
+                
+                let mut r = self.content_retriever.lock().await;
+                *r = ContentRetriever::new();
+                
+                return Ok(result);
+            }
+            drop(r);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
 }

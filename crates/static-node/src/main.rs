@@ -91,7 +91,9 @@ struct ApiResponse {
     content_id: Option<String>,
     manifest: Option<static_storage::ContentManifest>,
     data: Option<String>,
+    master_key: Option<String>,
 }
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -188,9 +190,15 @@ async fn main() -> Result<()> {
             if response.status == "ok" {
                 println!("Successfully published file: {:?}", file_path);
                 println!("Content ID: {}", response.content_id.unwrap_or_default());
+                println!("Master Key: {}", response.master_key.unwrap_or_default());
                 if let Some(manifest) = response.manifest {
                     let manifest_json = serde_json::to_string_pretty(&manifest)?;
-                    let manifest_path = file_path.with_extension("manifest.json");
+                    // Append .manifest.json to the original filename
+                    let manifest_path = {
+                        let mut path = file_path.clone();
+                        path.set_extension(format!("{}.manifest.json", path.extension().unwrap_or_default().to_string_lossy().to_string()));
+                        path
+                    };
                     std::fs::write(&manifest_path, manifest_json)?;
                     println!("Manifest saved to: {:?}", manifest_path);
                 }

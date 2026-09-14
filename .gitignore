@@ -11,3 +11,8 @@ Thumbs.db
 /node-data/
 *.log
 *.db
+node*-data/
+node-data/
+secret.txt
+secret.txt.manifest.json
+retrieved.txt

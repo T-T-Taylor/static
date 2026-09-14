@@ -36,6 +36,8 @@ pub struct ApiResponse {
     pub manifest: Option<static_storage::ContentManifest>,
     /// Base64 encoded file data (for retrieve response)
     pub data: Option<String>,
+    /// Hex encoded master key (for publish response)
+    pub master_key: Option<String>,
 }
 
 /// Start the local API server
@@ -57,7 +59,7 @@ pub async fn start_api_server(runner: Arc<NodeRunner>, addr: String) -> Result<(
             let request: ApiRequest = match serde_json::from_slice(&buf[..n]) {
                 Ok(r) => r,
                 Err(e) => {
-                    let resp = ApiResponse { status: "error".into(), message: format!("Invalid request: {}", e), content_id: None, manifest: None, data: None };
+                    let resp = ApiResponse { status: "error".into(), message: format!("Invalid request: {}", e), content_id: None, manifest: None, data: None, master_key: None };
                     let _ = socket.write_all(&serde_json::to_vec(&resp).unwrap()).await;
                     return;
                 }
@@ -75,33 +77,34 @@ async fn handle_request(runner: &NodeRunner, request: ApiRequest) -> ApiResponse
             let data_b64 = request.data.unwrap_or_default();
             let data = match base64_decode(&data_b64) {
                 Ok(d) => d,
-                Err(e) => return ApiResponse { status: "error".into(), message: format!("Invalid base64: {}", e), content_id: None, manifest: None, data: None },
+                Err(e) => return ApiResponse { status: "error".into(), message: format!("Invalid base64: {}", e), content_id: None, manifest: None, data: None, master_key: None },
             };
 
             match runner.publish_content(&data).await {
-                Ok((content_id, manifest)) => {
+                Ok((content_id, manifest, master_key)) => {
                     let id_hex = hex_encode(&content_id);
-                    ApiResponse { status: "ok".into(), message: "Published".into(), content_id: Some(id_hex), manifest: Some(manifest), data: None }
+                    let key_hex = hex_encode(&master_key.bytes);
+                    ApiResponse { status: "ok".into(), message: "Published".into(), content_id: Some(id_hex), manifest: Some(manifest), data: None, master_key: Some(key_hex) }
                 }
-                Err(e) => ApiResponse { status: "error".into(), message: format!("Publish failed: {}", e), content_id: None, manifest: None, data: None },
+                Err(e) => ApiResponse { status: "error".into(), message: format!("Publish failed: {}", e), content_id: None, manifest: None, data: None, master_key: None },
             }
         }
         "retrieve" => {
             let manifest = match request.manifest {
                 Some(m) => m,
-                None => return ApiResponse { status: "error".into(), message: "Missing manifest".into(), content_id: None, manifest: None, data: None },
+                None => return ApiResponse { status: "error".into(), message: "Missing manifest".into(), content_id: None, manifest: None, data: None, master_key: None },
             };
             let key_hex = match request.master_key {
                 Some(k) => k,
-                None => return ApiResponse { status: "error".into(), message: "Missing master_key".into(), content_id: None, manifest: None, data: None },
+                None => return ApiResponse { status: "error".into(), message: "Missing master_key".into(), content_id: None, manifest: None, data: None, master_key: None },
             };
             let key_bytes = match hex_decode(&key_hex) {
                 Ok(k) => k,
-                Err(e) => return ApiResponse { status: "error".into(), message: format!("Invalid master_key: {}", e), content_id: None, manifest: None, data: None },
+                Err(e) => return ApiResponse { status: "error".into(), message: format!("Invalid master_key: {}", e), content_id: None, manifest: None, data: None, master_key: None },
             };
             
             if key_bytes.len() != 32 {
-                return ApiResponse { status: "error".into(), message: "master_key must be 32 bytes".into(), content_id: None, manifest: None, data: None };
+                return ApiResponse { status: "error".into(), message: "master_key must be 32 bytes".into(), content_id: None, manifest: None, data: None, master_key: None };
             }
             let mut key_arr = [0u8; 32];
             key_arr.copy_from_slice(&key_bytes);
@@ -110,12 +113,12 @@ async fn handle_request(runner: &NodeRunner, request: ApiRequest) -> ApiResponse
             match runner.retrieve_content(manifest, master_key).await {
                 Ok(data) => {
                     let data_b64 = base64_encode(&data);
-                    ApiResponse { status: "ok".into(), message: "Retrieved".into(), content_id: None, manifest: None, data: Some(data_b64) }
+                    ApiResponse { status: "ok".into(), message: "Retrieved".into(), content_id: None, manifest: None, data: Some(data_b64), master_key: None }
                 }
-                Err(e) => ApiResponse { status: "error".into(), message: format!("Retrieve failed: {}", e), content_id: None, manifest: None, data: None },
+                Err(e) => ApiResponse { status: "error".into(), message: format!("Retrieve failed: {}", e), content_id: None, manifest: None, data: None, master_key: None },
             }
         }
-        _ => ApiResponse { status: "error".into(), message: "Unknown action".into(), content_id: None, manifest: None, data: None },
+        _ => ApiResponse { status: "error".into(), message: "Unknown action".into(), content_id: None, manifest: None, data: None, master_key: None },
     }
 }
 
