@@ -690,3 +690,6 @@ mod tests {
 
 /// Routing table and peer discovery
 pub mod routing;
+
+/// Fragmentation layer for large messages over Sphinx
+pub mod fragment;

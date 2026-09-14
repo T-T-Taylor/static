@@ -14,12 +14,12 @@
 //! and the responder doesn't know who requested it.
 
 use crate::{
-    Route, RouteHop, SphinxHeader, SphinxPacket, SphinxError,
+    Route, SphinxHeader, SphinxPacket, SphinxError,
     NodeId, MAX_HOPS, NODE_ID_SIZE, FLAG_SIZE, MAC_SIZE, SLOT_SIZE, Mac,
     ROUTING_INFO_SIZE, BODY_SIZE,
     RoutingFlag,
     SymmetricKey, derive_hop_keys, compute_mac, xor_slot, xor_body,
-    blinding_factor, random_bytes, random_node_id, random_scalar,
+    blinding_factor, random_bytes, random_scalar,
     BASE_POINT,
 };
 use curve25519_dalek::montgomery::MontgomeryPoint;
