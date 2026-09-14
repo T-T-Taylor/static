@@ -3,6 +3,9 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+/// Single-Use Reply Blocks for anonymous responses
+pub mod surb;
+
 use static_crypto::SymmetricKey;
 use blake3;
 use curve25519_dalek::montgomery::MontgomeryPoint;
