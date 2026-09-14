@@ -14,6 +14,7 @@
 
 use crate::routing::{RoutingTable, KnownNode};
 use static_storage::swap::{SwapState, StorageCapacity, decide_on_swap, create_swap_accept, create_swap_reject};
+use static_storage::retrieval::ChunkHolder;
 use crate::wire::{
     self, WireMessage, Handshake,
     try_read_message, write_message, MAX_MESSAGE_SIZE,
@@ -83,6 +84,8 @@ pub struct TransportState {
     pub storage_capacity: Arc<Mutex<StorageCapacity>>,
     /// Storage master key for our chunks
     pub storage_key: Arc<Mutex<static_crypto::SymmetricKey>>,
+    /// Chunks this node is holding
+    pub chunk_holder: Arc<Mutex<ChunkHolder>>,
 }
 
 /// An inbound message from a peer
@@ -644,6 +647,7 @@ pub fn create_transport_state(
     let swap_state = SwapState::new();
     let storage_capacity = StorageCapacity::new(10 * 1024 * 1024 * 1024); // 10 GB default
     let storage_key = static_crypto::SymmetricKey::random();
+    let chunk_holder = ChunkHolder::new();
 
     let state = Arc::new(TransportState {
         node_id,
@@ -659,6 +663,7 @@ pub fn create_transport_state(
         swap_state: Arc::new(Mutex::new(swap_state)),
         storage_capacity: Arc::new(Mutex::new(storage_capacity)),
         storage_key: Arc::new(Mutex::new(storage_key)),
+        chunk_holder: Arc::new(Mutex::new(chunk_holder)),
     });
 
     (state, inbound_rx)

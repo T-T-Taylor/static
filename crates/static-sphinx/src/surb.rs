@@ -188,7 +188,7 @@ pub fn create_surb_batch(route: &Route, count: usize) -> Result<Vec<(Surb, SurbS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{create_packet, process_packet, MixNode};
+    use crate::{create_packet, process_packet, MixNode, RouteHop, random_node_id};
 
     fn create_route(n: usize) -> (Vec<MixNode>, Route) {
         let mut nodes = Vec::with_capacity(n);
