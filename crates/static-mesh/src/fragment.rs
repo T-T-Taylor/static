@@ -287,7 +287,7 @@ mod tests {
         let payload = b"single fragment payload";
         let fragments = fragment_payload(payload);
 
-        let reassembler = Reassembler::new();
+        let mut reassembler = Reassembler::new();
         reassembler.add_fragment(fragments[0].clone());
 
         assert!(reassembler.is_complete());
@@ -303,7 +303,7 @@ mod tests {
         let payload = vec![0x42u8; MAX_FRAGMENT_DATA * 3 + 50];
         let fragments = fragment_payload(&payload);
 
-        let reassembler = Reassembler::new();
+        let mut reassembler = Reassembler::new();
 
         for (i, fragment) in fragments.iter().enumerate() {
             reassembler.add_fragment(fragment.clone());
@@ -324,7 +324,7 @@ mod tests {
         let payload = b"test payload";
         let fragments = fragment_payload(payload);
 
-        let reassembler = Reassembler::new();
+        let mut reassembler = Reassembler::new();
         assert!(reassembler.add_fragment(fragments[0].clone()));
         assert!(!reassembler.add_fragment(fragments[0].clone())); // Duplicate
     }
@@ -334,7 +334,7 @@ mod tests {
         let payload = vec![0x42u8; MAX_FRAGMENT_DATA * 3];
         let fragments = fragment_payload(&payload);
 
-        let reassembler = Reassembler::new();
+        let mut reassembler = Reassembler::new();
 
         // Add in reverse order
         reassembler.add_fragment(fragments[2].clone());
@@ -351,7 +351,7 @@ mod tests {
         let payload = vec![0x42u8; MAX_FRAGMENT_DATA * 3];
         let fragments = fragment_payload(&payload);
 
-        let reassembler = Reassembler::new();
+        let mut reassembler = Reassembler::new();
         reassembler.add_fragment(fragments[0].clone());
         reassembler.add_fragment(fragments[2].clone()); // Skip fragment 1
 
@@ -372,7 +372,7 @@ mod tests {
         let payload = vec![0x42u8; MAX_FRAGMENT_DATA * 4];
         let fragments = fragment_payload(&payload);
 
-        let reassembler = Reassembler::new();
+        let mut reassembler = Reassembler::new();
         reassembler.add_fragment(fragments[0].clone());
         assert!((reassembler.progress() - 0.25).abs() < 0.01);
 
@@ -391,7 +391,7 @@ mod tests {
         let payload = vec![0x42u8; MAX_FRAGMENT_DATA * 2];
         let fragments = fragment_payload(&payload);
 
-        let reassembler = Reassembler::new();
+        let mut reassembler = Reassembler::new();
         assert!(reassembler.total_expected().is_none());
 
         reassembler.add_fragment(fragments[0].clone());
@@ -409,7 +409,7 @@ mod tests {
             .collect();
 
         // Deserialize and reassemble
-        let reassembler = Reassembler::new();
+        let mut reassembler = Reassembler::new();
         for s in &serialized {
             let fragment = deserialize_fragment(s).unwrap();
             reassembler.add_fragment(fragment);

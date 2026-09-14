@@ -693,3 +693,6 @@ pub mod routing;
 
 /// Fragmentation layer for large messages over Sphinx
 pub mod fragment;
+
+/// Anonymous chunk retrieval protocol
+pub mod retrieval;

@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+
 /// Storage swap barter protocol
 pub mod swap;
 
