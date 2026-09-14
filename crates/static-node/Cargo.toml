@@ -20,11 +20,4 @@ anyhow.workspace = true
 rand.workspace = true
 clap = { version = "4.0", features = ["derive"] }
 bytes.workspace = true
-
-[dev-dependencies]
-static-mesh = { path = "../static-mesh" }
-static-sphinx = { path = "../static-sphinx" }
-static-storage = { path = "../static-storage" }
-static-crypto = { path = "../static-crypto" }
-tokio = { workspace = true, features = ["full", "rt-multi-thread", "macros", "time"] }
-rand.workspace = true
+hex = "0.4"

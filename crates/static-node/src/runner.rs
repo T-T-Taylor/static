@@ -44,7 +44,7 @@ pub struct NodeRunner {
     /// Storage master key for this node's published content
     pub storage_keys: Arc<Mutex<HashMap<ContentId, SymmetricKey>>>,
     /// Inbound message receiver
-    pub inbound_rx: tokio::sync::mpsc::Receiver<InboundMessage>,
+    pub inbound_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<InboundMessage>>>,
     /// Node configuration
     pub config: NodeConfig,
 }
@@ -67,13 +67,13 @@ impl NodeRunner {
             capacity: Arc::new(Mutex::new(StorageCapacity::new(config.max_storage_bytes))),
             accounting: Arc::new(Mutex::new(AccountingState::default())),
             storage_keys: Arc::new(Mutex::new(HashMap::new())),
-            inbound_rx,
+            inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
             config,
         }
     }
 
     /// Start the node
-    pub async fn run(mut self) -> anyhow::Result<()> {
+    pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         let node_id = self.transport.node_id;
 
         info!("Starting Static node: {:02x?}", node_id);
@@ -113,6 +113,15 @@ impl NodeRunner {
             lease_expiration_loop(leases, chunks).await;
         });
 
+        // Start local API server
+        let api_addr = self.config.api_addr.clone();
+        let runner_ref = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::api::start_api_server(runner_ref, api_addr).await {
+                tracing::error!("API server error: {}", e);
+            }
+        });
+
         // Start peer gossip loop
         let transport_for_gossip = self.transport.clone();
         tokio::spawn(async move {
@@ -122,7 +131,7 @@ impl NodeRunner {
         // Main inbound message processing loop
         info!("Node running. Processing inbound messages.");
         
-        while let Some(inbound) = self.inbound_rx.recv().await {
+        while let Some(inbound) = self.inbound_rx.lock().await.recv().await {
             if let Err(e) = self.handle_inbound(inbound).await {
                 warn!("Error handling inbound message: {}", e);
             }

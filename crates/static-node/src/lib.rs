@@ -15,6 +15,9 @@
 /// Node configuration persistence
 pub mod config;
 
+/// Local API server
+pub mod api;
+
 /// Async node runner
 pub mod runner;
 
@@ -42,6 +45,8 @@ pub struct NodeConfig {
     pub listen_addr: String,
     /// Bootstrap peers to connect to
     pub bootstrap_peers: Vec<String>,
+    /// Local API listen address
+    pub api_addr: String,
     /// Maximum storage to contribute in bytes
     pub max_storage_bytes: u64,
 }
@@ -55,6 +60,7 @@ impl Default for NodeConfig {
             cover_traffic_enabled: true,
             listen_addr: "0.0.0.0:9000".to_string(),
             bootstrap_peers: vec![],
+            api_addr: "127.0.0.1:9050".to_string(),
             max_storage_bytes: 10 * 1024 * 1024 * 1024, // 10 GB
         }
     }
