@@ -2,7 +2,7 @@
 
 ## High Priority (MVP Blockers)
 
-### 1. Tiered Bandwidth Modes
+### 1. Tiered Bandwidth Modes ✅ DONE
 - Add Low (50 KB/s), Standard (500 KB/s), High (5 MB/s) modes
 - User picks tier at startup; switching requires restart (preserves deniability)
 - Higher tiers get priority in tit-for-tat accounting
