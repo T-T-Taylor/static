@@ -46,6 +46,8 @@ pub struct Handshake {
     pub node_id: NodeId,
     /// The sending node's public key (Montgomery point bytes)
     pub public_key: [u8; 32],
+    /// The sending node's bandwidth tier
+    pub tier: crate::BandwidthTier,
 }
 
 /// A wire message
@@ -97,17 +99,18 @@ pub enum WireError {
 
 /// Serialize a handshake message into a bytes buffer
 fn serialize_handshake(handshake: &Handshake) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(16 + 32);
+    let mut buf = Vec::with_capacity(16 + 32 + 1);
     buf.extend_from_slice(&handshake.node_id);
     buf.extend_from_slice(&handshake.public_key);
+    buf.push(handshake.tier as u8);
     buf
 }
 
 /// Deserialize a handshake message from a bytes buffer
 fn deserialize_handshake(data: &[u8]) -> Result<Handshake, WireError> {
-    if data.len() < 16 + 32 {
+    if data.len() < 16 + 32 + 1 {
         return Err(WireError::BufferTooShort {
-            needed: 48,
+            needed: 49,
             have: data.len(),
         });
     }
@@ -118,7 +121,14 @@ fn deserialize_handshake(data: &[u8]) -> Result<Handshake, WireError> {
     let mut public_key = [0u8; 32];
     public_key.copy_from_slice(&data[16..48]);
 
-    Ok(Handshake { node_id, public_key })
+    let tier = match data[48] {
+        0 => crate::BandwidthTier::Low,
+        1 => crate::BandwidthTier::Standard,
+        2 => crate::BandwidthTier::High,
+        _ => return Err(WireError::InvalidMessageType(data[48])), // Reusing error type for simplicity
+    };
+
+    Ok(Handshake { node_id, public_key, tier })
 }
 
 /// Serialize a Sphinx packet into a bytes buffer
@@ -326,10 +336,11 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
         let hs = Handshake {
             node_id: [0x42u8; 16],
             public_key: [0xABu8; 32],
+            tier: crate::BandwidthTier::Standard,
         };
 
         let serialized = serialize_handshake(&hs);
-        assert_eq!(serialized.len(), 48);
+        assert_eq!(serialized.len(), 49);
 
         let deserialized = deserialize_handshake(&serialized).unwrap();
         assert_eq!(deserialized.node_id, hs.node_id);
@@ -386,6 +397,7 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
         let hs = Handshake {
             node_id: [0x42u8; 16],
             public_key: [0xABu8; 32],
+            tier: crate::BandwidthTier::Standard,
         };
         let msg = WireMessage::Handshake(hs);
 
@@ -436,6 +448,7 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
         let hs = Handshake {
             node_id: [0x42u8; 16],
             public_key: [0xABu8; 32],
+            tier: crate::BandwidthTier::Standard,
         };
         let msg = WireMessage::Handshake(hs);
         let serialized = serialize_message(&msg).unwrap();
@@ -451,6 +464,7 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
         let hs = Handshake {
             node_id: [0x42u8; 16],
             public_key: [0xABu8; 32],
+            tier: crate::BandwidthTier::Standard,
         };
         let msg = WireMessage::Handshake(hs);
         let serialized = serialize_message(&msg).unwrap();
@@ -467,10 +481,12 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
         let hs1 = Handshake {
             node_id: [0x01u8; 16],
             public_key: [0x01u8; 32],
+            tier: crate::BandwidthTier::Standard,
         };
         let hs2 = Handshake {
             node_id: [0x02u8; 16],
             public_key: [0x02u8; 32],
+            tier: crate::BandwidthTier::Standard,
         };
 
         let mut buf = BytesMut::new();

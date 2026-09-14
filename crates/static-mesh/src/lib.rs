@@ -40,6 +40,34 @@ pub const DEFAULT_PEER_TIMEOUT_SECS: u64 = 300;
 /// A node ID
 pub type NodeId = [u8; NODE_ID_SIZE];
 
+/// Bandwidth tier for cover traffic and priority
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum BandwidthTier {
+    /// Low mode (50 KB/s)
+    Low = 0,
+    /// Standard mode (500 KB/s)
+    Standard = 1,
+    /// High mode (5 MB/s)
+    High = 2,
+}
+
+impl BandwidthTier {
+    /// Get the target rate in bytes per second
+    pub fn target_rate_bps(&self) -> u64 {
+        match self {
+            BandwidthTier::Low => 50 * 1024,
+            BandwidthTier::Standard => 500 * 1024,
+            BandwidthTier::High => 5 * 1024 * 1024,
+        }
+    }
+}
+
+impl Default for BandwidthTier {
+    fn default() -> Self {
+        BandwidthTier::Standard
+    }
+}
+
 /// Peer connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerState {
@@ -60,6 +88,8 @@ pub struct Peer {
     pub address: String,
     /// Connection state
     pub state: PeerState,
+    /// Bandwidth tier of this peer
+    pub tier: BandwidthTier,
     /// Last seen timestamp
     pub last_seen: Instant,
     /// Bytes sent to this peer
@@ -70,11 +100,12 @@ pub struct Peer {
 
 impl Peer {
     /// Create a new peer
-    pub fn new(node_id: NodeId, address: String) -> Self {
+    pub fn new(node_id: NodeId, address: String, tier: BandwidthTier) -> Self {
         Self {
             node_id,
             address,
             state: PeerState::Disconnected,
+            tier,
             last_seen: Instant::now(),
             bytes_sent: 0,
             bytes_received: 0,
@@ -124,6 +155,8 @@ pub struct CoverTrafficConfig {
     pub interval_ms: u64,
     /// Whether cover traffic is enabled
     pub enabled: bool,
+    /// Bandwidth tier for this node
+    pub tier: BandwidthTier,
 }
 
 impl Default for CoverTrafficConfig {
@@ -132,6 +165,7 @@ impl Default for CoverTrafficConfig {
             target_rate_bps: DEFAULT_SEND_RATE_BPS,
             interval_ms: DEFAULT_COVER_INTERVAL_MS,
             enabled: true,
+            tier: BandwidthTier::Standard,
         }
     }
 }
@@ -325,8 +359,8 @@ impl MeshState {
     }
 
     /// Add a peer
-    pub fn add_peer(&mut self, node_id: NodeId, address: String) {
-        self.peers.insert(node_id, Peer::new(node_id, address));
+    pub fn add_peer(&mut self, node_id: NodeId, address: String, tier: BandwidthTier) {
+        self.peers.insert(node_id, Peer::new(node_id, address, tier));
     }
 
     /// Remove a peer
@@ -421,7 +455,7 @@ mod tests {
     #[test]
     fn test_peer_creation() {
         let node_id = random_node_id();
-        let peer = Peer::new(node_id, "127.0.0.1:8000".to_string());
+        let peer = Peer::new(node_id, "127.0.0.1:8000".to_string(), BandwidthTier::Standard);
 
         assert_eq!(peer.node_id, node_id);
         assert_eq!(peer.address, "127.0.0.1:8000");
@@ -433,7 +467,7 @@ mod tests {
     #[test]
     fn test_peer_state_transitions() {
         let node_id = random_node_id();
-        let mut peer = Peer::new(node_id, "127.0.0.1:8000".to_string());
+        let mut peer = Peer::new(node_id, "127.0.0.1:8000".to_string(), BandwidthTier::Standard);
 
         peer.mark_connected();
         assert_eq!(peer.state, PeerState::Connected);
@@ -445,7 +479,7 @@ mod tests {
     #[test]
     fn test_peer_byte_tracking() {
         let node_id = random_node_id();
-        let mut peer = Peer::new(node_id, "127.0.0.1:8000".to_string());
+        let mut peer = Peer::new(node_id, "127.0.0.1:8000".to_string(), BandwidthTier::Standard);
 
         peer.record_sent(1000);
         peer.record_received(500);
@@ -457,7 +491,7 @@ mod tests {
     #[test]
     fn test_peer_staleness() {
         let node_id = random_node_id();
-        let mut peer = Peer::new(node_id, "127.0.0.1:8000".to_string());
+        let mut peer = Peer::new(node_id, "127.0.0.1:8000".to_string(), BandwidthTier::Standard);
 
         // Fresh peer
         assert!(!peer.is_stale(Duration::from_secs(60)));
@@ -482,6 +516,7 @@ mod tests {
             target_rate_bps: 1000, // 1 KB/s
             interval_ms: 100,      // 100ms
             enabled: true,
+            tier: BandwidthTier::Standard,
         };
         let generator = CoverTrafficGenerator::new(config);
 
@@ -495,6 +530,7 @@ mod tests {
             target_rate_bps: 1000,
             interval_ms: 100,
             enabled: true,
+        tier: BandwidthTier::Standard,
         };
         let mut generator = CoverTrafficGenerator::new(config);
 
@@ -511,6 +547,7 @@ mod tests {
             target_rate_bps: 1000,
             interval_ms: 100,
             enabled: true,
+        tier: BandwidthTier::Standard,
         };
         let mut generator = CoverTrafficGenerator::new(config);
 
@@ -531,6 +568,7 @@ mod tests {
             target_rate_bps: 1000,
             interval_ms: 100,
             enabled: true,
+        tier: BandwidthTier::Standard,
         };
         let mut generator = CoverTrafficGenerator::new(config);
 
@@ -550,6 +588,7 @@ mod tests {
             target_rate_bps: 1000,
             interval_ms: 100,
             enabled: true,
+        tier: BandwidthTier::Standard,
         };
         let mut generator = CoverTrafficGenerator::new(config);
 
@@ -570,6 +609,7 @@ mod tests {
             target_rate_bps: 1000,
             interval_ms: 100,
             enabled: true,
+        tier: BandwidthTier::Standard,
         };
         let mut generator = CoverTrafficGenerator::new(config);
 
@@ -625,7 +665,7 @@ mod tests {
         let mut state = MeshState::new();
         let peer_id = random_node_id();
 
-        state.add_peer(peer_id, "127.0.0.1:8000".to_string());
+        state.add_peer(peer_id, "127.0.0.1:8000".to_string(), BandwidthTier::Standard);
         assert_eq!(state.peer_count(), 1);
 
         state.remove_peer(&peer_id);
@@ -638,8 +678,8 @@ mod tests {
         let peer1 = random_node_id();
         let peer2 = random_node_id();
 
-        state.add_peer(peer1, "127.0.0.1:8001".to_string());
-        state.add_peer(peer2, "127.0.0.1:8002".to_string());
+        state.add_peer(peer1, "127.0.0.1:8001".to_string(), BandwidthTier::Standard);
+        state.add_peer(peer2, "127.0.0.1:8002".to_string(), BandwidthTier::Standard);
 
         // Mark peer1 as connected
         state.get_peer_mut(&peer1).unwrap().mark_connected();
@@ -655,7 +695,7 @@ mod tests {
         let mut state = MeshState::new();
         let peer_id = random_node_id();
 
-        state.add_peer(peer_id, "127.0.0.1:8000".to_string());
+        state.add_peer(peer_id, "127.0.0.1:8000".to_string(), BandwidthTier::Standard);
         state.record_sent(&peer_id, 1000);
         state.record_received(&peer_id, 500);
 
@@ -674,8 +714,8 @@ mod tests {
         let peer1 = random_node_id();
         let peer2 = random_node_id();
 
-        state.add_peer(peer1, "127.0.0.1:8001".to_string());
-        state.add_peer(peer2, "127.0.0.1:8002".to_string());
+        state.add_peer(peer1, "127.0.0.1:8001".to_string(), BandwidthTier::Standard);
+        state.add_peer(peer2, "127.0.0.1:8002".to_string(), BandwidthTier::Standard);
 
         // Make peer2 stale
         state.get_peer_mut(&peer2).unwrap().last_seen =

@@ -62,6 +62,7 @@ impl NodeRunner {
             target_rate_bps: config.cover_traffic_rate_bps,
             interval_ms: config.cover_traffic_interval_ms,
             enabled: config.cover_traffic_enabled,
+            tier: config.tier,
         };
 
         let (transport, inbound_rx) = create_transport_state(node_id, mix_node, cover_config);
@@ -411,7 +412,7 @@ mod tests {
         let runner = NodeRunner::new(config, node_id, mix_node);
         
         let file_data = vec![0x42u8; 100];
-        let (_content_id, manifest) = runner.publish_content(&file_data).await.unwrap();
+        let (_content_id, manifest, _master_key) = runner.publish_content(&file_data).await.unwrap();
 
         assert_eq!(manifest.original_size, 100);
         assert_eq!(manifest.chunk_ids.len(), 1);
@@ -429,7 +430,7 @@ mod tests {
         let runner = NodeRunner::new(config, node_id, mix_node);
         
         let file_data = vec![0x42u8; 100];
-        let (_content_id, manifest) = runner.publish_content(&file_data).await.unwrap();
+        let (_content_id, manifest, _master_key) = runner.publish_content(&file_data).await.unwrap();
 
         // Retrieve the content
         let master_key = runner.storage_keys.lock().await
@@ -448,7 +449,7 @@ mod tests {
         let runner = NodeRunner::new(config, node_id, mix_node);
         
         let file_data = vec![0x42u8; CHUNK_SIZE * 3 + 50];
-        let (_content_id, manifest) = runner.publish_content(&file_data).await.unwrap();
+        let (_content_id, manifest, _master_key) = runner.publish_content(&file_data).await.unwrap();
 
         assert_eq!(manifest.chunk_ids.len(), 4); // 3 full + 1 partial
 

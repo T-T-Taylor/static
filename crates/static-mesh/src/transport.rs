@@ -169,6 +169,7 @@ pub async fn handle_incoming_connection(
                     let our_hs = WireMessage::Handshake(Handshake {
                         node_id: state.node_id,
                         public_key: state.mix_node.lock().await.public_key,
+                        tier: state.cover_config.read().await.tier,
                     });
                     
                     let mut write_buf = bytes::BytesMut::new();
@@ -245,6 +246,7 @@ pub async fn connect_to_peer(
     let our_hs = WireMessage::Handshake(Handshake {
         node_id: state.node_id,
         public_key: state.mix_node.lock().await.public_key,
+        tier: state.cover_config.read().await.tier,
     });
 
     let mut write_buf = bytes::BytesMut::new();

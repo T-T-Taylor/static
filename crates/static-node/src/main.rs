@@ -30,6 +30,10 @@ struct Cli {
     #[arg(long)]
     no_cover: bool,
 
+    /// Bandwidth tier for cover traffic and priority (low, standard, high)
+    #[arg(long, default_value = "standard")]
+    tier: String,
+
     /// Listen address for P2P network
     #[arg(long, default_value = "0.0.0.0:9000")]
     listen: String,
@@ -101,15 +105,29 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    let tier = match cli.tier.to_lowercase().as_str() {
+        "low" => static_mesh::BandwidthTier::Low,
+        "high" => static_mesh::BandwidthTier::High,
+        _ => static_mesh::BandwidthTier::Standard,
+    };
+
+    // If tier is specified, override the cover rate with the tier default
+    let cover_rate = if cli.tier != "standard" {
+        tier.target_rate_bps()
+    } else {
+        cli.cover_rate
+    };
+
     let config = NodeConfig {
         data_dir: cli.data_dir.clone(),
-        cover_traffic_rate_bps: cli.cover_rate,
+        cover_traffic_rate_bps: cover_rate,
         cover_traffic_interval_ms: cli.cover_interval,
         cover_traffic_enabled: !cli.no_cover,
         listen_addr: cli.listen.clone(),
         api_addr: cli.api_addr.clone(),
         bootstrap_peers: cli.peer.clone(),
         max_storage_bytes: cli.max_storage,
+        tier,
         ..Default::default()
     };
 
@@ -123,6 +141,7 @@ async fn main() -> Result<()> {
             tracing::info!("Starting Static node: {:02x?}", node_id);
             tracing::info!("P2P Listen address: {}", config.listen_addr);
             tracing::info!("API Listen address: {}", config.api_addr);
+            tracing::info!("Bandwidth tier: {:?}", config.tier);
             tracing::info!("Cover traffic: {} bps", config.cover_traffic_rate_bps);
             tracing::info!("Storage contribution: {} bytes", config.max_storage_bytes);
 
@@ -148,6 +167,7 @@ async fn main() -> Result<()> {
             println!("Data directory: {:?}", config.data_dir);
             println!("P2P address: {}", config.listen_addr);
             println!("API address: {}", config.api_addr);
+            println!("Bandwidth tier: {:?}", config.tier);
             println!("Cover traffic: {}", if config.cover_traffic_enabled { "enabled" } else { "disabled" });
             println!("Cover rate: {} bps", config.cover_traffic_rate_bps);
             println!("Max storage: {} bytes", config.max_storage_bytes);

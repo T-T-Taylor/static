@@ -41,6 +41,8 @@ pub struct NodeConfig {
     pub cover_traffic_interval_ms: u64,
     /// Whether to enable cover traffic
     pub cover_traffic_enabled: bool,
+    /// Bandwidth tier for this node
+    pub tier: static_mesh::BandwidthTier,
     /// Listen address for the node
     pub listen_addr: String,
     /// Bootstrap peers to connect to
@@ -58,6 +60,7 @@ impl Default for NodeConfig {
             cover_traffic_rate_bps: 100 * 1024, // 100 KB/s
             cover_traffic_interval_ms: 100,
             cover_traffic_enabled: true,
+            tier: static_mesh::BandwidthTier::Standard,
             listen_addr: "0.0.0.0:9000".to_string(),
             bootstrap_peers: vec![],
             api_addr: "127.0.0.1:9050".to_string(),
@@ -121,6 +124,7 @@ impl StaticNode {
             target_rate_bps: self.config.cover_traffic_rate_bps,
             interval_ms: self.config.cover_traffic_interval_ms,
             enabled: self.config.cover_traffic_enabled,
+            tier: self.config.tier,
         };
         self.mesh.cover_traffic.update_config(cover_config);
 
@@ -128,7 +132,7 @@ impl StaticNode {
         for peer_addr in &self.config.bootstrap_peers {
             let mut peer_id = [0u8; 16];
             OsRng.fill_bytes(&mut peer_id);
-            self.mesh.add_peer(peer_id, peer_addr.clone());
+            self.mesh.add_peer(peer_id, peer_addr.clone(), self.config.tier);
         }
 
         tracing::info!("Static node initialized");
