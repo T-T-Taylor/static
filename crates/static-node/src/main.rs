@@ -1,13 +1,12 @@
 //! static-node - The main Static network node binary
-//!
-//! Runs the Static node: a privacy-preserving network node that
-//! participates in the Sphinx mixnet, storage swap, and cover
-//! traffic system.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use static_node::{NodeConfig, StaticNode};
+use static_node::NodeConfig;
+use static_node::runner::NodeRunner;
+use static_sphinx::MixNode;
+use static_mesh::MeshState;
 
 /// Static - A privacy network where traffic is indistinguishable from noise
 #[derive(Parser, Debug)]
@@ -37,15 +36,19 @@ struct Cli {
     #[arg(long, action = clap::ArgAction::Append)]
     peer: Vec<String>,
 
+    /// Maximum storage to contribute in bytes
+    #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024)]
+    max_storage: u64,
+
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Start the node
+    /// Start the node and connect to the network
     Start,
-    /// Show node status
+    /// Show node status (requires node to be running separately)
     Status,
     /// Generate a new node identity
     GenId,
@@ -53,7 +56,8 @@ enum Commands {
     Info,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
@@ -65,51 +69,61 @@ fn main() -> Result<()> {
         cover_traffic_enabled: !cli.no_cover,
         listen_addr: cli.listen.clone(),
         bootstrap_peers: cli.peer.clone(),
+        max_storage_bytes: cli.max_storage,
         ..Default::default()
     };
 
     match cli.command {
         Commands::Start => {
-            let mut node = StaticNode::new(config);
-            node.init()?;
-            node.start();
+            // Ensure data directory exists
+            std::fs::create_dir_all(&config.data_dir)?;
 
-            println!("Static node is running.");
-            println!("Node ID: {:02x?}", node.mesh.node_id);
-            println!("Cover traffic: {} bps", node.config.cover_traffic_rate_bps);
-            println!("Press Ctrl+C to stop.");
+            // Generate node identity (in a real implementation, this would be loaded from disk)
+            let mesh_state = MeshState::new();
+            let node_id = mesh_state.node_id;
+            let mix_node = MixNode::new();
+            
+            tracing::info!("Starting Static node: {:02x?}", node_id);
+            tracing::info!("Listen address: {}", config.listen_addr);
+            tracing::info!("Cover traffic: {} bps", config.cover_traffic_rate_bps);
+            tracing::info!("Storage contribution: {} bytes", config.max_storage_bytes);
 
-            // In a real implementation, this would start the async runtime
-            // and run the main event loop. For now, we just print status.
-            let status = node.status();
-            println!("Peers: {} known, {} connected", status.peer_count, status.connected_peers);
+            let runner = NodeRunner::new(config, node_id, mix_node);
 
-            // Keep the node running until Ctrl+C
-            // This is a placeholder - the real implementation will use
-            // tokio::signal::ctrl_c() in an async context
-            println!("\nNote: This is a scaffold. The async runtime is not yet implemented.");
-            println!("The node state is in memory but not actively networking.");
+            // Run the node in a tokio task
+            let node_handle = tokio::spawn(async move {
+                if let Err(e) = runner.run().await {
+                    tracing::error!("Node runner error: {}", e);
+                }
+            });
+
+            tracing::info!("Node running. Press Ctrl+C to stop.");
+
+            // Wait for Ctrl+C
+            tokio::signal::ctrl_c().await?;
+            
+            tracing::info!("Shutdown signal received, stopping node...");
+            node_handle.abort();
+            tracing::info!("Node stopped.");
         }
         Commands::Status => {
-            let node = StaticNode::new(config);
-            let status = node.status();
-
+            // In a real implementation, this would connect to the running node via IPC/API
+            // For now, just show what the config would be
             println!("Static Node Status");
             println!("==================");
-            println!("Running: {}", status.running);
-            println!("Node ID: {:02x?}", status.node_id);
-            println!("Peers: {} known, {} connected", status.peer_count, status.connected_peers);
-            println!("Stored chunks: {}", status.stored_chunks);
-            println!("Published content: {}", status.published_content);
-            println!("Cover traffic: {}", if status.cover_traffic_enabled { "enabled" } else { "disabled" });
-            println!("Bytes served: {}", status.total_bytes_served);
-            println!("Bytes received: {}", status.total_bytes_received);
+            println!("Data directory: {:?}", config.data_dir);
+            println!("Listen address: {}", config.listen_addr);
+            println!("Cover traffic: {}", if config.cover_traffic_enabled { "enabled" } else { "disabled" });
+            println!("Cover rate: {} bps", config.cover_traffic_rate_bps);
+            println!("Max storage: {} bytes", config.max_storage_bytes);
+            println!("Bootstrap peers: {:?}", config.bootstrap_peers);
         }
         Commands::GenId => {
-            let node = StaticNode::with_defaults();
+            let mesh_state = MeshState::new();
+            let mix_node = MixNode::new();
             println!("Generated new node identity:");
-            println!("  Node ID: {:02x?}", node.mesh.node_id);
-            println!("  Mix public key: {:02x?}", node.mix_node.public_key);
+            println!("  Node ID: {:02x?}", mesh_state.node_id);
+            println!("  Mix public key: {:02x?}", mix_node.public_key);
             println!("\nSave these to your configuration to persist identity across restarts.");
         }
         Commands::Info => {
@@ -122,7 +136,7 @@ fn main() -> Result<()> {
             println!("  - Local peer-to-peer accounting (no blockchain)");
             println!("  - Pure darknet (no clearnet exit)");
             println!();
-            println!("Status: Pre-alpha scaffold");
+            println!("Status: Pre-alpha");
             println!("Version: 0.1.0");
             println!("License: AGPL-3.0-or-later");
         }
