@@ -5,8 +5,6 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use static_node::NodeConfig;
 use static_node::runner::NodeRunner;
-use static_sphinx::MixNode;
-use static_mesh::MeshState;
 
 /// Static - A privacy network where traffic is indistinguishable from noise
 #[derive(Parser, Debug)]
@@ -78,11 +76,11 @@ async fn main() -> Result<()> {
             // Ensure data directory exists
             std::fs::create_dir_all(&config.data_dir)?;
 
-            // Generate node identity (in a real implementation, this would be loaded from disk)
-            let mesh_state = MeshState::new();
-            let node_id = mesh_state.node_id;
-            let mix_node = MixNode::new();
-            
+            // Load or create node identity
+            let persistent_config = static_node::config::PersistentConfig::load_or_create(&config.data_dir)?;
+            let node_id = persistent_config.node_id;
+            let mix_node = persistent_config.to_mix_node();
+
             tracing::info!("Starting Static node: {:02x?}", node_id);
             tracing::info!("Listen address: {}", config.listen_addr);
             tracing::info!("Cover traffic: {} bps", config.cover_traffic_rate_bps);
@@ -119,12 +117,11 @@ async fn main() -> Result<()> {
             println!("Bootstrap peers: {:?}", config.bootstrap_peers);
         }
         Commands::GenId => {
-            let mesh_state = MeshState::new();
-            let mix_node = MixNode::new();
+            let persistent_config = static_node::config::PersistentConfig::new();
             println!("Generated new node identity:");
-            println!("  Node ID: {:02x?}", mesh_state.node_id);
-            println!("  Mix public key: {:02x?}", mix_node.public_key);
-            println!("\nSave these to your configuration to persist identity across restarts.");
+            println!("  Node ID: {:02x?}", persistent_config.node_id);
+            println!("  Mix private key: {:02x?}", persistent_config.mix_private_key);
+            println!("\nRun 'static-node start' to save this to config.json and start the node.");
         }
         Commands::Info => {
             println!("Static - Privacy network where traffic is indistinguishable from noise");

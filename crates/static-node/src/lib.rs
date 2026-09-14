@@ -12,6 +12,9 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+/// Node configuration persistence
+pub mod config;
+
 /// Async node runner
 pub mod runner;
 
