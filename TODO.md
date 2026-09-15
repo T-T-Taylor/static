@@ -9,7 +9,7 @@
 - Extend CoverTrafficConfig with a `mode` enum
 - Update accounting `should_serve()` to factor in tier
 
-### 2. Content Discovery via Hidden Services
+### 2. Content Discovery via Hidden Services ✅ DONE
 - Content ID IS the hidden service address
 - Retriever builds Sphinx route to content ID, sends request
 - Node holding the chunk responds via return route
