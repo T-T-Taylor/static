@@ -71,10 +71,8 @@ enum Commands {
     },
     /// Retrieve a file from the network
     Retrieve {
-        /// Path to the JSON manifest file
-        manifest_path: PathBuf,
-        /// Hex-encoded master key
-        master_key: String,
+        /// Hex-encoded content public key
+        content_pub_key: String,
         /// Path to save the retrieved file
         output_path: PathBuf,
     },
@@ -84,8 +82,7 @@ enum Commands {
 struct ApiRequest {
     action: String,
     data: Option<String>,
-    manifest: Option<static_storage::ContentManifest>,
-    master_key: Option<String>,
+    content_pub_key: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -95,7 +92,7 @@ struct ApiResponse {
     content_id: Option<String>,
     manifest: Option<static_storage::ContentManifest>,
     data: Option<String>,
-    master_key: Option<String>,
+    content_pub_key: Option<String>,
 }
 
 
@@ -201,8 +198,7 @@ async fn main() -> Result<()> {
             let request = ApiRequest {
                 action: "publish".into(),
                 data: Some(data_hex),
-                manifest: None,
-                master_key: None,
+                content_pub_key: None,
             };
             
             let response = send_api_request(&config.api_addr, &request).await?;
@@ -210,7 +206,7 @@ async fn main() -> Result<()> {
             if response.status == "ok" {
                 println!("Successfully published file: {:?}", file_path);
                 println!("Content ID: {}", response.content_id.unwrap_or_default());
-                println!("Master Key: {}", response.master_key.unwrap_or_default());
+                println!("Content Public Key: {}", response.content_pub_key.unwrap_or_default());
                 if let Some(manifest) = response.manifest {
                     let manifest_json = serde_json::to_string_pretty(&manifest)?;
                     // Append .manifest.json to the original filename
@@ -226,15 +222,11 @@ async fn main() -> Result<()> {
                 eprintln!("Publish failed: {}", response.message);
             }
         }
-        Commands::Retrieve { manifest_path, master_key, output_path } => {
-            let manifest_json = std::fs::read_to_string(&manifest_path)?;
-            let manifest: static_storage::ContentManifest = serde_json::from_str(&manifest_json)?;
-            
+        Commands::Retrieve { content_pub_key, output_path } => {
             let request = ApiRequest {
                 action: "retrieve".into(),
                 data: None,
-                manifest: Some(manifest),
-                master_key: Some(master_key),
+                content_pub_key: Some(content_pub_key),
             };
             
             let response = send_api_request(&config.api_addr, &request).await?;

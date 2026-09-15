@@ -17,10 +17,8 @@ pub struct ApiRequest {
     pub action: String,
     /// Base64 encoded file data (for publish)
     pub data: Option<String>,
-    /// Content manifest (for retrieve)
-    pub manifest: Option<static_storage::ContentManifest>,
-    /// Hex encoded master key (for retrieve)
-    pub master_key: Option<String>,
+    /// Hex encoded content public key (for retrieve)
+    pub content_pub_key: Option<String>,
 }
 
 /// A response from the local API
@@ -36,8 +34,8 @@ pub struct ApiResponse {
     pub manifest: Option<static_storage::ContentManifest>,
     /// Base64 encoded file data (for retrieve response)
     pub data: Option<String>,
-    /// Hex encoded master key (for publish response)
-    pub master_key: Option<String>,
+    /// Hex encoded content public key (for publish response)
+    pub content_pub_key: Option<String>,
 }
 
 /// Start the local API server
@@ -59,7 +57,7 @@ pub async fn start_api_server(runner: Arc<NodeRunner>, addr: String) -> Result<(
             let request: ApiRequest = match serde_json::from_slice(&buf[..n]) {
                 Ok(r) => r,
                 Err(e) => {
-                    let resp = ApiResponse { status: "error".into(), message: format!("Invalid request: {}", e), content_id: None, manifest: None, data: None, master_key: None };
+                    let resp = ApiResponse { status: "error".into(), message: format!("Invalid request: {}", e), content_id: None, manifest: None, data: None, content_pub_key: None };
                     let _ = socket.write_all(&serde_json::to_vec(&resp).unwrap()).await;
                     return;
                 }
@@ -77,48 +75,43 @@ async fn handle_request(runner: &NodeRunner, request: ApiRequest) -> ApiResponse
             let data_b64 = request.data.unwrap_or_default();
             let data = match base64_decode(&data_b64) {
                 Ok(d) => d,
-                Err(e) => return ApiResponse { status: "error".into(), message: format!("Invalid base64: {}", e), content_id: None, manifest: None, data: None, master_key: None },
+                Err(e) => return ApiResponse { status: "error".into(), message: format!("Invalid base64: {}", e), content_id: None, manifest: None, data: None, content_pub_key: None },
             };
 
             match runner.publish_content(&data).await {
-                Ok((content_id, manifest, master_key)) => {
+                Ok((content_id, manifest, content_pub_key)) => {
                     let id_hex = hex_encode(&content_id);
-                    let key_hex = hex_encode(&master_key.bytes);
-                    ApiResponse { status: "ok".into(), message: "Published".into(), content_id: Some(id_hex), manifest: Some(manifest), data: None, master_key: Some(key_hex) }
+                    let key_hex = hex_encode(&content_pub_key);
+                    ApiResponse { status: "ok".into(), message: "Published".into(), content_id: Some(id_hex), manifest: Some(manifest), data: None, content_pub_key: Some(key_hex) }
                 }
-                Err(e) => ApiResponse { status: "error".into(), message: format!("Publish failed: {}", e), content_id: None, manifest: None, data: None, master_key: None },
+                Err(e) => ApiResponse { status: "error".into(), message: format!("Publish failed: {}", e), content_id: None, manifest: None, data: None, content_pub_key: None },
             }
         }
         "retrieve" => {
-            let manifest = match request.manifest {
-                Some(m) => m,
-                None => return ApiResponse { status: "error".into(), message: "Missing manifest".into(), content_id: None, manifest: None, data: None, master_key: None },
-            };
-            let key_hex = match request.master_key {
+            let key_hex = match request.content_pub_key {
                 Some(k) => k,
-                None => return ApiResponse { status: "error".into(), message: "Missing master_key".into(), content_id: None, manifest: None, data: None, master_key: None },
+                None => return ApiResponse { status: "error".into(), message: "Missing content_pub_key".into(), content_id: None, manifest: None, data: None, content_pub_key: None },
             };
             let key_bytes = match hex_decode(&key_hex) {
                 Ok(k) => k,
-                Err(e) => return ApiResponse { status: "error".into(), message: format!("Invalid master_key: {}", e), content_id: None, manifest: None, data: None, master_key: None },
+                Err(e) => return ApiResponse { status: "error".into(), message: format!("Invalid content_pub_key: {}", e), content_id: None, manifest: None, data: None, content_pub_key: None },
             };
             
             if key_bytes.len() != 32 {
-                return ApiResponse { status: "error".into(), message: "master_key must be 32 bytes".into(), content_id: None, manifest: None, data: None, master_key: None };
+                return ApiResponse { status: "error".into(), message: "content_pub_key must be 32 bytes".into(), content_id: None, manifest: None, data: None, content_pub_key: None };
             }
             let mut key_arr = [0u8; 32];
             key_arr.copy_from_slice(&key_bytes);
-            let master_key = static_crypto::SymmetricKey::from_bytes(key_arr);
 
-            match runner.retrieve_content(manifest, master_key).await {
+            match runner.retrieve_content(&key_arr).await {
                 Ok(data) => {
                     let data_b64 = base64_encode(&data);
-                    ApiResponse { status: "ok".into(), message: "Retrieved".into(), content_id: None, manifest: None, data: Some(data_b64), master_key: None }
+                    ApiResponse { status: "ok".into(), message: "Retrieved".into(), content_id: None, manifest: None, data: Some(data_b64), content_pub_key: None }
                 }
-                Err(e) => ApiResponse { status: "error".into(), message: format!("Retrieve failed: {}", e), content_id: None, manifest: None, data: None, master_key: None },
+                Err(e) => ApiResponse { status: "error".into(), message: format!("Retrieve failed: {}", e), content_id: None, manifest: None, data: None, content_pub_key: None },
             }
         }
-        _ => ApiResponse { status: "error".into(), message: "Unknown action".into(), content_id: None, manifest: None, data: None, master_key: None },
+        _ => ApiResponse { status: "error".into(), message: "Unknown action".into(), content_id: None, manifest: None, data: None, content_pub_key: None },
     }
 }
 

@@ -26,7 +26,7 @@ pub const MSG_CHUNK_REQUEST: u8 = 0x01;
 pub const MSG_CHUNK_RESPONSE: u8 = 0x02;
 
 /// A chunk request sent through the mixnet
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChunkRequest {
     /// The chunk ID being requested
     pub chunk_id: ChunkId,
@@ -36,7 +36,7 @@ pub struct ChunkRequest {
 }
 
 /// A chunk response sent through the mixnet
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChunkResponse {
     /// The chunk ID being responded to
     pub chunk_id: ChunkId,
@@ -50,7 +50,7 @@ pub struct ChunkResponse {
 ///
 /// This contains the information needed to send a Sphinx packet
 /// back to the requester without knowing their identity.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReturnRoute {
     /// The route hops (in order from requester to first mix)
     pub hops: Vec<RouteHopInfo>,
@@ -59,7 +59,7 @@ pub struct ReturnRoute {
 }
 
 /// Route hop information for serialization
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RouteHopInfo {
     /// The mix node's public key
     pub public_key: [u8; 32],
