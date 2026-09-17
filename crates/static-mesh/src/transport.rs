@@ -1,8 +1,14 @@
-//! Async TCP transport for Static network
+//! Pluggable transport layer for the Static network
 //!
-//! Implements:
-//! - TCP listener for incoming peer connections
-//! - TCP connector for outgoing peer connections
+//! Defines the [`Transport`] and [`Connection`] traits that abstract
+//! the raw byte-level link between peers, with TCP as the default
+//! implementation (`TcpTransport`). Alternative transports (WebSocket,
+//! QUIC, Bluetooth mesh) can be added by implementing the traits
+//! without touching the protocol layer above.
+//!
+//! On top of the transport traits, implements:
+//! - Listener for incoming peer connections
+//! - Connector for outgoing peer connections
 //! - Frame-based message reading/writing using the wire protocol
 //! - Connection management (track active connections by node ID)
 //! - Background cover traffic loop (constant-rate sending)
@@ -24,15 +30,201 @@ use static_sphinx::{
     SphinxPacket, MixNode, process_packet, RoutingFlag,
     NodeId,
 };
+use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, RwLock, Mutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time;
 use tracing::{info, warn, error, debug};
+
+/// A connection to a peer (transport-agnostic)
+///
+/// Abstracts the raw byte-level link to one peer. The protocol layer
+/// (framing, handshakes, cover traffic) operates on top of this trait
+/// and never sees transport-specific types.
+///
+/// Implementations must support concurrent send and receive (full
+/// duplex): the connection loop reads and writes simultaneously, and
+/// cover traffic must keep flowing even while waiting for inbound
+/// bytes. A transport that serializes reads and writes would stall
+/// cover traffic whenever the peer is silent. (TCP is full duplex; a
+/// half-duplex transport should buffer internally.)
+#[async_trait]
+pub trait Connection: Send + Sync {
+    /// Send raw bytes to the peer
+    async fn send_bytes(&self, data: &[u8]) -> Result<(), TransportError>;
+
+    /// Receive raw bytes from the peer
+    ///
+    /// Returns the number of bytes read, or `None` if the connection
+    /// is closed by the peer.
+    async fn recv_bytes(&self, buf: &mut [u8]) -> Result<Option<usize>, TransportError>;
+
+    /// Close the connection
+    async fn close(&self) -> Result<(), TransportError>;
+
+    /// Get the peer's address as a string
+    fn peer_addr(&self) -> String;
+}
+
+/// A transport implementation (TCP, WebSocket, Bluetooth, etc.)
+///
+/// Abstracts connection management: listening, accepting, and dialing.
+/// Each transport handles its own MTU/fragmentation; the protocol
+/// layer only ever deals with complete messages via the framing layer.
+///
+/// All methods take `&self`: implementations use interior mutability
+/// so that a listening node can still dial out (and vice versa) without
+/// any lock held across an await.
+#[async_trait]
+pub trait Transport: Send + Sync {
+    /// Start listening for incoming connections
+    async fn listen(&self, addr: &str) -> Result<(), TransportError>;
+
+    /// Accept an incoming connection
+    ///
+    /// Returns the new connection and the peer's address.
+    async fn accept(&self) -> Result<(Box<dyn Connection>, String), TransportError>;
+
+    /// Connect to a peer
+    async fn connect(&self, addr: &str) -> Result<Box<dyn Connection>, TransportError>;
+
+    /// Get the transport name (e.g. "tcp", "websocket", "bluetooth")
+    fn name(&self) -> &str;
+
+    /// Get the maximum message size this transport can carry
+    ///
+    /// The protocol layer uses this to decide if fragmentation is
+    /// needed. Transports with a small MTU handle fragmentation and
+    /// reassembly internally; the protocol layer never sees partial
+    /// messages.
+    fn max_message_size(&self) -> usize;
+}
+
+/// TCP transport implementation
+///
+/// The default [`Transport`]. The listener is held behind interior
+/// mutability, so `listen`, `accept`, and `connect` never block each
+/// other: a node that listens can still dial out immediately.
+pub struct TcpTransport {
+    /// Bound listener (set by [`Transport::listen`])
+    listener: std::sync::Mutex<Option<Arc<TcpListener>>>,
+}
+
+impl TcpTransport {
+    /// Create a new TCP transport (not yet listening)
+    pub fn new() -> Self {
+        Self {
+            listener: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl Default for TcpTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Transport for TcpTransport {
+    async fn listen(&self, addr: &str) -> Result<(), TransportError> {
+        let socket_addr: SocketAddr = addr
+            .parse()
+            .map_err(|_| TransportError::HandshakeFailed(format!("Invalid address: {}", addr)))?;
+        let listener = TcpListener::bind(socket_addr).await?;
+        *self.listener.lock().unwrap() = Some(Arc::new(listener));
+        Ok(())
+    }
+
+    async fn accept(&self) -> Result<(Box<dyn Connection>, String), TransportError> {
+        let listener = self
+            .listener
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| TransportError::HandshakeFailed("Not listening".into()))?;
+        let (stream, addr) = listener.accept().await?;
+        Ok((Box::new(TcpConnection::new(stream)), addr.to_string()))
+    }
+
+    async fn connect(&self, addr: &str) -> Result<Box<dyn Connection>, TransportError> {
+        let socket_addr: SocketAddr = addr
+            .parse()
+            .map_err(|_| TransportError::HandshakeFailed(format!("Invalid address: {}", addr)))?;
+        let stream = TcpStream::connect(socket_addr).await?;
+        Ok(Box::new(TcpConnection::new(stream)))
+    }
+
+    fn name(&self) -> &str {
+        "tcp"
+    }
+
+    fn max_message_size(&self) -> usize {
+        HYBRID_MAX_MESSAGE_SIZE
+    }
+}
+
+/// TCP connection implementation
+///
+/// The stream is split into independently locked read and write halves
+/// so the connection stays full duplex: waiting for inbound bytes never
+/// blocks outgoing sends (and vice versa).
+pub struct TcpConnection {
+    /// Read half (locked only by receivers)
+    reader: Mutex<tokio::net::tcp::OwnedReadHalf>,
+    /// Write half (locked only by senders)
+    writer: Mutex<tokio::net::tcp::OwnedWriteHalf>,
+}
+
+impl TcpConnection {
+    /// Wrap an established TCP stream
+    pub fn new(stream: TcpStream) -> Self {
+        let (reader, writer) = stream.into_split();
+        Self {
+            reader: Mutex::new(reader),
+            writer: Mutex::new(writer),
+        }
+    }
+}
+
+#[async_trait]
+impl Connection for TcpConnection {
+    async fn send_bytes(&self, data: &[u8]) -> Result<(), TransportError> {
+        let mut writer = self.writer.lock().await;
+        writer.write_all(data).await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
+    async fn recv_bytes(&self, buf: &mut [u8]) -> Result<Option<usize>, TransportError> {
+        let mut reader = self.reader.lock().await;
+        let n = reader.read(buf).await?;
+        if n == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(n))
+        }
+    }
+
+    async fn close(&self) -> Result<(), TransportError> {
+        // Dropping the halves closes the socket
+        Ok(())
+    }
+
+    fn peer_addr(&self) -> String {
+        self.reader
+            .try_lock()
+            .ok()
+            .and_then(|reader| reader.peer_addr().ok())
+            .map(|a| a.to_string())
+            .unwrap_or_default()
+    }
+}
 
 /// Size of a node ID
 pub const NODE_ID_SIZE: usize = 16;
@@ -95,6 +287,8 @@ pub struct TransportState {
     /// first-time connections. Populated on disconnect, consumed on
     /// the next successful handshake with the same node ID.
     pub previously_connected: Arc<RwLock<HashSet<NodeId>>>,
+    /// The transport implementation (TCP by default)
+    pub transport: Arc<dyn Transport>,
 }
 
 /// An inbound message from a peer
@@ -135,19 +329,15 @@ pub enum TransportError {
     ChannelSend,
 }
 
-/// Handle an incoming TCP connection
+/// Handle an incoming connection
 ///
-/// Performs handshake, then enters read loop.
+/// Performs handshake, then enters the connection loop.
 pub async fn handle_incoming_connection(
-    stream: TcpStream,
-    addr: SocketAddr,
+    connection: Box<dyn Connection>,
+    addr: String,
     state: Arc<TransportState>,
 ) {
     debug!("Incoming connection from {}", addr);
-
-    let (read_half, write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    let mut writer = BufWriter::new(write_half);
 
     // Read handshake from peer
     let mut buf = vec![0u8; READ_BUFFER_SIZE];
@@ -155,12 +345,12 @@ pub async fn handle_incoming_connection(
 
     // Read until we have a complete handshake
     loop {
-        let n = match reader.read(&mut buf).await {
-            Ok(0) => {
+        let n = match connection.recv_bytes(&mut buf).await {
+            Ok(Some(n)) => n,
+            Ok(None) => {
                 warn!("Peer {} disconnected during handshake", addr);
                 return;
             }
-            Ok(n) => n,
             Err(e) => {
                 warn!("Error reading handshake from {}: {}", addr, e);
                 return;
@@ -192,17 +382,16 @@ pub async fn handle_incoming_connection(
                         warn!("Failed to serialize handshake for {}: {}", addr, e);
                         return;
                     }
-                    if let Err(e) = writer.write_all(&write_buf).await {
+                    if let Err(e) = connection.send_bytes(&write_buf).await {
                         warn!("Failed to send handshake to {}: {}", addr, e);
                         return;
                     }
-                    let _ = writer.flush().await;
 
                     // Add to routing table
                     state.routing_table.write().await.add_node(KnownNode {
                         node_id: hs.node_id,
                         public_key: hs.public_key,
-                        address: addr.to_string(),
+                        address: addr.clone(),
                         kem_public_key: hs.kem_public_key.clone(),
                     });
 
@@ -226,15 +415,13 @@ pub async fn handle_incoming_connection(
                             .await;
                     }
                     
-                    // Spawn write loop
+                    // Enter the connection loop
+                    let shared: Arc<dyn Connection> = Arc::from(connection);
                     let write_state = state.clone();
                     let peer_id = hs.node_id;
                     tokio::spawn(async move {
-                        write_loop(writer, rx, write_state, peer_id).await;
+                        connection_loop(shared, rx, write_state, peer_id).await;
                     });
-
-                    // Enter read loop
-                    read_loop(reader, read_buf, state.clone(), peer_id).await;
                     return;
                 }
                 WireMessage::Sphinx(_) => {
@@ -277,10 +464,7 @@ pub async fn connect_to_peer(
 ) -> Result<(), TransportError> {
     debug!("Connecting to {}", addr);
 
-    let stream = TcpStream::connect(addr).await?;
-    let (read_half, write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    let mut writer = BufWriter::new(write_half);
+    let connection = state.transport.connect(&addr.to_string()).await?;
 
     // Send our handshake first
     let our_hs = WireMessage::Handshake(Handshake {
@@ -292,18 +476,17 @@ pub async fn connect_to_peer(
 
     let mut write_buf = bytes::BytesMut::new();
     write_message(&mut write_buf, &our_hs)?;
-    writer.write_all(&write_buf).await?;
-    let _ = writer.flush().await;
+    connection.send_bytes(&write_buf).await?;
 
     // Read their handshake
     let mut buf = vec![0u8; READ_BUFFER_SIZE];
     let mut read_buf = bytes::BytesMut::with_capacity(READ_BUFFER_SIZE);
 
     loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            return Err(TransportError::HandshakeFailed("peer disconnected".into()));
-        }
+        let n = match connection.recv_bytes(&mut buf).await? {
+            Some(n) => n,
+            None => return Err(TransportError::HandshakeFailed("peer disconnected".into())),
+        };
         read_buf.extend_from_slice(&buf[..n]);
 
         if let Some(msg) = try_read_message(&mut read_buf)? {
@@ -335,14 +518,11 @@ pub async fn connect_to_peer(
                             .await;
                     }
                     
+                    let shared: Arc<dyn Connection> = Arc::from(connection);
                     let write_state = state.clone();
                     let peer_id = hs.node_id;
                     tokio::spawn(async move {
-                        write_loop(writer, rx, write_state, peer_id).await;
-                    });
-
-                    tokio::spawn(async move {
-                        read_loop(reader, read_buf, state, peer_id).await;
+                        connection_loop(shared, rx, write_state, peer_id).await;
                     });
 
                     return Ok(());
@@ -373,46 +553,111 @@ pub async fn connect_to_peer(
     }
 }
 
-/// Read loop for a peer connection
+/// Connection loop for an established peer connection
 ///
-/// Reads messages from the peer and processes them.
-async fn read_loop(
-    mut reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
-    mut read_buf: bytes::BytesMut,
+/// Multiplexes, via `tokio::select!`: outgoing real messages from the
+/// channel, constant-rate cover traffic, and incoming wire frames from
+/// the peer. Runs until the connection dies, then cleans up (removes
+/// the connection and remembers the peer for heal detection).
+async fn connection_loop(
+    connection: Arc<dyn Connection>,
+    mut rx: mpsc::Receiver<WireMessage>,
     state: Arc<TransportState>,
     peer_id: NodeId,
 ) {
-    let mut buf = vec![0u8; READ_BUFFER_SIZE];
+    let cover_config = state.cover_config.read().await.clone();
+    let interval_ms = cover_config.interval_ms;
+    let target_rate_bps = cover_config.target_rate_bps;
+    let target_bytes_per_interval = (target_rate_bps * interval_ms) / 1000;
 
-    loop {
-        // Try to read a message from the buffer
-        match try_read_message(&mut read_buf) {
-            Ok(Some(msg)) => {
-                if let Err(e) = handle_message(msg, &state, peer_id).await {
-                    warn!("Error handling message from {:02x?}: {}", peer_id, e);
+    let mut interval = time::interval(Duration::from_millis(interval_ms));
+    let mut bytes_this_interval: u64 = 0;
+    let mut read_buf = bytes::BytesMut::with_capacity(READ_BUFFER_SIZE);
+    let mut read_chunk = vec![0u8; READ_BUFFER_SIZE];
+
+    'conn: loop {
+        tokio::select! {
+            // Real message to send
+            Some(msg) = rx.recv() => {
+                println!("[WRITE_LOOP] Received message to send to peer");
+                let mut wire_buf = bytes::BytesMut::new();
+                if let Err(e) = write_message(&mut wire_buf, &msg) {
+                    warn!("Failed to serialize message to {:02x?}: {}", peer_id, e);
+                    continue;
                 }
-                continue;
-            }
-            Ok(None) => {} // Need more data
-            Err(e) => {
-                warn!("Wire error from {:02x?}: {}", peer_id, e);
-                break;
-            }
-        }
 
-        // Read more data
-        match reader.read(&mut buf).await {
-            Ok(0) => {
-                info!("Peer {:02x?} disconnected", peer_id);
-                break;
+                let msg_bytes = wire_buf.len() as u64;
+                if let Err(e) = connection.send_bytes(&wire_buf).await {
+                    warn!("Write error to {:02x?}: {}", peer_id, e);
+                    break;
+                }
+
+                bytes_this_interval += msg_bytes;
+                state.total_bytes_sent.fetch_add(msg_bytes, std::sync::atomic::Ordering::Relaxed);
+                state.total_real_bytes_sent.fetch_add(msg_bytes, std::sync::atomic::Ordering::Relaxed);
             }
-            Ok(n) => {
-                println!("[READ_LOOP] Read {} bytes from peer", n);
-                read_buf.extend_from_slice(&buf[..n]);
+
+            // Cover traffic tick
+            _ = interval.tick() => {
+                let remaining = target_bytes_per_interval.saturating_sub(bytes_this_interval);
+
+                if remaining > 0 && cover_config.enabled {
+                    // Generate cover traffic matching the configured packet
+                    // version: hybrid nodes emit v1-sized dummies (with
+                    // placeholder KEM ciphertexts) so cover is
+                    // indistinguishable from real traffic of that version.
+                    let dummy_msg = dummy_sphinx_message(cover_config.use_hybrid, remaining as usize);
+                    let mut wire_buf = bytes::BytesMut::new();
+
+                    if write_message(&mut wire_buf, &dummy_msg).is_err() {
+                        continue;
+                    }
+
+                    let cover_bytes = wire_buf.len() as u64;
+                    if connection.send_bytes(&wire_buf).await.is_err() {
+                        break;
+                    }
+
+                    // bytes_this_interval is reset at the start of the next interval
+                    state.total_bytes_sent.fetch_add(cover_bytes, std::sync::atomic::Ordering::Relaxed);
+                    state.total_cover_bytes_sent.fetch_add(cover_bytes, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                // Reset interval
+                bytes_this_interval = 0;
             }
-            Err(e) => {
-                warn!("Read error from {:02x?}: {}", peer_id, e);
-                break;
+
+            // Incoming bytes from the peer
+            read_result = connection.recv_bytes(&mut read_chunk) => {
+                match read_result {
+                    Ok(Some(n)) => {
+                        println!("[READ_LOOP] Read {} bytes from peer", n);
+                        read_buf.extend_from_slice(&read_chunk[..n]);
+                        // Process all complete messages in the buffer
+                        loop {
+                            match try_read_message(&mut read_buf) {
+                                Ok(Some(msg)) => {
+                                    if let Err(e) = handle_message(msg, &state, peer_id).await {
+                                        warn!("Error handling message from {:02x?}: {}", peer_id, e);
+                                    }
+                                }
+                                Ok(None) => break, // Need more data
+                                Err(e) => {
+                                    warn!("Wire error from {:02x?}: {}", peer_id, e);
+                                    break 'conn;
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        info!("Peer {:02x?} disconnected", peer_id);
+                        break;
+                    }
+                    Err(e) => {
+                        warn!("Read error from {:02x?}: {}", peer_id, e);
+                        break;
+                    }
+                }
             }
         }
     }
@@ -422,6 +667,7 @@ async fn read_loop(
     // not a first-time connection.
     state.previously_connected.write().await.insert(peer_id);
     state.connections.write().await.remove(&peer_id);
+    let _ = connection.close().await;
 }
 
 /// Normalized result of one Sphinx hop (classical or hybrid)
@@ -700,81 +946,6 @@ async fn handle_message(
     Ok(())
 }
 
-/// Write loop for a peer connection
-///
-/// Reads messages from the channel and writes them to the TCP stream.
-/// Also generates cover traffic at a constant rate.
-async fn write_loop(
-    mut writer: BufWriter<tokio::net::tcp::OwnedWriteHalf>,
-    mut rx: mpsc::Receiver<WireMessage>,
-    state: Arc<TransportState>,
-    peer_id: NodeId,
-) {
-    let cover_config = state.cover_config.read().await.clone();
-    let interval_ms = cover_config.interval_ms;
-    let target_rate_bps = cover_config.target_rate_bps;
-    let target_bytes_per_interval = (target_rate_bps * interval_ms) / 1000;
-
-    let mut interval = time::interval(Duration::from_millis(interval_ms));
-    let mut bytes_this_interval: u64 = 0;
-
-    loop {
-        tokio::select! {
-            // Real message to send
-            Some(msg) = rx.recv() => {
-                println!("[WRITE_LOOP] Received message to send to peer");
-                let mut buf = bytes::BytesMut::new();
-                if let Err(e) = write_message(&mut buf, &msg) {
-                    warn!("Failed to serialize message to {:02x?}: {}", peer_id, e);
-                    continue;
-                }
-
-                let msg_bytes = buf.len() as u64;
-                if let Err(e) = writer.write_all(&buf).await {
-                    warn!("Write error to {:02x?}: {}", peer_id, e);
-                    break;
-                }
-                let _ = writer.flush().await;
-
-                bytes_this_interval += msg_bytes;
-                state.total_bytes_sent.fetch_add(msg_bytes, std::sync::atomic::Ordering::Relaxed);
-                state.total_real_bytes_sent.fetch_add(msg_bytes, std::sync::atomic::Ordering::Relaxed);
-            }
-
-            // Cover traffic tick
-            _ = interval.tick() => {
-                let remaining = target_bytes_per_interval.saturating_sub(bytes_this_interval);
-                
-                if remaining > 0 && cover_config.enabled {
-                    // Generate cover traffic matching the configured packet
-                    // version: hybrid nodes emit v1-sized dummies (with
-                    // placeholder KEM ciphertexts) so cover is
-                    // indistinguishable from real traffic of that version.
-                    let dummy_msg = dummy_sphinx_message(cover_config.use_hybrid, remaining as usize);
-                    let mut buf = bytes::BytesMut::new();
-
-                    if write_message(&mut buf, &dummy_msg).is_err() {
-                        continue;
-                    }
-
-                    let cover_bytes = buf.len() as u64;
-                    if writer.write_all(&buf).await.is_err() {
-                        break;
-                    }
-                    let _ = writer.flush().await;
-
-                    // bytes_this_interval is reset at the start of the next interval
-                    state.total_bytes_sent.fetch_add(cover_bytes, std::sync::atomic::Ordering::Relaxed);
-                    state.total_cover_bytes_sent.fetch_add(cover_bytes, std::sync::atomic::Ordering::Relaxed);
-                }
-
-                // Reset interval
-                bytes_this_interval = 0;
-            }
-        }
-    }
-}
-
 /// Generate a dummy packet for cover traffic
 fn generate_cover_packet(size: usize) -> Vec<u8> {
     use rand::RngCore;
@@ -861,20 +1032,24 @@ pub async fn gossip_loop(state: Arc<TransportState>, interval_secs: u64) {
     }
 }
 
-/// Start the TCP listener
+/// Start the listener
+///
+/// Binds the transport's listener and loops accepting incoming
+/// connections, handing each to [`handle_incoming_connection`]. No
+/// lock is held across awaits, so a listening node can still dial out.
 pub async fn start_listener(
     addr: SocketAddr,
     state: Arc<TransportState>,
 ) -> Result<(), TransportError> {
-    let listener = TcpListener::bind(addr).await?;
+    state.transport.listen(&addr.to_string()).await?;
     info!("Listening on {}", addr);
 
     loop {
-        match listener.accept().await {
-            Ok((stream, peer_addr)) => {
+        match state.transport.accept().await {
+            Ok((connection, peer_addr)) => {
                 let state = state.clone();
                 tokio::spawn(async move {
-                    handle_incoming_connection(stream, peer_addr, state).await;
+                    handle_incoming_connection(connection, peer_addr, state).await;
                 });
             }
             Err(e) => {
@@ -901,6 +1076,7 @@ pub fn create_transport_state(
     let swap_state = SwapState::new();
     let storage_key = static_crypto::SymmetricKey::random();
     let chunk_holder = ChunkHolder::new();
+    let transport: Arc<dyn Transport> = Arc::new(TcpTransport::new());
 
     let state = Arc::new(TransportState {
         node_id,
@@ -919,6 +1095,7 @@ pub fn create_transport_state(
         chunk_holder: Arc::new(Mutex::new(chunk_holder)),
         kem: Arc::new(Mutex::new(static_crypto::KemKeypair::random())),
         previously_connected: Arc::new(RwLock::new(HashSet::new())),
+        transport,
     });
 
     (state, inbound_rx)
@@ -1100,7 +1277,12 @@ mod tests {
                 if let Ok((stream, addr)) = listener.accept().await {
                     let s = state1_clone.clone();
                     tokio::spawn(async move {
-                        handle_incoming_connection(stream, addr, s).await;
+                        handle_incoming_connection(
+                            Box::new(TcpConnection::new(stream)),
+                            addr.to_string(),
+                            s,
+                        )
+                        .await;
                     });
                 }
             }
@@ -1160,7 +1342,12 @@ mod tests {
                 if let Ok((stream, addr)) = listener_b.accept().await {
                     let s = state_b_clone.clone();
                     tokio::spawn(async move {
-                        handle_incoming_connection(stream, addr, s).await;
+                        handle_incoming_connection(
+                            Box::new(TcpConnection::new(stream)),
+                            addr.to_string(),
+                            s,
+                        )
+                        .await;
                     });
                 }
             }
@@ -1172,7 +1359,12 @@ mod tests {
                 if let Ok((stream, addr)) = listener_c.accept().await {
                     let s = state_c_clone.clone();
                     tokio::spawn(async move {
-                        handle_incoming_connection(stream, addr, s).await;
+                        handle_incoming_connection(
+                            Box::new(TcpConnection::new(stream)),
+                            addr.to_string(),
+                            s,
+                        )
+                        .await;
                     });
                 }
             }
@@ -1228,5 +1420,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_tcp_transport_implementation() {
+        let transport = TcpTransport::new();
+
+        assert_eq!(transport.name(), "tcp");
+        assert_eq!(transport.max_message_size(), HYBRID_MAX_MESSAGE_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_connection_send_recv() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Echo server: read once, send the bytes back
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let conn = TcpConnection::new(stream);
+            let mut buf = vec![0u8; 64];
+            match conn.recv_bytes(&mut buf).await.unwrap() {
+                Some(n) => {
+                    conn.send_bytes(&buf[..n]).await.unwrap();
+                }
+                None => panic!("server: unexpected disconnect"),
+            }
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        assert!(!stream.peer_addr().unwrap().to_string().is_empty());
+        let client = TcpConnection::new(stream);
+
+        client.send_bytes(b"ping").await.unwrap();
+
+        let mut buf = vec![0u8; 64];
+        let n = client
+            .recv_bytes(&mut buf)
+            .await
+            .unwrap()
+            .expect("client: connection closed before echo");
+        assert_eq!(&buf[..n], b"ping");
+
+        server.await.unwrap();
     }
 }

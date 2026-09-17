@@ -17,7 +17,7 @@
 /// Wire protocol module
 pub mod wire;
 
-/// Async TCP transport module
+/// Pluggable transport module (TCP default)
 pub mod transport;
 
 use std::collections::HashMap;

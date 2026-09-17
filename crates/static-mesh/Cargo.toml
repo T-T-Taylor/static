@@ -17,3 +17,4 @@ thiserror.workspace = true
 rand.workspace = true
 tracing.workspace = true
 futures = "0.3"
+async-trait.workspace = true

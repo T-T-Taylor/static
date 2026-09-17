@@ -54,7 +54,7 @@
 - Version the Sphinx packet format to support both classical and hybrid
 - Protects against "harvest now, decrypt later" attacks
 
-### 8. Transport Abstraction Trait
+### 8. Transport Abstraction Trait ✅ DONE
 - Define a `Transport` trait in static-mesh
 - TCP transport implements the trait (existing code)
 - Enables future Bluetooth mesh, WebSocket, or other transports
