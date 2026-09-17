@@ -37,7 +37,7 @@
 
 ## Medium Priority (Privacy Enhancements)
 
-### 6. Hot Storage Rotation (Freenet-style)
+### 6. Hot Storage Rotation (Freenet-style) ✅ DONE
 - Periodic re-encryption and re-distribution of a percentage of chunks per epoch
 - Request-driven migration: nodes that request chunks cache copies
 - Chunks naturally migrate toward demand (like Freenet)

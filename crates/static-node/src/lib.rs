@@ -72,6 +72,14 @@ pub struct NodeConfig {
     pub mode: NodeMode,
     /// Sponsor peer address (required for seed-only mode)
     pub sponsor: Option<String>,
+    /// Hot storage rotation configuration (Freenet-style migration/caching)
+    #[serde(default = "default_rotation_config")]
+    pub rotation_config: static_storage::rotation::RotationConfig,
+}
+
+/// Default for `NodeConfig::rotation_config`
+fn default_rotation_config() -> static_storage::rotation::RotationConfig {
+    static_storage::rotation::RotationConfig::default()
 }
 
 impl Default for NodeConfig {
@@ -88,6 +96,7 @@ impl Default for NodeConfig {
             max_storage_bytes: 10 * 1024 * 1024 * 1024, // 10 GB
             mode: NodeMode::Full,
             sponsor: None,
+            rotation_config: default_rotation_config(),
         }
     }
 }

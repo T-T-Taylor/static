@@ -58,6 +58,26 @@ struct Cli {
     #[arg(long)]
     sponsor: Option<String>,
 
+    /// Disable hot storage rotation
+    #[arg(long)]
+    no_rotation: bool,
+
+    /// Rotation epoch duration in seconds (default: 86400 = 24 hours)
+    #[arg(long, default_value_t = 86400)]
+    rotation_epoch: u64,
+
+    /// Percentage of chunks to rotate per epoch (default: 10)
+    #[arg(long, default_value_t = 10)]
+    rotation_percentage: u8,
+
+    /// Disable chunk caching (Freenet-style)
+    #[arg(long)]
+    no_caching: bool,
+
+    /// Maximum cached chunks (default: 100)
+    #[arg(long, default_value_t = 100)]
+    max_cached: usize,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -133,6 +153,15 @@ async fn main() -> Result<()> {
         anyhow::bail!("Seed-only mode requires --sponsor <addr>");
     }
 
+    let rotation_config = static_storage::rotation::RotationConfig {
+        enabled: !cli.no_rotation,
+        epoch_duration_secs: cli.rotation_epoch,
+        rotation_percentage: cli.rotation_percentage,
+        enable_caching: !cli.no_caching,
+        max_cached_chunks: cli.max_cached,
+        min_lease_remaining_secs: 3600,
+    };
+
     let config = NodeConfig {
         data_dir: cli.data_dir.clone(),
         cover_traffic_rate_bps: cover_rate,
@@ -145,6 +174,7 @@ async fn main() -> Result<()> {
         tier,
         mode,
         sponsor: cli.sponsor.clone(),
+        rotation_config,
     };
 
     match cli.command {
@@ -196,6 +226,9 @@ async fn main() -> Result<()> {
             println!("Cover rate: {} bps", config.cover_traffic_rate_bps);
             println!("Max storage: {} bytes", config.max_storage_bytes);
             println!("Bootstrap peers: {:?}", config.bootstrap_peers);
+            println!("Rotation: {}", if config.rotation_config.enabled { "enabled" } else { "disabled" });
+            println!("Rotation percentage: {}%", config.rotation_config.rotation_percentage);
+            println!("Caching: {}", if config.rotation_config.enable_caching { "enabled" } else { "disabled" });
         }
         Commands::GenId => {
             let persistent_config = PersistentConfig::new();

@@ -27,6 +27,7 @@ use static_storage::{
     repair::RepairState,
     heartbeat::LeaseManager,
     retrieval::{ChunkHolder, ContentRetriever},
+    rotation::{RotationConfig, RotationState},
     swap::{SwapState, StorageCapacity},
 };
 use std::collections::HashMap;
@@ -62,6 +63,8 @@ pub struct NodeRunner {
     pub content_retriever: Arc<Mutex<ContentRetriever>>,
     /// Repair state for tracking chunk repairs
     pub repair_state: Arc<Mutex<RepairState>>,
+    /// Rotation state for tracking chunk rotations and caching
+    pub rotation_state: Arc<Mutex<RotationState>>,
     /// Content retriever for tracking pending chunk retrievals
     /// Retrieval manager for tracking pending network fragments
     pub retriever: Arc<Mutex<static_mesh::retrieval::RetrievalManager>>,
@@ -110,6 +113,7 @@ impl NodeRunner {
             retriever: Arc::new(Mutex::new(static_mesh::retrieval::RetrievalManager::new())),
             content_retriever: Arc::new(Mutex::new(ContentRetriever::new())),
             repair_state: Arc::new(Mutex::new(RepairState::new())),
+            rotation_state: Arc::new(Mutex::new(RotationState::new())),
             inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
             config,
         }
@@ -293,6 +297,33 @@ impl NodeRunner {
                 }
             }
         });
+
+        // Start rotation loop (Full nodes only: SeedOnly holds no chunks
+        // locally and must stay rate-limited; BackupOnly is dormant).
+        if matches!(self.config.mode, NodeMode::Full) {
+            let rotation_state = self.rotation_state.clone();
+            let rotation_config = self.config.rotation_config.clone();
+            let chunk_holder_for_rotation = self.transport.chunk_holder.clone();
+            let leases_for_rotation = self.leases.clone();
+            let swaps_for_rotation = self.swaps.clone();
+            let capacity_for_rotation = self.capacity.clone();
+            let transport_for_rotation = self.transport.clone();
+            let rotation_node_id = self.transport.node_id;
+            tokio::spawn(async move {
+                rotation_loop(
+                    rotation_state,
+                    rotation_config,
+                    chunk_holder_for_rotation,
+                    leases_for_rotation,
+                    swaps_for_rotation,
+                    capacity_for_rotation,
+                    transport_for_rotation,
+                    rotation_node_id,
+                )
+                .await;
+            });
+        }
+
         // Start local API server
         let api_addr = self.config.api_addr.clone();
         let runner_ref = self.clone();
@@ -346,9 +377,13 @@ impl NodeRunner {
                             data: response.chunk_data,
                         };
                         let mut content_retriever = self.content_retriever.lock().await;
-                        if content_retriever.record_chunk(chunk).unwrap_or(false) {
+                        if content_retriever.record_chunk(chunk.clone()).unwrap_or(false) {
                             debug!("Successfully retrieved chunk {:02x?}", response.chunk_id);
                         }
+                        drop(content_retriever);
+                        // Freenet-style: cache what we retrieve so popular
+                        // chunks spread and no holder set stays static.
+                        self.cache_retrieved_chunk(chunk.id, &chunk.data).await;
                     }
                 }
             }
@@ -474,6 +509,77 @@ impl NodeRunner {
     /// Check whether this runner is a backup-only node
     pub fn is_backup_only(&self) -> bool {
         matches!(self.config.mode, NodeMode::BackupOnly)
+    }
+
+    /// Cache a retrieved chunk locally (Freenet-style, Full nodes only)
+    ///
+    /// Popular chunks spread as retrievers keep copies; the holder set
+    /// never stays static. Cached bytes count toward the storage
+    /// contribution via `StorageCapacity::record_accept`, and the LRU
+    /// cached chunk is evicted when at the cap. Lock discipline: each
+    /// guard is dropped before the next is taken.
+    pub async fn cache_retrieved_chunk(&self, chunk_id: ChunkId, data: &[u8]) {
+        if !matches!(self.config.mode, NodeMode::Full) {
+            return;
+        }
+        if !self.config.rotation_config.enable_caching {
+            return;
+        }
+        if self.transport.chunk_holder.lock().await.has_chunk(&chunk_id) {
+            return;
+        }
+
+        let chunk_len = data.len() as u64;
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Fast path: capacity available.
+        let fits = self.capacity.lock().await.can_accept(chunk_len, 0);
+        if fits {
+            self.transport.chunk_holder.lock().await.add_chunk(
+                chunk_id,
+                data.to_vec(),
+                [0u8; 32], // cached chunks carry no content binding
+            );
+            self.capacity.lock().await.record_accept(chunk_len);
+            self.rotation_state.lock().await.record_cache(chunk_id, current_time);
+            debug!("Cached chunk {:02x?} locally", chunk_id);
+            return;
+        }
+
+        // Slow path: evict the LRU cached chunk to make room.
+        let max = self.config.rotation_config.max_cached_chunks;
+        if max > 0 {
+            let lru = self.rotation_state.lock().await.lru_cached_chunk();
+            if let Some(lru_id) = lru {
+                let evicted_len = {
+                    self.transport
+                        .chunk_holder
+                        .lock()
+                        .await
+                        .get_chunk(&lru_id)
+                        .map(|d| d.len() as u64)
+                        .unwrap_or(0)
+                };
+                self.transport.chunk_holder.lock().await.remove_chunk(&lru_id);
+                self.rotation_state.lock().await.remove_cache(&lru_id);
+                self.capacity.lock().await.record_remove(evicted_len);
+                debug!("Evicted cached chunk {:02x?} to make room", lru_id);
+
+                if self.capacity.lock().await.can_accept(chunk_len, 0) {
+                    self.transport.chunk_holder.lock().await.add_chunk(
+                        chunk_id,
+                        data.to_vec(),
+                        [0u8; 32],
+                    );
+                    self.capacity.lock().await.record_accept(chunk_len);
+                    self.rotation_state.lock().await.record_cache(chunk_id, current_time);
+                    debug!("Cached chunk {:02x?} locally after eviction", chunk_id);
+                }
+            }
+        }
     }
 
     /// Number of seed-only nodes currently sponsored (sponsor-side)
@@ -1003,9 +1109,227 @@ async fn reconcile_capacity_once(
     actual_bytes
 }
 
+/// Evict least-recently-used cached chunks until under the limit
+///
+/// Each step takes at most one lock at a time (rotation state, then
+/// chunk holder, then capacity) to respect the no-nested-guards
+/// discipline. Evicted bytes are subtracted from capacity so the
+/// counter keeps matching the holder.
+async fn evict_excess_cache(
+    rotation_state: &Arc<Mutex<RotationState>>,
+    chunk_holder: &Arc<Mutex<ChunkHolder>>,
+    capacity: &Arc<Mutex<StorageCapacity>>,
+    max_cached_chunks: usize,
+) {
+    if max_cached_chunks == 0 {
+        return; // 0 = unlimited
+    }
+    loop {
+        let lru: Option<ChunkId> = {
+            let state = rotation_state.lock().await;
+            if state.cached_chunks.len() <= max_cached_chunks {
+                None
+            } else {
+                state.lru_cached_chunk()
+            }
+        };
+        let lru_chunk = match lru {
+            Some(id) => id,
+            None => break,
+        };
+        let evicted_len = {
+            let mut holder = chunk_holder.lock().await;
+            let len = holder.get_chunk(&lru_chunk).map(|d| d.len() as u64).unwrap_or(0);
+            holder.remove_chunk(&lru_chunk);
+            len
+        };
+        rotation_state.lock().await.remove_cache(&lru_chunk);
+        capacity.lock().await.record_remove(evicted_len);
+        debug!("Evicted cached chunk {:02x?}", lru_chunk);
+    }
+}
+
+/// Background loop to periodically rotate chunks (Freenet-style)
+///
+/// Every epoch a percentage of held chunks is offered to random peers
+/// via the existing swap barter (`SwapProposal`), keeping the 1:1
+/// hosting balance. Only chunks with healthy remaining leases rotate.
+/// Snapshot-then-act throughout: state is cloned under short locks,
+/// guards are dropped before any send, and rotation records are
+/// written back afterwards — no two guards are ever held at once.
+#[allow(clippy::too_many_arguments)]
+async fn rotation_loop(
+    rotation_state: Arc<Mutex<RotationState>>,
+    rotation_config: RotationConfig,
+    chunk_holder: Arc<Mutex<ChunkHolder>>,
+    leases: Arc<Mutex<LeaseManager>>,
+    swaps: Arc<Mutex<SwapState>>,
+    capacity: Arc<Mutex<StorageCapacity>>,
+    transport: Arc<TransportState>,
+    node_id: NodeId,
+) {
+    // Note: tokio::interval ticks immediately on first tick; with an
+    // empty holder (or fresh state) selection is empty, so the first
+    // tick is a safe no-op that just stamps last_epoch.
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+        rotation_config.epoch_duration_secs.max(1),
+    ));
+
+    loop {
+        interval.tick().await;
+
+        if !rotation_config.enabled {
+            continue;
+        }
+
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // 1. Snapshot held chunk IDs.
+        let chunk_ids: Vec<ChunkId> = {
+            chunk_holder.lock().await.chunks.keys().cloned().collect()
+        };
+
+        // 2. Select this epoch's rotation set.
+        let chunks_to_rotate = {
+            rotation_state.lock().await.select_chunks_for_rotation(
+                &chunk_ids,
+                &rotation_config,
+                current_time,
+            )
+        };
+
+        if chunks_to_rotate.is_empty() {
+            rotation_state.lock().await.last_epoch = current_time;
+            debug!("No chunks to rotate this epoch");
+            continue;
+        }
+
+        // 3a. Snapshot (chunk_id, data) for selected chunks.
+        let held: Vec<(ChunkId, Vec<u8>)> = {
+            let holder = chunk_holder.lock().await;
+            chunks_to_rotate
+                .iter()
+                .filter_map(|id| holder.get_chunk(id).map(|data| (*id, data.clone())))
+                .collect()
+        };
+
+        // 3b. Keep only chunks with healthy remaining leases.
+        let eligible: Vec<(ChunkId, Vec<u8>)> = {
+            let lease_mgr = leases.lock().await;
+            held.into_iter()
+                .filter(|(chunk_id, _)| {
+                    lease_mgr
+                        .leases
+                        .get(chunk_id)
+                        .map(|lease| {
+                            lease.expires_at.saturating_sub(current_time)
+                                > rotation_config.min_lease_remaining_secs
+                        })
+                        .unwrap_or(false)
+                })
+                .collect()
+        };
+
+        if eligible.is_empty() {
+            rotation_state.lock().await.last_epoch = current_time;
+            debug!("No lease-eligible chunks to rotate this epoch");
+            continue;
+        }
+
+        // 4a. Snapshot known peers.
+        let known_nodes: Vec<static_mesh::routing::KnownNode> = {
+            transport.routing_table.read().await.nodes.values().cloned().collect()
+        };
+
+        if known_nodes.is_empty() {
+            rotation_state.lock().await.last_epoch = current_time;
+            warn!("No peers available for rotation");
+            continue;
+        }
+
+        // Mark the epoch processed before sending.
+        rotation_state.lock().await.last_epoch = current_time;
+
+        // 4b. Snapshot our key and connection senders (senders are cheap to clone).
+        let master_key = transport.storage_key.lock().await.clone();
+        let senders = transport.connections.read().await.clone();
+
+        // 4c. Build proposals and send; collect what actually dispatched.
+        let mut dispatched: Vec<ChunkId> = Vec::new();
+        for (chunk_id, data) in &eligible {
+            let peer = &known_nodes[rand::random::<usize>() % known_nodes.len()];
+            if peer.node_id == node_id {
+                continue;
+            }
+            let Some(sender) = senders.get(&peer.node_id) else {
+                continue;
+            };
+
+            let chunk = EncryptedChunk { id: *chunk_id, data: data.clone() };
+            // Leases here are minted with our own key: rotation proposals
+            // are time-validated barters, not ownership proofs (MVP).
+            let proposal = static_storage::swap::create_swap_proposal(
+                node_id,
+                chunk,
+                &master_key,
+                static_storage::swap::DEFAULT_LEASE_DURATION_SECS,
+            );
+            swaps.lock().await.record_proposal(&proposal);
+            if sender.send(WireMessage::SwapProposal(proposal)).await.is_ok() {
+                debug!(
+                    "Sent rotation swap proposal for chunk {:02x?} to {:02x?}",
+                    chunk_id, peer.node_id
+                );
+                dispatched.push(*chunk_id);
+            }
+        }
+
+        // 5. Record successful rotations.
+        if !dispatched.is_empty() {
+            let mut state = rotation_state.lock().await;
+            for chunk_id in &dispatched {
+                state.record_rotation(*chunk_id, current_time);
+            }
+        }
+
+        // 6. Evict excess cached chunks if over limit.
+        evict_excess_cache(
+            &rotation_state,
+            &chunk_holder,
+            &capacity,
+            rotation_config.max_cached_chunks,
+        )
+        .await;
+
+        debug!("Rotation epoch complete. Rotated {} chunks.", dispatched.len());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_node_runner_has_rotation_state() {
+        let config = NodeConfig::default();
+        assert!(config.rotation_config.enabled);
+        let node_id = [0x42u8; 16];
+        let mix_node = MixNode::new();
+        let runner = NodeRunner::new(config, node_id, mix_node);
+
+        let state = runner.rotation_state.lock().await;
+        assert_eq!(state.total_rotations, 0);
+        assert_eq!(state.total_cached, 0);
+        assert!(state.cached_chunks.is_empty());
+        assert!(state.rotation_history.is_empty());
+        let stats = state.stats();
+        assert_eq!(stats.active_cached, 0);
+    }
+
+    #[tokio::test]
     async fn test_publish_updates_capacity() {
         let config = NodeConfig::default();
         let runner = NodeRunner::new(config, [0x42u8; 16], MixNode::new());
