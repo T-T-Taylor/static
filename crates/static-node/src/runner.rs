@@ -13,11 +13,13 @@
 
 use rand::RngCore;
 use crate::{NodeConfig, NodeMode, NodeStatus, BackupConfig};
+use crate::compute::{build_request_packets, build_response_packets, execute_wasm, ComputeError};
 use static_accounting::{AccountingState, PeerCredit, current_timestamp};
 use static_crypto::SymmetricKey;
+use static_mesh::fragment::{deserialize_fragment, Reassembler};
 use static_mesh::transport::{
     TransportState, InboundMessage, create_transport_state,
-    start_listener, connect_to_peer, get_stats, gossip_loop,
+    start_listener, connect_to_peer, get_stats, gossip_loop, send_sphinx,
 };
 use static_mesh::wire::{
     AccountingReconciliation, Prepayment, ReconciliationEntry, WireMessage,
@@ -26,6 +28,7 @@ use static_mesh::wire::{
 use static_sphinx::{MixNode, NodeId, Route, RouteHop};
 use static_storage::{
     EncryptedChunk, ChunkId, ContentId, ContentManifest,
+    compute::{ComputeRequest, ComputeResponse, ReturnRoute, MAX_COMPUTE_INPUT_SIZE},
     repair::RepairState,
     heartbeat::LeaseManager,
     retrieval::{ChunkHolder, ContentRetriever},
@@ -73,6 +76,97 @@ pub struct BackupState {
     pub any_active: bool,
 }
 
+/// Minimum compute fee accepted by providers (bytes of storage credit)
+pub const MIN_COMPUTE_FEE: u64 = 1024;
+
+/// Maximum stored compute results before the oldest are dropped
+///
+/// Results are removed when polled via the local API; this cap only
+/// bounds growth for results nobody polls.
+pub const MAX_COMPLETED_COMPUTE_RESULTS: usize = 512;
+
+impl std::fmt::Debug for ComputeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ComputeState")
+            .field("active_executions", &self.active_executions.len())
+            .field("cached_modules", &self.cached_modules.len())
+            .field("pending_requests", &self.pending_requests.len())
+            .field("completed_results", &self.completed_results.len())
+            .field(
+                "reassembler",
+                &(
+                    self.reassembler.received_count(),
+                    self.reassembler.total_expected(),
+                ),
+            )
+            .field("compute_bytes_served", &self.compute_bytes_served)
+            .field("compute_bytes_received", &self.compute_bytes_received)
+            .field("successful_executions", &self.successful_executions)
+            .field("failed_executions", &self.failed_executions)
+            .finish()
+    }
+}
+
+/// State of a single compute execution on the provider side
+#[derive(Debug, Clone)]
+pub struct ComputeExecution {
+    /// The request ID
+    pub request_id: [u8; 32],
+    /// The requesting node (accounting bookkeeping only; unverifiable
+    /// through the mixnet)
+    pub from_node: NodeId,
+    /// The module content ID
+    pub module_content_id: ContentId,
+    /// The input data
+    pub input_data: Vec<u8>,
+    /// The fee offered
+    pub fee_offer: u64,
+    /// When the execution was accepted
+    pub started_at: u64,
+}
+
+/// A compute request this node has issued and is awaiting a response for
+#[derive(Debug, Clone)]
+pub struct PendingComputeRequest {
+    /// The request ID
+    pub request_id: [u8; 32],
+    /// The provider node the request was routed to (for fee accounting)
+    pub provider: NodeId,
+    /// The fee offered
+    pub fee_offer: u64,
+    /// When the request was submitted
+    pub started_at: u64,
+}
+
+/// Overall compute state for the node
+///
+/// Serves both protocol roles: `active_executions`/`cached_modules`
+/// track the provider side, `pending_requests`/`completed_results`
+/// track the requester side. `reassembler` reassembles inbound compute
+/// fragments (one reassembly in flight at a time; concurrent exchanges
+/// serialize on it).
+#[derive(Default)]
+pub struct ComputeState {
+    /// Active executions (request_id -> execution)
+    pub active_executions: HashMap<[u8; 32], ComputeExecution>,
+    /// Cached WASM modules (content_id -> module bytes)
+    pub cached_modules: HashMap<ContentId, Vec<u8>>,
+    /// Requests we issued and are awaiting responses for
+    pub pending_requests: HashMap<[u8; 32], PendingComputeRequest>,
+    /// Completed responses available for polling via the local API
+    pub completed_results: HashMap<[u8; 32], ComputeResponse>,
+    /// Reassembler for inbound compute request/response fragments
+    pub reassembler: Reassembler,
+    /// Total compute output bytes served (provider)
+    pub compute_bytes_served: u64,
+    /// Total compute output bytes received (requester)
+    pub compute_bytes_received: u64,
+    /// Number of successful executions (provider)
+    pub successful_executions: u64,
+    /// Number of failed executions (provider)
+    pub failed_executions: u64,
+}
+
 /// The running Static node
 pub struct NodeRunner {
     /// Transport state (shared across tasks)
@@ -101,6 +195,8 @@ pub struct NodeRunner {
     pub inbound_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<InboundMessage>>>,
     /// Backup state for tracking primary health and activation
     pub backup_state: Arc<Mutex<BackupState>>,
+    /// Compute state for tracking executions and fees
+    pub compute_state: Arc<Mutex<ComputeState>>,
     /// Node configuration
     pub config: NodeConfig,
 }
@@ -132,7 +228,7 @@ impl NodeRunner {
         // periodic reconciler all observe the same object, so the
         // counter cannot drift between layers.
         let capacity = Arc::new(Mutex::new(StorageCapacity::new(config.max_storage_bytes)));
-        let (transport, inbound_rx) =
+        let (mut transport, inbound_rx) =
             create_transport_state(node_id, mix_node, cover_config, capacity.clone());
 
         // Backup-only nodes start dormant: they hold chunks but do not
@@ -141,6 +237,12 @@ impl NodeRunner {
             transport
                 .serve_enabled
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // Advertise compute capability in handshakes when enabled.
+        if let Some(transport) = Arc::get_mut(&mut transport) {
+            transport.compute_enabled = config.compute_config.enabled;
+            transport.compute_capacity = config.compute_config.capacity.min(u8::MAX as u32) as u8;
         }
 
         Self {
@@ -155,6 +257,7 @@ impl NodeRunner {
             repair_state: Arc::new(Mutex::new(RepairState::new())),
             rotation_state: Arc::new(Mutex::new(RotationState::new())),
             backup_state: Arc::new(Mutex::new(BackupState::default())),
+            compute_state: Arc::new(Mutex::new(ComputeState::default())),
             inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
             config,
         }
@@ -406,8 +509,7 @@ impl NodeRunner {
 
         let mut inbound_rx = self.inbound_rx.lock().await;
         while let Some(inbound) = inbound_rx.recv().await {
-            if let Err(e) = self.handle_inbound(inbound).await {
-                warn!("Error handling inbound message: {}", e);
+            if let Err(e) = self.handle_inbound(inbound).await {                warn!("Error handling inbound message: {}", e);
             }
         }
 
@@ -416,7 +518,7 @@ impl NodeRunner {
     }
 
     /// Handle an inbound message from the transport layer
-    async fn handle_inbound(&self, inbound: InboundMessage) -> anyhow::Result<()> {
+    async fn handle_inbound(self: &Arc<Self>, inbound: InboundMessage) -> anyhow::Result<()> {
         // Reactive partition-heal path: the transport flags the
         // handshake-echo of a previously-connected peer. Exchange
         // accounting state now; the message itself (handshake echo)
@@ -430,31 +532,40 @@ impl NodeRunner {
 
         match inbound.message {
             WireMessage::Sphinx(packet) => {
-                // Backup-only nodes are dormant and do not serve chunks.
-                // TODO: Implement health-check via gossip and activation logic.
+                // Backup-only nodes are dormant and do not serve chunks
+                // or compute. Dormant backups still process nothing here;
+                // every other mode proceeds to retrieval/compute handling.
                 if matches!(self.config.mode, NodeMode::BackupOnly) {
                     debug!("Backup-only node dormant: ignoring Sphinx packet");
                     return Ok(());
                 }
                 debug!("Received Sphinx packet (destination) from {:02x?}", inbound.from);
-                
-                let mut manager = self.retriever.lock().await;
-                if let Ok(Some(response)) = manager.process_fragment(&packet.body) {
-                    if response.found {
-                        let chunk = EncryptedChunk {
-                            id: response.chunk_id,
-                            data: response.chunk_data,
-                        };
-                        let mut content_retriever = self.content_retriever.lock().await;
-                        if content_retriever.record_chunk(chunk.clone()).unwrap_or(false) {
-                            debug!("Successfully retrieved chunk {:02x?}", response.chunk_id);
+
+                {
+                    let mut manager = self.retriever.lock().await;
+                    if let Ok(Some(response)) = manager.process_fragment(&packet.body) {
+                        if response.found {
+                            let chunk = EncryptedChunk {
+                                id: response.chunk_id,
+                                data: response.chunk_data,
+                            };
+                            let mut content_retriever = self.content_retriever.lock().await;
+                            if content_retriever.record_chunk(chunk.clone()).unwrap_or(false) {
+                                debug!("Successfully retrieved chunk {:02x?}", response.chunk_id);
+                            }
+                            drop(content_retriever);
+                            // Freenet-style: cache what we retrieve so popular
+                            // chunks spread and no holder set stays static.
+                            self.cache_retrieved_chunk(chunk.id, &chunk.data).await;
                         }
-                        drop(content_retriever);
-                        // Freenet-style: cache what we retrieve so popular
-                        // chunks spread and no holder set stays static.
-                        self.cache_retrieved_chunk(chunk.id, &chunk.data).await;
                     }
                 }
+
+                // Compute dispatch: reassemble compute fragments and route
+                // by message type byte (requests to the provider role,
+                // responses to the requester role). Non-compute bodies are
+                // ignored.
+                self.handle_compute_fragment(&packet.body).await;
             }
             WireMessage::Prepayment(prepayment) => {
                 let accepted = self.handle_prepayment(inbound.from, prepayment).await?;
@@ -466,6 +577,441 @@ impl NodeRunner {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Reassemble a compute fragment and dispatch by message type byte
+    ///
+    /// Inbound Sphinx bodies that are not chunk requests arrive here.
+    /// Bodies that do not parse as fragments are ignored; reassembled
+    /// payloads whose type byte is not a compute message are discarded
+    /// (this keeps stray traffic — e.g. chunk responses — out of the
+    /// compute path).
+    async fn handle_compute_fragment(self: &Arc<Self>, body: &[u8]) {
+        let fragment = match deserialize_fragment(body) {
+            Ok(fragment) => fragment,
+            Err(_) => return,
+        };
+
+        let completed = {
+            let mut state = self.compute_state.lock().await;
+            if !state.reassembler.add_fragment(fragment) {
+                return;
+            }
+            if !state.reassembler.is_complete() {
+                return;
+            }
+            match state.reassembler.reassemble() {
+                Ok(payload) => Some(payload),
+                Err(_) => {
+                    // Corrupt reassembly: reset for the next exchange
+                    state.reassembler = Reassembler::new();
+                    None
+                }
+            }
+        };
+
+        let Some(payload) = completed else {
+            return;
+        };
+        // One reassembly has completed; reset for the next exchange.
+        self.compute_state.lock().await.reassembler = Reassembler::new();
+
+        match payload.first().copied() {
+            Some(m) if m == static_storage::compute::MSG_COMPUTE_REQUEST => {
+                match static_storage::compute::deserialize_request(&payload) {
+                    Ok(request) => self.handle_compute_request(request).await,
+                    Err(_) => debug!("Dropping malformed compute request"),
+                }
+            }
+            Some(m) if m == static_storage::compute::MSG_COMPUTE_RESPONSE => {
+                match static_storage::compute::deserialize_response(&payload) {
+                    Ok(response) => self.handle_compute_response(response).await,
+                    Err(_) => debug!("Dropping malformed compute response"),
+                }
+            }
+            _ => debug!("Discarding non-compute payload after reassembly"),
+        }
+    }
+
+    /// Handle a compute request (provider role)
+    ///
+    /// Gates on compute-enabled, capacity, and fee; rejections get an
+    /// anonymous error response over the request's return route.
+    async fn handle_compute_request(self: &Arc<Self>, request: ComputeRequest) {
+        if !self.transport.compute_enabled {
+            debug!("Ignoring compute request (compute disabled)");
+            return;
+        }
+
+        if let Err(err) = self.accept_compute_request(&request).await {
+            debug!("Rejecting compute request {:02x?}: {}", request.request_id, err);
+            let response = ComputeResponse {
+                request_id: request.request_id,
+                output_data: vec![],
+                success: false,
+                error: Some(err.to_string()),
+                cpu_time_ms: 0,
+                memory_used: 0,
+                fee_charged: 0,
+            };
+            if let Err(e) = self.send_compute_response(response, &request.return_route).await {
+                warn!("Failed to send compute rejection: {}", e);
+            }
+            return;
+        }
+
+        debug!(
+            "Accepted compute request {:02x?} (fee offer {})",
+            request.request_id, request.fee_offer
+        );
+
+        // Execute off the inbound loop; the provider's identity is not
+        // revealed to the requester beyond the mixnet's guarantees.
+        let runner = self.clone();
+        tokio::spawn(async move {
+            runner.run_compute_execution(request).await;
+        });
+    }
+
+    /// Gate a compute request and register it as an active execution
+    ///
+    /// Checks capacity and fee, then records the execution. Duplicate
+    /// request IDs are accepted idempotently (the first registration
+    /// wins) so retried fragments cannot double-book an execution.
+    async fn accept_compute_request(
+        &self,
+        request: &ComputeRequest,
+    ) -> Result<(), ComputeError> {
+        let mut state = self.compute_state.lock().await;
+
+        if state.active_executions.contains_key(&request.request_id) {
+            return Ok(());
+        }
+        if state.active_executions.len() >= usize::from(self.transport.compute_capacity) {
+            return Err(ComputeError::CapacityExceeded);
+        }
+        if request.fee_offer < MIN_COMPUTE_FEE {
+            return Err(ComputeError::FeeInsufficient);
+        }
+
+        state.active_executions.insert(
+            request.request_id,
+            ComputeExecution {
+                request_id: request.request_id,
+                from_node: request.from_node,
+                module_content_id: request.module_content_id,
+                input_data: request.input_data.clone(),
+                fee_offer: request.fee_offer,
+                started_at: current_timestamp(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Fetch a WASM module from cache or the network (provider role)
+    async fn obtain_module(
+        &self,
+        request: &ComputeRequest,
+    ) -> Result<Vec<u8>, ComputeError> {
+        {
+            let state = self.compute_state.lock().await;
+            if let Some(bytes) = state.cached_modules.get(&request.module_content_id) {
+                return Ok(bytes.clone());
+            }
+        }
+
+        // Fetch the published module content through the normal retrieval
+        // protocol (manifest chunk request + reassembly). Once fetched the
+        // module is cached for future requests.
+        let bytes = self
+            .retrieve_content(&request.module_content_pub_key)
+            .await
+            .map_err(|_| ComputeError::ModuleNotFound)?;
+        if bytes.is_empty() {
+            return Err(ComputeError::ModuleNotFound);
+        }
+        Ok(bytes)
+    }
+
+    /// Execute an accepted compute request and send the response
+    async fn run_compute_execution(self: Arc<Self>, request: ComputeRequest) {
+        let module_bytes = match self.obtain_module(&request).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.finish_failed_execution(&request, err).await;
+                return;
+            }
+        };
+
+        self.compute_state
+            .lock()
+            .await
+            .cached_modules
+            .insert(request.module_content_id, module_bytes.clone());
+
+        let compute_config = self.config.compute_config.clone();
+        let input_len = request.input_data.len();
+        let input_data = request.input_data.clone();
+        let exec = tokio::task::spawn_blocking(move || {
+            execute_wasm(
+                &module_bytes,
+                &input_data,
+                compute_config.max_cpu_ms,
+                compute_config.max_memory_mb,
+            )
+        })
+        .await;
+
+        match exec {
+            Ok(Ok((output_data, cpu_time_ms, memory_used))) => {
+                let output_len = output_data.len();
+                let fee = ((input_len as u64 + output_len as u64)
+                    * self.config.compute_config.fee_multiplier)
+                    .min(request.fee_offer);
+
+                {
+                    let mut state = self.compute_state.lock().await;
+                    state.active_executions.remove(&request.request_id);
+                    state.successful_executions += 1;
+                    state.compute_bytes_served += output_len as u64;
+                }
+                self.accounting
+                    .lock()
+                    .await
+                    .record_served(request.from_node, fee);
+
+                debug!(
+                    "Compute execution {:02x?} succeeded: {} bytes output, {} ms",
+                    request.request_id, output_len, cpu_time_ms
+                );
+
+                let response = ComputeResponse {
+                    request_id: request.request_id,
+                    output_data,
+                    success: true,
+                    error: None,
+                    cpu_time_ms,
+                    memory_used,
+                    fee_charged: fee,
+                };
+                if let Err(e) = self.send_compute_response(response, &request.return_route).await {
+                    warn!("Failed to send compute response: {}", e);
+                }
+            }
+            Ok(Err(err)) => {
+                self.finish_failed_execution(&request, err).await;
+            }
+            Err(join_err) => {
+                self.finish_failed_execution(
+                    &request,
+                    ComputeError::ExecutionFailed(join_err.to_string()),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Deregister a failed execution and send an anonymous error response
+    async fn finish_failed_execution(
+        self: Arc<Self>,
+        request: &ComputeRequest,
+        error: ComputeError,
+    ) {
+        {
+            let mut state = self.compute_state.lock().await;
+            state.active_executions.remove(&request.request_id);
+            state.failed_executions += 1;
+        }
+        warn!(
+            "Compute execution {:02x?} failed: {}",
+            request.request_id, error
+        );
+
+        let response = ComputeResponse {
+            request_id: request.request_id,
+            output_data: vec![],
+            success: false,
+            error: Some(error.to_string()),
+            cpu_time_ms: 0,
+            memory_used: 0,
+            fee_charged: 0,
+        };
+        if let Err(e) = self.send_compute_response(response, &request.return_route).await {
+            warn!("Failed to send compute error response: {}", e);
+        }
+    }
+
+    /// Send a compute response over the request's return route
+    async fn send_compute_response(
+        &self,
+        response: ComputeResponse,
+        return_route: &ReturnRoute,
+    ) -> anyhow::Result<()> {
+        let packets = build_response_packets(&response, return_route)?;
+        let first_hop = return_route
+            .hops
+            .first()
+            .map(|h| h.node_id)
+            .ok_or_else(|| anyhow::anyhow!("empty return route"))?;
+
+        let connections = self.transport.connections.read().await;
+        if let Some(sender) = connections.get(&first_hop) {
+            for packet in packets {
+                let _ = sender.send(WireMessage::Sphinx(packet)).await;
+            }
+        } else {
+            anyhow::bail!("no connection to compute return route first hop");
+        }
+        Ok(())
+    }
+
+    /// Handle a compute response (requester role)
+    ///
+    /// Records the result for API polling and books the charged fee
+    /// against the provider the request was routed to.
+    async fn handle_compute_response(&self, response: ComputeResponse) {
+        let provider = {
+            let mut state = self.compute_state.lock().await;
+            let Some(pending) = state.pending_requests.remove(&response.request_id) else {
+                debug!(
+                    "Ignoring compute response for unknown request {:02x?}",
+                    response.request_id
+                );
+                return;
+            };
+            state.compute_bytes_received += response.output_data.len() as u64;
+            pending.provider
+        };
+
+        if response.fee_charged > 0 {
+            self.accounting
+                .lock()
+                .await
+                .record_received(provider, response.fee_charged);
+        }
+
+        if response.success {
+            info!(
+                "Compute execution {:02x?} succeeded: {} bytes output, {} ms CPU, {} bytes memory",
+                response.request_id, response.output_data.len(), response.cpu_time_ms,
+                response.memory_used
+            );
+        } else {
+            warn!(
+                "Compute execution {:02x?} failed: {}",
+                response.request_id,
+                response.error.clone().unwrap_or_default()
+            );
+        }
+
+        let mut state = self.compute_state.lock().await;
+        if state.completed_results.len() >= MAX_COMPLETED_COMPUTE_RESULTS {
+            state.completed_results.clear();
+        }
+        state.completed_results.insert(response.request_id, response);
+    }
+
+    /// Submit a compute request to the most capable compute peer
+    ///
+    /// Returns the request ID used to poll for the result via
+    /// [`NodeRunner::compute_result`].
+    pub async fn submit_compute_request(
+        &self,
+        module_content_pub_key: &[u8; 32],
+        input_data: Vec<u8>,
+        fee_offer: u64,
+    ) -> anyhow::Result<[u8; 32]> {
+        if input_data.len() > MAX_COMPUTE_INPUT_SIZE {
+            anyhow::bail!(
+                "input too large: {} bytes (max {})",
+                input_data.len(),
+                MAX_COMPUTE_INPUT_SIZE
+            );
+        }
+        if fee_offer < MIN_COMPUTE_FEE {
+            anyhow::bail!("fee too low: {} (min {})", fee_offer, MIN_COMPUTE_FEE);
+        }
+
+        let routing_table = self.transport.routing_table.read().await;
+        let peer = routing_table
+            .nodes
+            .values()
+            .filter(|n| n.compute_enabled)
+            .max_by_key(|n| n.compute_capacity)
+            .cloned();
+        drop(routing_table);
+        let Some(peer) = peer else {
+            anyhow::bail!("No compute-capable peers available");
+        };
+
+        let module_content_id =
+            static_storage::hidden_service::content_id_from_public(module_content_pub_key);
+
+        let mut request_id = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut request_id);
+
+        let our_pubkey = self.transport.mix_node.lock().await.public_key;
+        let our_node_id = self.transport.node_id;
+        let return_route = ReturnRoute::from_sphinx_route(&Route {
+            hops: vec![RouteHop {
+                public_key: our_pubkey,
+                node_id: our_node_id,
+            }],
+            destination: our_node_id,
+        });
+
+        let request = ComputeRequest {
+            from_node: our_node_id,
+            module_content_id,
+            module_content_pub_key: *module_content_pub_key,
+            fee_offer,
+            request_id,
+            return_route,
+            input_data,
+        };
+
+        let forward_route = Route {
+            hops: vec![RouteHop {
+                public_key: peer.public_key,
+                node_id: peer.node_id,
+            }],
+            destination: peer.node_id,
+        };
+        let packets = build_request_packets(&request, &forward_route)?;
+
+        self.compute_state.lock().await.pending_requests.insert(
+            request_id,
+            PendingComputeRequest {
+                request_id,
+                provider: peer.node_id,
+                fee_offer,
+                started_at: current_timestamp(),
+            },
+        );
+
+        // Each fragment travels as its own Sphinx packet, indistinguishable
+        // from cover traffic.
+        for packet in packets {
+            send_sphinx(&self.transport, peer.node_id, packet).await?;
+        }
+
+        debug!(
+            "Submitted compute request {:02x?} to {:02x?}",
+            request_id, peer.node_id
+        );
+        Ok(request_id)
+    }
+
+    /// Poll a submitted compute request for its completed result
+    ///
+    /// Returns `None` while the response has not arrived.
+    pub async fn compute_result(&self, request_id: &[u8; 32]) -> Option<ComputeResponse> {
+        self.compute_state
+            .lock()
+            .await
+            .completed_results
+            .get(request_id)
+            .cloned()
     }
 
     /// Convert local accounting state into batched wire entries
@@ -1881,5 +2427,163 @@ mod tests {
                 .serve_enabled
                 .load(std::sync::atomic::Ordering::Relaxed)
         );
+    }
+
+    fn test_compute_request(request_id: [u8; 32], fee_offer: u64) -> ComputeRequest {
+        ComputeRequest {
+            from_node: [0x11u8; 16],
+            module_content_id: [0x22u8; 32],
+            module_content_pub_key: [0x33u8; 32],
+            fee_offer,
+            request_id,
+            return_route: ReturnRoute {
+                hops: vec![],
+                destination: [0x44u8; 16],
+            },
+            input_data: b"compute input".to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_compute_state_creation() {
+        let state = ComputeState::default();
+        assert!(state.active_executions.is_empty());
+        assert!(state.cached_modules.is_empty());
+        assert!(state.pending_requests.is_empty());
+        assert!(state.completed_results.is_empty());
+        assert_eq!(state.compute_bytes_served, 0);
+        assert_eq!(state.compute_bytes_received, 0);
+        assert_eq!(state.successful_executions, 0);
+        assert_eq!(state.failed_executions, 0);
+    }
+
+    #[tokio::test]
+    async fn test_compute_capacity_check() {
+        let mut config = NodeConfig::default();
+        config.compute_config = crate::ComputeConfig {
+            enabled: true,
+            capacity: 1,
+            ..Default::default()
+        };
+        let runner = Arc::new(NodeRunner::new(config, [0x42u8; 16], MixNode::new()));
+
+        // First request is accepted and tracked.
+        runner
+            .accept_compute_request(&test_compute_request([0xA1u8; 32], 5000))
+            .await
+            .expect("first request should be accepted");
+        assert_eq!(runner.compute_state.lock().await.active_executions.len(), 1);
+
+        // Second concurrent request exceeds capacity and is rejected.
+        let err = runner
+            .accept_compute_request(&test_compute_request([0xA2u8; 32], 5000))
+            .await
+            .expect_err("second request should be rejected");
+        assert!(matches!(err, ComputeError::CapacityExceeded));
+    }
+
+    #[tokio::test]
+    async fn test_compute_fee_check() {
+        let mut config = NodeConfig::default();
+        config.compute_config = crate::ComputeConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let runner = Arc::new(NodeRunner::new(config, [0x42u8; 16], MixNode::new()));
+
+        let err = runner
+            .accept_compute_request(&test_compute_request([0xB1u8; 32], MIN_COMPUTE_FEE - 1))
+            .await
+            .expect_err("low-fee request should be rejected");
+        assert!(matches!(err, ComputeError::FeeInsufficient));
+
+        runner
+            .accept_compute_request(&test_compute_request([0xB2u8; 32], MIN_COMPUTE_FEE))
+            .await
+            .expect("minimum fee should be accepted");
+    }
+
+    #[tokio::test]
+    async fn test_compute_execution_tracking() {
+        let mut config = NodeConfig::default();
+        config.compute_config = crate::ComputeConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let runner = Arc::new(NodeRunner::new(config, [0x42u8; 16], MixNode::new()));
+
+        let request = test_compute_request([0xC1u8; 32], 5000);
+        runner
+            .accept_compute_request(&request)
+            .await
+            .expect("request should be accepted");
+        assert!(runner.compute_state.lock().await.active_executions.contains_key(&request.request_id));
+
+        // A failed execution deregisters and counts.
+        runner
+            .clone()
+            .finish_failed_execution(&request, ComputeError::ModuleNotFound)
+            .await;
+        let state = runner.compute_state.lock().await;
+        assert!(!state.active_executions.contains_key(&request.request_id));
+        assert_eq!(state.failed_executions, 1);
+        assert_eq!(state.successful_executions, 0);
+    }
+
+    #[tokio::test]
+    async fn test_compute_response_handling() {
+        let runner = Arc::new(NodeRunner::new(NodeConfig::default(), [0x42u8; 16], MixNode::new()));
+
+        let request_id = [0xD1u8; 32];
+        let provider = [0x99u8; 16];
+        runner.compute_state.lock().await.pending_requests.insert(
+            request_id,
+            PendingComputeRequest {
+                request_id,
+                provider,
+                fee_offer: 10_000,
+                started_at: current_timestamp(),
+            },
+        );
+
+        let response = ComputeResponse {
+            request_id,
+            output_data: vec![1, 2, 3],
+            success: true,
+            error: None,
+            cpu_time_ms: 10,
+            memory_used: 4096,
+            fee_charged: 3_000,
+        };
+        runner.handle_compute_response(response).await;
+
+        let state = runner.compute_state.lock().await;
+        assert!(state.pending_requests.is_empty());
+        assert_eq!(state.compute_bytes_received, 3);
+        let stored = state.completed_results.get(&request_id).expect("result stored");
+        assert_eq!(stored.fee_charged, 3_000);
+        drop(state);
+
+        // Fee booked against the provider the request was routed to.
+        let accounting = runner.accounting.lock().await;
+        let credit = accounting.peers.get(&provider).expect("credit entry");
+        assert_eq!(credit.bytes_received, 3_000);
+    }
+
+    #[tokio::test]
+    async fn test_compute_request_ignored_when_disabled() {
+        // Compute is disabled by default.
+        let runner = Arc::new(NodeRunner::new(NodeConfig::default(), [0x42u8; 16], MixNode::new()));
+        assert!(!runner.transport.compute_enabled);
+
+        let payload = static_storage::compute::serialize_request(&test_compute_request([0xE1u8; 32], 5000))
+            .unwrap();
+        for fragment in static_mesh::fragment::fragment_payload(&payload) {
+            let body = static_mesh::fragment::serialize_fragment(&fragment);
+            runner.handle_compute_fragment(&body).await;
+        }
+
+        // Disabled nodes neither track nor execute compute requests.
+        assert!(runner.compute_state.lock().await.active_executions.is_empty());
     }
 }

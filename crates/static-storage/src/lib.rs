@@ -21,6 +21,9 @@ pub mod heartbeat;
 /// Chunk retrieval protocol
 pub mod retrieval;
 
+/// Compute execution protocol (WASM requests/responses over Sphinx)
+pub mod compute;
+
 /// Hidden service discovery and encrypted manifests
 pub mod hidden_service;
 

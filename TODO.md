@@ -104,7 +104,7 @@
 
 ## Core Architecture (Future Discussions)
 
-### 15. Compute Network & Dynamic Hidden Services
+### 15. Compute Network & Dynamic Hidden Services ✅ DONE
 - Current state: Static is an anonymous *storage* network. Compute stays local.
 - Goal: Allow nodes to offer both storage AND compute (for higher fees/priority).
 - Proposed mechanics:
@@ -114,6 +114,17 @@
   - Compute providers earn higher accounting credit/tier.
   - Confidentiality options: Trusted Execution Environments (TEEs) or Homomorphic Encryption if the compute provider shouldn't see the data.
    - Routing logic for compute requests vs. storage requests.
+- Implementation: WASM via `wasmtime` (fuel CPU cap + resource-limiter memory cap,
+  no WASI). `ComputeRequest`/`ComputeResponse` are Sphinx-body messages
+  (`static-storage/src/compute.rs`, type bytes 0x03/0x04), fragmented like chunk
+  responses and reassembled at the destination — indistinguishable from cover
+  traffic, never direct wire messages. Providers advertise
+  `compute_enabled`/`compute_capacity` in handshakes (propagated via gossip);
+  requesters route to the most capable compute peer. Modules are fetched through
+  the normal retrieval protocol and cached. Fees: (input+output) x multiplier
+  (default 10x storage credit). Results poll via the `compute_result` API
+  action / `static-node compute --wait`. Confidentiality: trust-based for MVP;
+  response/request types carry the metadata a TEE provider needs later.
 
 ## Technical Debt
 

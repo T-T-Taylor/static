@@ -21,3 +21,5 @@ rand.workspace = true
 clap = { version = "4.0", features = ["derive"] }
 bytes.workspace = true
 hex = "0.4"
+thiserror.workspace = true
+wasmtime.workspace = true

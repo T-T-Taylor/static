@@ -303,6 +303,10 @@ pub struct TransportState {
     /// heartbeat timeout, the backup activates. Gossip (60 s cadence)
     /// keeps entries fresh for any connected, living peer.
     pub peer_activity: Arc<std::sync::Mutex<HashMap<NodeId, u64>>>,
+    /// Whether this node accepts compute requests (advertised in handshakes)
+    pub compute_enabled: bool,
+    /// Maximum concurrent compute executions (advertised in handshakes)
+    pub compute_capacity: u8,
     /// The transport implementation (TCP by default)
     pub transport: Arc<dyn Transport>,
 }
@@ -413,6 +417,8 @@ pub async fn handle_incoming_connection(
                         public_key: state.mix_node.lock().await.public_key,
                         tier: state.cover_config.read().await.tier,
                         kem_public_key: Some(state.kem.lock().await.public_bytes()),
+                        compute_enabled: state.compute_enabled,
+                        compute_capacity: state.compute_capacity,
                     });
                     
                     let mut write_buf = bytes::BytesMut::new();
@@ -431,6 +437,8 @@ pub async fn handle_incoming_connection(
                         public_key: hs.public_key,
                         address: addr.clone(),
                         kem_public_key: hs.kem_public_key.clone(),
+                        compute_enabled: hs.compute_enabled,
+                        compute_capacity: hs.compute_capacity,
                     });
 
                     // Set up connection
@@ -512,6 +520,8 @@ pub async fn connect_to_peer(
         public_key: state.mix_node.lock().await.public_key,
         tier: state.cover_config.read().await.tier,
         kem_public_key: Some(state.kem.lock().await.public_bytes()),
+        compute_enabled: state.compute_enabled,
+        compute_capacity: state.compute_capacity,
     });
 
     let mut write_buf = bytes::BytesMut::new();
@@ -540,6 +550,8 @@ pub async fn connect_to_peer(
                         public_key: hs.public_key,
                         address: addr.to_string(),
                         kem_public_key: hs.kem_public_key.clone(),
+                        compute_enabled: hs.compute_enabled,
+                        compute_capacity: hs.compute_capacity,
                     });
 
                     let (tx, rx) = mpsc::channel::<WireMessage>(CHANNEL_BUFFER);
@@ -1198,6 +1210,8 @@ pub fn create_transport_state(
         previously_connected: Arc::new(RwLock::new(HashSet::new())),
         serve_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         peer_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        compute_enabled: false,
+        compute_capacity: 0,
         transport,
     });
 

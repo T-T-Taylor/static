@@ -101,6 +101,14 @@ struct Cli {
     #[arg(long, default_value_t = 100)]
     max_cached: usize,
 
+    /// Enable compute request handling (sandboxed WASM execution)
+    #[arg(long)]
+    compute_enabled: bool,
+
+    /// Maximum concurrent compute executions (default: 4)
+    #[arg(long, default_value_t = 4)]
+    compute_capacity: u32,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -127,6 +135,19 @@ enum Commands {
         /// Path to save the retrieved file
         output_path: PathBuf,
     },
+    /// Submit a compute request for a WASM module
+    Compute {
+        /// Hex-encoded content public key of the WASM module
+        module_key: String,
+        /// Hex-encoded input data for the module
+        input: String,
+        /// Fee offer in bytes of storage credit
+        #[arg(long, default_value_t = 10240)]
+        fee: u64,
+        /// Seconds to wait for the result before giving up (0 = submit only)
+        #[arg(long, default_value_t = 30)]
+        wait: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -134,6 +155,7 @@ struct ApiRequest {
     action: String,
     data: Option<String>,
     content_pub_key: Option<String>,
+    compute_fee: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -144,6 +166,7 @@ struct ApiResponse {
     manifest: Option<static_storage::ContentManifest>,
     data: Option<String>,
     content_pub_key: Option<String>,
+    request_id: Option<String>,
 }
 
 
@@ -216,6 +239,11 @@ async fn main() -> Result<()> {
         use_hybrid_crypto: cli.hybrid_crypto,
         rotation_config,
         backup_config,
+        compute_config: static_node::ComputeConfig {
+            enabled: cli.compute_enabled,
+            capacity: cli.compute_capacity,
+            ..Default::default()
+        },
     };
 
     match cli.command {
@@ -312,6 +340,7 @@ async fn main() -> Result<()> {
                 action: "publish".into(),
                 data: Some(data_hex),
                 content_pub_key: None,
+                compute_fee: None,
             };
             
             let response = send_api_request(&config.api_addr, &request).await?;
@@ -340,6 +369,7 @@ async fn main() -> Result<()> {
                 action: "retrieve".into(),
                 data: None,
                 content_pub_key: Some(content_pub_key),
+                compute_fee: None,
             };
             
             let response = send_api_request(&config.api_addr, &request).await?;
@@ -355,6 +385,67 @@ async fn main() -> Result<()> {
             } else {
                 eprintln!("Retrieve failed: {}", response.message);
             }
+        }
+        Commands::Compute { module_key, input, fee, wait } => {
+            let request = ApiRequest {
+                action: "compute".into(),
+                data: Some(input),
+                content_pub_key: Some(module_key),
+                compute_fee: Some(fee),
+            };
+
+            let response = send_api_request(&config.api_addr, &request).await?;
+
+            if response.status != "ok" {
+                eprintln!("Compute failed: {}", response.message);
+                return Ok(());
+            }
+
+            let request_id = response
+                .request_id
+                .ok_or_else(|| anyhow::anyhow!("Compute accepted but no request ID returned"))?;
+            println!("Compute request submitted. Request ID: {}", request_id);
+
+            if wait == 0 {
+                println!("Poll for the result: static-node status  (or re-run with --wait)");
+                return Ok(());
+            }
+
+            // Poll the local API until the result arrives or the wait
+            // budget is exhausted.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+            while std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+                let poll = ApiRequest {
+                    action: "compute_result".into(),
+                    data: Some(request_id.clone()),
+                    content_pub_key: None,
+                    compute_fee: None,
+                };
+                let poll_response = send_api_request(&config.api_addr, &poll).await?;
+
+                match poll_response.status.as_str() {
+                    "ok" => {
+                        let output_hex = poll_response.data.unwrap_or_default();
+                        if poll_response.message.contains("failed") {
+                            eprintln!("Compute execution failed: {}", output_hex);
+                        } else {
+                            println!("Compute output (hex): {}", output_hex);
+                        }
+                        return Ok(());
+                    }
+                    "pending" => continue,
+                    _ => {
+                        eprintln!("Compute failed: {}", poll_response.message);
+                        return Ok(());
+                    }
+                }
+            }
+            println!(
+                "Result not ready yet. Poll again later with request ID: {}",
+                request_id
+            );
         }
     }
 

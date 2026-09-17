@@ -80,6 +80,10 @@ pub struct Handshake {
     /// `None` for legacy (classical-only) peers. Serialized as trailing
     /// bytes: absent in 49-byte legacy handshakes, present afterwards.
     pub kem_public_key: Option<Vec<u8>>,
+    /// Whether the sending node accepts compute requests
+    pub compute_enabled: bool,
+    /// Maximum concurrent compute executions on the sending node
+    pub compute_capacity: u8,
 }
 
 /// A wire message
@@ -209,19 +213,30 @@ pub enum WireError {
 }
 
 /// Serialize a handshake message into a bytes buffer
+///
+/// Layout: `[16 node_id][32 public_key][1 tier][kem bytes?][2 compute]`.
+/// The final two bytes are always `compute_enabled` and `compute_capacity`;
+/// everything between the fixed 49-byte prefix and those two bytes is the
+/// KEM public key (empty for classical-only peers).
 fn serialize_handshake(handshake: &Handshake) -> Vec<u8> {
     let kem_len = handshake.kem_public_key.as_ref().map(|k| k.len()).unwrap_or(0);
-    let mut buf = Vec::with_capacity(16 + 32 + 1 + kem_len);
+    let mut buf = Vec::with_capacity(16 + 32 + 1 + kem_len + 2);
     buf.extend_from_slice(&handshake.node_id);
     buf.extend_from_slice(&handshake.public_key);
     buf.push(handshake.tier as u8);
     if let Some(kem) = &handshake.kem_public_key {
         buf.extend_from_slice(kem);
     }
+    buf.push(u8::from(handshake.compute_enabled));
+    buf.push(handshake.compute_capacity);
     buf
 }
 
 /// Deserialize a handshake message from a bytes buffer
+///
+/// Accepts legacy layouts (49-byte classical, 49+kem-byte hybrid) and maps
+/// them to compute-disabled defaults; handshakes of at least 51 bytes carry
+/// the two compute capability bytes at the end.
 fn deserialize_handshake(data: &[u8]) -> Result<Handshake, WireError> {
     if data.len() < 16 + 32 + 1 {
         return Err(WireError::BufferTooShort {
@@ -243,15 +258,41 @@ fn deserialize_handshake(data: &[u8]) -> Result<Handshake, WireError> {
         _ => return Err(WireError::InvalidMessageType(data[48])), // Reusing error type for simplicity
     };
 
-    // Trailing bytes (if any) are the peer's ML-KEM public key.
-    // Legacy 49-byte handshakes carry no KEM key (classical-only peer).
-    let kem_public_key = if data.len() > 49 {
-        Some(data[49..].to_vec())
+    // Compute capability (2 trailing bytes) and KEM key (everything between
+    // the fixed prefix and the compute bytes) are disambiguated by length.
+    // The exact legacy hybrid length is matched first so pre-compute peers'
+    // KEM keys are never mistaken for compute bytes.
+    const KEM_SIZE: usize = static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE;
+    let (kem_public_key, compute_enabled, compute_capacity) = if data.len() == 49 {
+        (None, false, 0)
+    } else if data.len() == 49 + KEM_SIZE {
+        // Legacy hybrid peer: KEM key only, no compute capability.
+        (Some(data[49..].to_vec()), false, 0)
+    } else if data.len() >= 51 {
+        let compute_enabled = data[data.len() - 2] == 1;
+        let compute_capacity = data[data.len() - 1];
+        let kem = &data[49..data.len() - 2];
+        (
+            if kem.is_empty() {
+                None
+            } else {
+                Some(kem.to_vec())
+            },
+            compute_enabled,
+            compute_capacity,
+        )
     } else {
-        None
+        (None, false, 0)
     };
 
-    Ok(Handshake { node_id, public_key, tier, kem_public_key })
+    Ok(Handshake {
+        node_id,
+        public_key,
+        tier,
+        kem_public_key,
+        compute_enabled,
+        compute_capacity,
+    })
 }
 
 /// Serialize a Sphinx packet into a bytes buffer
@@ -542,15 +583,19 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
             public_key: [0xABu8; 32],
             tier: crate::BandwidthTier::Standard,
             kem_public_key: None,
+            compute_enabled: false,
+            compute_capacity: 0,
         };
 
         let serialized = serialize_handshake(&hs);
-        assert_eq!(serialized.len(), 49);
+        assert_eq!(serialized.len(), 51);
 
         let deserialized = deserialize_handshake(&serialized).unwrap();
         assert_eq!(deserialized.node_id, hs.node_id);
         assert_eq!(deserialized.public_key, hs.public_key);
         assert!(deserialized.kem_public_key.is_none());
+        assert!(!deserialized.compute_enabled);
+        assert_eq!(deserialized.compute_capacity, 0);
     }
 
     #[test]
@@ -605,6 +650,8 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
             public_key: [0xABu8; 32],
             tier: crate::BandwidthTier::Standard,
             kem_public_key: None,
+            compute_enabled: false,
+            compute_capacity: 0,
         };
         let msg = WireMessage::Handshake(hs);
 
@@ -657,6 +704,8 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
             public_key: [0xABu8; 32],
             tier: crate::BandwidthTier::Standard,
             kem_public_key: None,
+            compute_enabled: false,
+            compute_capacity: 0,
         };
         let msg = WireMessage::Handshake(hs);
         let serialized = serialize_message(&msg).unwrap();
@@ -674,6 +723,8 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
             public_key: [0xABu8; 32],
             tier: crate::BandwidthTier::Standard,
             kem_public_key: None,
+            compute_enabled: false,
+            compute_capacity: 0,
         };
         let msg = WireMessage::Handshake(hs);
         let serialized = serialize_message(&msg).unwrap();
@@ -692,12 +743,16 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
             public_key: [0x01u8; 32],
             tier: crate::BandwidthTier::Standard,
             kem_public_key: None,
+            compute_enabled: false,
+            compute_capacity: 0,
         };
         let hs2 = Handshake {
             node_id: [0x02u8; 16],
             public_key: [0x02u8; 32],
             tier: crate::BandwidthTier::Standard,
             kem_public_key: None,
+            compute_enabled: false,
+            compute_capacity: 0,
         };
 
         let mut buf = BytesMut::new();
@@ -811,11 +866,44 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
             public_key: [0xABu8; 32],
             tier: crate::BandwidthTier::Standard,
             kem_public_key: Some(kem.clone()),
+            compute_enabled: false,
+            compute_capacity: 0,
         };
         let serialized = serialize_handshake(&hs);
-        assert_eq!(serialized.len(), 49 + kem.len());
+        assert_eq!(serialized.len(), 51 + kem.len());
         let back = deserialize_handshake(&serialized).unwrap();
         assert_eq!(back.kem_public_key, Some(kem));
+    }
+
+    #[test]
+    fn test_handshake_with_compute() {
+        let kem = vec![0x66u8; static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE];
+        let hs = Handshake {
+            node_id: [0x77u8; 16],
+            public_key: [0x88u8; 32],
+            tier: crate::BandwidthTier::High,
+            kem_public_key: Some(kem.clone()),
+            compute_enabled: true,
+            compute_capacity: 4,
+        };
+
+        let serialized = serialize_handshake(&hs);
+        assert_eq!(serialized.len(), 51 + kem.len());
+        let back = deserialize_handshake(&serialized).unwrap();
+
+        assert_eq!(back.node_id, hs.node_id);
+        assert_eq!(back.kem_public_key.as_deref(), Some(kem.as_slice()));
+        assert!(back.compute_enabled);
+        assert_eq!(back.compute_capacity, 4);
+
+        // Legacy hybrid peer (kem only, no compute bytes) parses with
+        // compute disabled.
+        let mut legacy = vec![0u8; 49];
+        legacy.extend_from_slice(&kem);
+        let legacy_hs = deserialize_handshake(&legacy).unwrap();
+        assert_eq!(legacy_hs.kem_public_key.as_deref(), Some(kem.as_slice()));
+        assert!(!legacy_hs.compute_enabled);
+        assert_eq!(legacy_hs.compute_capacity, 0);
     }
 
     #[test]

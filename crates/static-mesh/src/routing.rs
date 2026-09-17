@@ -32,6 +32,14 @@ pub struct KnownNode {
     /// learned via gossip (gossip strips KEM keys to bound message size).
     #[serde(default)]
     pub kem_public_key: Option<Vec<u8>>,
+    /// Whether this node accepts compute requests
+    ///
+    /// Learned via direct handshake or gossip.
+    #[serde(default)]
+    pub compute_enabled: bool,
+    /// Maximum concurrent compute executions on this node
+    #[serde(default)]
+    pub compute_capacity: u8,
 }
 
 /// Peer gossip message
@@ -241,6 +249,8 @@ impl RoutingTable {
             public_key: node.public_key,
             address,
             kem_public_key: None,
+            compute_enabled: false,
+            compute_capacity: 0,
         }
     }
 
@@ -255,6 +265,8 @@ impl RoutingTable {
             public_key: node.public_key,
             address,
             kem_public_key: Some(kem_public_key),
+            compute_enabled: false,
+            compute_capacity: 0,
         }
     }
 }
@@ -294,6 +306,8 @@ mod tests {
             public_key: pub_key,
             address: "127.0.0.1:9000".to_string(),
             kem_public_key: None,
+            compute_enabled: false,
+            compute_capacity: 0,
         }
     }
 
@@ -327,6 +341,8 @@ mod tests {
             public_key: [0u8; 32],
             address: "127.0.0.1:9000".to_string(),
             kem_public_key: None,
+                compute_enabled: false,
+                compute_capacity: 0,
         };
 
         table.add_node(node);
@@ -468,6 +484,8 @@ mod tests {
                 public_key: [0u8; 32],
                 address: "127.0.0.1:9000".to_string(),
                 kem_public_key: None,
+                compute_enabled: false,
+                compute_capacity: 0,
             }],
         };
 

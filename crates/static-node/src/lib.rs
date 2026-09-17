@@ -18,6 +18,9 @@ pub mod config;
 /// Local API server
 pub mod api;
 
+/// WASM compute execution (sandboxed module runtime)
+pub mod compute;
+
 /// Async node runner
 pub mod runner;
 
@@ -85,6 +88,9 @@ pub struct NodeConfig {
     /// Backup-only mode configuration
     #[serde(default = "default_backup_config")]
     pub backup_config: BackupConfig,
+    /// Compute offering configuration (WASM execution for peers)
+    #[serde(default = "default_compute_config")]
+    pub compute_config: ComputeConfig,
 }
 
 /// Default for `NodeConfig::use_hybrid_crypto`: new nodes opt into hybrid
@@ -146,6 +152,43 @@ fn default_backup_config() -> BackupConfig {
     BackupConfig::default()
 }
 
+/// Configuration for compute offering (sandboxed WASM execution)
+///
+/// A compute provider executes WASM modules for peers through the mixnet
+/// and earns storage credit at a higher rate than storage barter.
+/// Disabled by default; enable with `--compute-enabled`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ComputeConfig {
+    /// Whether this node accepts compute requests
+    pub enabled: bool,
+    /// Maximum concurrent compute executions
+    pub capacity: u32,
+    /// Maximum CPU time per execution in milliseconds (fuel-based cap)
+    pub max_cpu_ms: u64,
+    /// Maximum memory per execution in megabytes
+    pub max_memory_mb: u32,
+    /// Compute fee multiplier: 1 byte of compute earns N bytes of
+    /// storage credit
+    pub fee_multiplier: u64,
+}
+
+impl Default for ComputeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            capacity: 4,
+            max_cpu_ms: 5000,
+            max_memory_mb: 64,
+            fee_multiplier: 10,
+        }
+    }
+}
+
+/// Default for `NodeConfig::compute_config`
+fn default_compute_config() -> ComputeConfig {
+    ComputeConfig::default()
+}
+
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
@@ -163,6 +206,7 @@ impl Default for NodeConfig {
             use_hybrid_crypto: default_hybrid_crypto(),
             rotation_config: default_rotation_config(),
             backup_config: default_backup_config(),
+            compute_config: default_compute_config(),
         }
     }
 }
