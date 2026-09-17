@@ -287,8 +287,46 @@ pub struct TransportState {
     /// first-time connections. Populated on disconnect, consumed on
     /// the next successful handshake with the same node ID.
     pub previously_connected: Arc<RwLock<HashSet<NodeId>>>,
+    /// Whether this node is currently allowed to serve chunks
+    ///
+    /// Full nodes always serve. Backup-only nodes start dormant
+    /// (`false`) and flip this to `true` when they activate after the
+    /// primary's heartbeats (inbound activity) stop. Every other kind
+    /// of traffic keeps flowing while dormant, so a dormant backup is
+    /// indistinguishable from any other peer on the wire.
+    pub serve_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-peer last inbound activity (heartbeat proxy)
+    ///
+    /// Every inbound message refreshes the sender's timestamp, so the
+    /// map tracks "when did we last hear from this peer". Backup-only
+    /// nodes monitor their primary's entry: once it exceeds the
+    /// heartbeat timeout, the backup activates. Gossip (60 s cadence)
+    /// keeps entries fresh for any connected, living peer.
+    pub peer_activity: Arc<std::sync::Mutex<HashMap<NodeId, u64>>>,
     /// The transport implementation (TCP by default)
     pub transport: Arc<dyn Transport>,
+}
+
+impl TransportState {
+    /// Record inbound liveness for a peer (heartbeat proxy)
+    ///
+    /// Cheap, synchronous, and safe to call from async contexts: the
+    /// lock is never held across an await.
+    pub fn note_peer_activity(&self, peer: NodeId) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.peer_activity.lock().unwrap().insert(peer, now);
+    }
+
+    /// Snapshot of per-peer last-activity timestamps
+    ///
+    /// Callers get an owned copy so the shared map is never locked
+    /// across awaits or while other locks are held.
+    pub fn peer_activity_snapshot(&self) -> HashMap<NodeId, u64> {
+        self.peer_activity.lock().unwrap().clone()
+    }
 }
 
 /// An inbound message from a peer
@@ -398,6 +436,8 @@ pub async fn handle_incoming_connection(
                     // Set up connection
                     let (tx, rx) = mpsc::channel::<WireMessage>(CHANNEL_BUFFER);
                     state.connections.write().await.insert(hs.node_id, tx.clone());
+                    // The handshake itself proves the peer is alive.
+                    state.note_peer_activity(hs.node_id);
 
                     // Partition-heal detection: if this node ID was connected
                     // before, this handshake is a reconnection. Signal the
@@ -504,6 +544,8 @@ pub async fn connect_to_peer(
 
                     let (tx, rx) = mpsc::channel::<WireMessage>(CHANNEL_BUFFER);
                     state.connections.write().await.insert(hs.node_id, tx.clone());
+                    // The handshake itself proves the peer is alive.
+                    state.note_peer_activity(hs.node_id);
 
                     // Partition-heal detection (outbound side).
                     if state.previously_connected.write().await.remove(&hs.node_id) {
@@ -693,6 +735,9 @@ async fn handle_message(
     from: NodeId,
 ) -> Result<(), TransportError> {
     println!("[HANDLE_MSG] Received message from {:02x?}", from);
+    // Any inbound message is proof of life: refresh the peer's
+    // liveness timestamp (backup nodes use this as the heartbeat).
+    state.note_peer_activity(from);
     match msg {
         WireMessage::Handshake(_) => {
             warn!("Unexpected handshake from connected peer {:02x?}", from);
@@ -739,6 +784,47 @@ async fn handle_message(
             
             match result {
                 Ok(()) => {
+                    // Dormant backup nodes materialize the offered chunk
+                    // locally: this is how backups acquire content (the
+                    // rotation swaps of full-node primaries deliver real
+                    // chunks). Active nodes keep the metadata-only swap
+                    // behavior: nothing is stored, so nothing is
+                    // accounted (item 16 invariant).
+                    if !state
+                        .serve_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        let chunk_len = proposal.chunk.data.len() as u64;
+                        let already_held = state
+                            .chunk_holder
+                            .lock()
+                            .await
+                            .has_chunk(&proposal.chunk.id);
+                        if !already_held {
+                            let fits = state
+                                .storage_capacity
+                                .lock()
+                                .await
+                                .can_accept(chunk_len, 0);
+                            if fits {
+                                state.chunk_holder.lock().await.add_chunk(
+                                    proposal.chunk.id,
+                                    proposal.chunk.data.clone(),
+                                    [0u8; 32], // swaps carry no content binding
+                                );
+                                state
+                                    .storage_capacity
+                                    .lock()
+                                    .await
+                                    .record_accept(chunk_len);
+                                debug!(
+                                    "Dormant backup stored swapped chunk {:02x?} ({} bytes)",
+                                    proposal.chunk.id, chunk_len
+                                );
+                            }
+                        }
+                    }
+
                     // Accept the swap - create a return chunk
                     // In a real implementation, we'd select one of our chunks to offer
                     // For now, create a dummy chunk
@@ -868,12 +954,27 @@ async fn handle_message(
                     // We are the destination - try to handle as chunk request
                     if let Some(body) = outcome.body {
                         println!("[HANDLE_MSG] Destination reached, body len: {}", body.len());
-                        
+
                         // Try to parse as a chunk request
                         match static_storage::retrieval::deserialize_request(&body) {
                             Ok(request) => {
                                 println!("[HANDLE_MSG] Parsed as ChunkRequest for chunk {:02x?}", request.chunk_id);
-                                
+
+                                // Dormant backup nodes hold chunks but do
+                                // not serve them. All other traffic keeps
+                                // flowing, so a dormant backup remains
+                                // indistinguishable from any other peer.
+                                if !state
+                                    .serve_enabled
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    debug!(
+                                        "Dormant backup ignoring chunk request for {:02x?}",
+                                        request.chunk_id
+                                    );
+                                    return Ok(());
+                                }
+
                                 // Look up the chunk in our holder
                                 let chunk_data = {
                                     let holder = state.chunk_holder.lock().await;
@@ -1095,6 +1196,8 @@ pub fn create_transport_state(
         chunk_holder: Arc::new(Mutex::new(chunk_holder)),
         kem: Arc::new(Mutex::new(static_crypto::KemKeypair::random())),
         previously_connected: Arc::new(RwLock::new(HashSet::new())),
+        serve_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        peer_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
         transport,
     });
 
@@ -1463,5 +1566,140 @@ mod tests {
         assert_eq!(&buf[..n], b"ping");
 
         server.await.unwrap();
+    }
+
+    /// Build a swap proposal carrying a real chunk
+    ///
+    /// Chunk data must be exactly `CHUNK_SIZE + 16` bytes and the lease
+    /// must be valid, or `decide_on_swap` rejects the proposal.
+    fn test_swap_proposal(from: NodeId, chunk_id: [u8; 32], data: Vec<u8>) -> static_storage::swap::SwapProposal {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        static_storage::swap::SwapProposal {
+            from_node: from,
+            chunk: static_storage::EncryptedChunk { id: chunk_id, data },
+            lease: static_storage::ChunkLease {
+                chunk_id,
+                expires_at: now + 86400,
+                renewal_token: [0u8; 32],
+            },
+            encrypted_master_key: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dormant_swap_accept_stores_chunk() {
+        let (state, _rx) = create_transport_state(
+            random_node_id(),
+            MixNode::new(),
+            crate::CoverTrafficConfig::default(),
+            test_capacity(),
+        );
+        // Dormant backup: serving disabled
+        state
+            .serve_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let chunk_id = [0xB1u8; 32];
+        let data = vec![0x5Cu8; static_storage::CHUNK_SIZE + 16];
+        let proposal = test_swap_proposal(random_node_id(), chunk_id, data.clone());
+
+        handle_message(WireMessage::SwapProposal(proposal), &state, random_node_id())
+            .await
+            .unwrap();
+
+        let expected_len = (static_storage::CHUNK_SIZE + 16) as u64;
+        let holder = state.chunk_holder.lock().await;
+        assert_eq!(holder.get_chunk(&chunk_id), Some(&data));
+        assert_eq!(holder.total_bytes(), expected_len);
+        drop(holder);
+        assert_eq!(state.storage_capacity.lock().await.current_bytes, expected_len);
+    }
+
+    #[tokio::test]
+    async fn test_active_swap_accept_stores_nothing() {
+        let (state, _rx) = create_transport_state(
+            random_node_id(),
+            MixNode::new(),
+            crate::CoverTrafficConfig::default(),
+            test_capacity(),
+        );
+        // Active node (default): serving enabled, metadata-only swaps
+        assert!(state.serve_enabled.load(std::sync::atomic::Ordering::Relaxed));
+
+        let chunk_id = [0xB2u8; 32];
+        let proposal = test_swap_proposal(
+            random_node_id(),
+            chunk_id,
+            vec![0x5Du8; static_storage::CHUNK_SIZE + 16],
+        );
+
+        handle_message(WireMessage::SwapProposal(proposal), &state, random_node_id())
+            .await
+            .unwrap();
+
+        assert!(state.chunk_holder.lock().await.get_chunk(&chunk_id).is_none());
+        assert_eq!(state.storage_capacity.lock().await.current_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn test_dormant_backup_ignores_chunk_request() {
+        // A dormant backup must not serve chunks it holds, even valid ones.
+        let (state, _rx) = create_transport_state(
+            random_node_id(),
+            MixNode::new(),
+            crate::CoverTrafficConfig::default(),
+            test_capacity(),
+        );
+        state
+            .serve_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // Store a chunk so an active node would have something to serve.
+        let chunk_id = [0xB3u8; 32];
+        state
+            .chunk_holder
+            .lock()
+            .await
+            .add_chunk(chunk_id, vec![0x11u8; 512], [0u8; 32]);
+
+        // Build a ChunkRequest destined for us and wrap it in a Sphinx
+        // packet addressed to our mix node (destination flag).
+        let requester_id = random_node_id();
+        let return_route = static_storage::retrieval::ReturnRoute {
+            hops: vec![static_storage::retrieval::RouteHopInfo {
+                public_key: [0u8; 32],
+                node_id: requester_id,
+            }],
+            destination: requester_id,
+        };
+        let request = static_storage::retrieval::ChunkRequest {
+            chunk_id,
+            return_route,
+        };
+        let request_bytes = static_storage::retrieval::serialize_request(&request);
+
+        // A packet created for us (our public key) with our node ID as
+        // destination decrypts at our hop with flag = Destination.
+        let our_pubkey = state.mix_node.lock().await.public_key;
+        let forward_route = Route {
+            hops: vec![RouteHop {
+                public_key: our_pubkey,
+                node_id: state.node_id,
+            }],
+            destination: state.node_id,
+        };
+        let packet = create_packet(&forward_route, &request_bytes).unwrap();
+
+        handle_message(WireMessage::Sphinx(packet), &state, requester_id)
+            .await
+            .unwrap();
+
+        // The chunk is still held (nothing was deleted), and no chunk
+        // response was sent (no connection to the requester existed, and
+        // more importantly the dormant gate returned before serving).
+        assert!(state.chunk_holder.lock().await.get_chunk(&chunk_id).is_some());
     }
 }

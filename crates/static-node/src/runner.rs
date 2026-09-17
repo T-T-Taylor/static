@@ -8,9 +8,11 @@
 //! - Chunk holder for serving retrieval requests
 //! - Constant-rate cover traffic loop
 //! - Lease expiration and repopulation loop
+//! - Backup-only mode: dormant chunk holding with primary health
+//!   monitoring and activation on heartbeat timeout
 
 use rand::RngCore;
-use crate::{NodeConfig, NodeMode, NodeStatus};
+use crate::{NodeConfig, NodeMode, NodeStatus, BackupConfig};
 use static_accounting::{AccountingState, PeerCredit, current_timestamp};
 use static_crypto::SymmetricKey;
 use static_mesh::transport::{
@@ -44,6 +46,33 @@ pub const PARTITION_GRACE_PERIOD_SECS: u64 = 86400;
 /// Default inactivity threshold before pruning a peer (7 days)
 pub const PRUNE_MAX_AGE_SECS: u64 = 86400 * 7;
 
+/// State for a single backed-up content item
+#[derive(Debug, Clone)]
+pub struct BackupContentState {
+    /// The content ID being backed up
+    ///
+    /// Chunks that arrive via swap carry no content binding, so those
+    /// entries use the chunk ID itself as the content ID.
+    pub content_id: ContentId,
+    /// The primary node ID for this content (`None` until known)
+    pub primary_node_id: Option<NodeId>,
+    /// Whether this backup is currently active (serving)
+    pub is_active: bool,
+    /// Last heartbeat (inbound activity) timestamp from the primary
+    pub last_heartbeat: u64,
+    /// Chunk IDs for this content
+    pub chunk_ids: Vec<ChunkId>,
+}
+
+/// Overall backup state for the node
+#[derive(Debug, Clone, Default)]
+pub struct BackupState {
+    /// Content items being backed up (content_id -> state)
+    pub backed_up_content: HashMap<ContentId, BackupContentState>,
+    /// Whether the node has activated for any content
+    pub any_active: bool,
+}
+
 /// The running Static node
 pub struct NodeRunner {
     /// Transport state (shared across tasks)
@@ -70,6 +99,8 @@ pub struct NodeRunner {
     pub retriever: Arc<Mutex<static_mesh::retrieval::RetrievalManager>>,
     /// Inbound message receiver
     pub inbound_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<InboundMessage>>>,
+    /// Backup state for tracking primary health and activation
+    pub backup_state: Arc<Mutex<BackupState>>,
     /// Node configuration
     pub config: NodeConfig,
 }
@@ -104,6 +135,14 @@ impl NodeRunner {
         let (transport, inbound_rx) =
             create_transport_state(node_id, mix_node, cover_config, capacity.clone());
 
+        // Backup-only nodes start dormant: they hold chunks but do not
+        // serve them until the primary fails (see backup_health_loop).
+        if matches!(config.mode, NodeMode::BackupOnly) {
+            transport
+                .serve_enabled
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+
         Self {
             transport,
             leases: Arc::new(Mutex::new(LeaseManager::new())),
@@ -115,6 +154,7 @@ impl NodeRunner {
             content_retriever: Arc::new(Mutex::new(ContentRetriever::new())),
             repair_state: Arc::new(Mutex::new(RepairState::new())),
             rotation_state: Arc::new(Mutex::new(RotationState::new())),
+            backup_state: Arc::new(Mutex::new(BackupState::default())),
             inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
             config,
         }
@@ -131,10 +171,28 @@ impl NodeRunner {
 
         match self.config.mode {
             NodeMode::BackupOnly => {
-                // TODO: Implement health-check via gossip and activation logic.
-                // Backup-only nodes are dormant: they run the listener but do
-                // not serve chunks until the primary's heartbeats stop.
-                info!("Backup-only mode: dormant, monitoring primary (stub)");
+                // Dormant backup: the listener runs and swaps are
+                // accepted (chunks accumulate), but chunk serving is
+                // disabled (serve_enabled=false, set in new()) until
+                // the primary's heartbeat timeout fires.
+                info!(
+                    "Backup-only mode: dormant, monitoring primary {} (heartbeat timeout {}s)",
+                    self.config.backup_config.primary_address.as_deref().unwrap_or("<unresolved>"),
+                    self.config.backup_config.heartbeat_timeout_secs
+                );
+                let backup_state = self.backup_state.clone();
+                let backup_config = self.config.backup_config.clone();
+                let transport_for_backup = self.transport.clone();
+                let leases_for_backup = self.leases.clone();
+                tokio::spawn(async move {
+                    backup_health_loop(
+                        backup_state,
+                        backup_config,
+                        transport_for_backup,
+                        leases_for_backup,
+                    )
+                    .await;
+                });
             }
             NodeMode::SeedOnly => {
                 info!(
@@ -161,13 +219,23 @@ impl NodeRunner {
         }
 
         // Build the dial list: sponsor first (seed-only requires it),
-        // then bootstrap peers.
+        // then the monitored primary (backup-only), then bootstrap peers.
         let mut dial_addrs: Vec<String> = Vec::new();
         if matches!(self.config.mode, NodeMode::SeedOnly) {
             if let Some(sponsor) = &self.config.sponsor {
                 dial_addrs.push(sponsor.clone());
             } else if self.config.bootstrap_peers.is_empty() {
                 warn!("Seed-only node has no --sponsor configured; cannot publish until a sponsor is connected");
+            }
+        }
+        if matches!(self.config.mode, NodeMode::BackupOnly) {
+            match &self.config.backup_config.primary_address {
+                Some(primary) => dial_addrs.push(primary.clone()),
+                None => {
+                    if self.config.backup_config.primary_node_id.is_none() {
+                        warn!("Backup-only node has no primary configured; it will stay dormant (no liveness signal to monitor)");
+                    }
+                }
             }
         }
         dial_addrs.extend(self.config.bootstrap_peers.clone());
@@ -510,6 +578,37 @@ impl NodeRunner {
     /// Check whether this runner is a backup-only node
     pub fn is_backup_only(&self) -> bool {
         matches!(self.config.mode, NodeMode::BackupOnly)
+    }
+
+    /// Register content to be backed up by this node
+    ///
+    /// Programmatic registration for content whose chunks are (or will
+    /// be) held locally. Chunks that arrive via swap are auto-registered
+    /// by the health loop as per-chunk entries (swaps carry no content
+    /// binding); this method is for callers that know the real content
+    /// identity and the primary's node ID.
+    pub async fn register_backup_content(
+        &self,
+        content_id: ContentId,
+        primary_node_id: NodeId,
+        chunk_ids: Vec<ChunkId>,
+    ) {
+        let now = current_timestamp();
+        let mut state = self.backup_state.lock().await;
+        state.backed_up_content.insert(
+            content_id,
+            BackupContentState {
+                content_id,
+                primary_node_id: Some(primary_node_id),
+                is_active: false,
+                last_heartbeat: now,
+                chunk_ids,
+            },
+        );
+        info!(
+            "Registered backup for content {:02x?} (primary: {:02x?})",
+            content_id, primary_node_id
+        );
     }
 
     /// Cache a retrieved chunk locally (Freenet-style, Full nodes only)
@@ -1357,6 +1456,199 @@ async fn rotation_loop(
     }
 }
 
+/// Background loop monitoring the primary's health (backup-only nodes)
+///
+/// Ticks once a minute and runs one [`run_backup_health_tick`] sweep.
+async fn backup_health_loop(
+    backup_state: Arc<Mutex<BackupState>>,
+    backup_config: BackupConfig,
+    transport: Arc<TransportState>,
+    leases: Arc<Mutex<LeaseManager>>,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+
+    loop {
+        interval.tick().await;
+        let now = current_timestamp();
+        if let Err(e) =
+            run_backup_health_tick(&backup_state, &backup_config, &transport, &leases, now).await
+        {
+            warn!("Backup health tick failed: {}", e);
+        }
+    }
+}
+
+/// Run one backup health-check sweep
+///
+/// Lock discipline is strictly sequential — routing table read,
+/// activity snapshot, chunk holder snapshot, backup state, then
+/// leases — and no two guards are ever held at once. The sweep:
+///
+/// 1. Resolves the primary node ID (config, else routing-table lookup
+///    by the configured address).
+/// 2. Auto-registers any held chunks not yet tracked (swap-delivered
+///    chunks carry no content binding, so each becomes its own entry).
+/// 3. Refreshes `last_heartbeat` from the transport's peer-activity
+///    map: any inbound message from the primary is the heartbeat.
+/// 4. Activates entries whose primary has been silent past the
+///    heartbeat timeout and flips the transport's `serve_enabled`
+///    flag on the first activation. Entries with no known primary
+///    never activate (no liveness signal to monitor).
+/// 5. Extends the leases of held chunks: dormant entries with a
+///    healthy primary (so the expiration loop cannot destroy the
+///    backup before the primary fails), and activated entries per the
+///    `permanent_takeover` policy — extended every tick when true,
+///    once at activation when false (leases then lapse naturally).
+///
+/// Returns the number of entries activated by this sweep.
+async fn run_backup_health_tick(
+    backup_state: &Arc<Mutex<BackupState>>,
+    backup_config: &BackupConfig,
+    transport: &Arc<TransportState>,
+    leases: &Arc<Mutex<LeaseManager>>,
+    now: u64,
+) -> anyhow::Result<usize> {
+    // 1. Resolve the primary.
+    let resolved_primary: Option<NodeId> = match backup_config.primary_node_id {
+        Some(id) => Some(id),
+        None => match &backup_config.primary_address {
+            Some(addr) => transport
+                .routing_table
+                .read()
+                .await
+                .nodes
+                .values()
+                .find(|n| &n.address == addr)
+                .map(|n| n.node_id),
+            None => None,
+        },
+    };
+
+    // 2/3/4. Snapshot holder and activity, then mutate backup state.
+    let activity = transport.peer_activity_snapshot();
+    let held_chunk_ids: Vec<ChunkId> = {
+        transport
+            .chunk_holder
+            .lock()
+            .await
+            .chunks
+            .keys()
+            .cloned()
+            .collect()
+    };
+
+    let mut newly_activated: Vec<ContentId> = Vec::new();
+    let mut extend_lease_ids: Vec<ChunkId> = Vec::new();
+    let mut activated_any = false;
+
+    {
+        let mut state = backup_state.lock().await;
+
+        for chunk_id in held_chunk_ids {
+            if !state.backed_up_content.contains_key(&chunk_id) {
+                debug!("Auto-registered backup entry for chunk {:02x?}", chunk_id);
+                state.backed_up_content.insert(
+                    chunk_id,
+                    BackupContentState {
+                        content_id: chunk_id,
+                        primary_node_id: None,
+                        is_active: false,
+                        last_heartbeat: now,
+                        chunk_ids: vec![chunk_id],
+                    },
+                );
+            }
+        }
+
+        for (content_id, entry) in state.backed_up_content.iter_mut() {
+            // Fill in the primary once it is known.
+            if entry.primary_node_id.is_none() {
+                entry.primary_node_id = resolved_primary;
+            }
+
+            // Heartbeat refresh: recent inbound activity from the
+            // primary counts as a heartbeat.
+            if let Some(primary) = entry.primary_node_id {
+                if let Some(&last_seen) = activity.get(&primary) {
+                    if last_seen > entry.last_heartbeat {
+                        entry.last_heartbeat = last_seen;
+                    }
+                }
+            }
+
+            if entry.is_active {
+                // Activated entries stay active (failover is permanent
+                // for MVP). Keep their leases alive only under the
+                // permanent-takeover policy.
+                if backup_config.permanent_takeover {
+                    extend_lease_ids.extend(entry.chunk_ids.iter().copied());
+                }
+                continue;
+            }
+
+            if entry.primary_node_id.is_none() {
+                debug!(
+                    "Backup entry {:02x?} has no known primary yet; waiting",
+                    content_id
+                );
+                continue;
+            }
+
+            let healthy =
+                now.saturating_sub(entry.last_heartbeat) <= backup_config.heartbeat_timeout_secs;
+            if healthy {
+                // Dormant + healthy: keep our copies' leases alive so
+                // the lease expiration loop cannot destroy the backup
+                // before the primary ever fails.
+                extend_lease_ids.extend(entry.chunk_ids.iter().copied());
+                continue;
+            }
+
+            // Primary silent past the timeout: activate. Leases are
+            // extended now under both policies; with permanent takeover
+            // they keep being extended every tick afterwards, without
+            // it they lapse naturally (de facto deactivation).
+            let silent_for = now.saturating_sub(entry.last_heartbeat);
+            entry.is_active = true;
+            newly_activated.push(*content_id);
+            extend_lease_ids.extend(entry.chunk_ids.iter().copied());
+            info!(
+                "Primary for content {:02x?} silent for {}s (timeout {}s). Activating backup.",
+                content_id, silent_for, backup_config.heartbeat_timeout_secs
+            );
+        }
+
+        if !newly_activated.is_empty() {
+            state.any_active = true;
+            activated_any = true;
+        }
+    }
+
+    // 4b. Flip the serving flag on first activation (backup state
+    // guard is dropped).
+    if activated_any {
+        transport
+            .serve_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        info!("Backup node activated. Now serving chunks.");
+    }
+
+    // 5. Lease extension (sequential: no other guard is held).
+    if !extend_lease_ids.is_empty() {
+        let mut lease_mgr = leases.lock().await;
+        let new_expiry = now + static_storage::swap::DEFAULT_LEASE_DURATION_SECS;
+        for chunk_id in &extend_lease_ids {
+            if let Some(lease) = lease_mgr.leases.get_mut(chunk_id) {
+                if lease.expires_at < new_expiry {
+                    lease.expires_at = new_expiry;
+                }
+            }
+        }
+    }
+
+    Ok(newly_activated.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1420,5 +1712,174 @@ mod tests {
         assert_eq!(expired, 1);
         assert!(chunks.lock().await.get_chunk(&chunk_id).is_none());
         assert_eq!(capacity.lock().await.current_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn test_backup_state_creation() {
+        let state = BackupState::default();
+        assert!(state.backed_up_content.is_empty());
+        assert!(!state.any_active);
+    }
+
+    #[tokio::test]
+    async fn test_backup_content_registration() {
+        let runner = NodeRunner::new(NodeConfig::default(), [0x42u8; 16], MixNode::new());
+
+        let content_id = [0x11u8; 32];
+        let primary = [0x22u8; 16];
+        let chunk_ids = vec![[0x33u8; 32], [0x34u8; 32]];
+        runner
+            .register_backup_content(content_id, primary, chunk_ids.clone())
+            .await;
+
+        let state = runner.backup_state.lock().await;
+        assert_eq!(state.backed_up_content.len(), 1);
+        let entry = state.backed_up_content.get(&content_id).unwrap();
+        assert_eq!(entry.content_id, content_id);
+        assert_eq!(entry.primary_node_id, Some(primary));
+        assert!(!entry.is_active);
+        assert_eq!(entry.chunk_ids, chunk_ids);
+    }
+
+    #[tokio::test]
+    async fn test_backup_activation_on_timeout() {
+        let mut config = NodeConfig::default();
+        config.mode = NodeMode::BackupOnly;
+        config.backup_config.heartbeat_timeout_secs = 5400;
+        let runner = NodeRunner::new(config, [0x42u8; 16], MixNode::new());
+
+        // Backup nodes start dormant.
+        assert!(
+            !runner
+                .transport
+                .serve_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        let content_id = [0x11u8; 32];
+        let primary = [0x22u8; 16];
+        runner
+            .register_backup_content(content_id, primary, vec![[0x33u8; 32]])
+            .await;
+
+        // Primary silent for 2 hours (past the 90-minute timeout).
+        let now = current_timestamp();
+        {
+            let mut state = runner.backup_state.lock().await;
+            state
+                .backed_up_content
+                .get_mut(&content_id)
+                .unwrap()
+                .last_heartbeat = now.saturating_sub(7200);
+        }
+
+        let activated = run_backup_health_tick(
+            &runner.backup_state,
+            &runner.config.backup_config,
+            &runner.transport,
+            &runner.leases,
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(activated, 1);
+
+        let state = runner.backup_state.lock().await;
+        assert!(state.backed_up_content.get(&content_id).unwrap().is_active);
+        assert!(state.any_active);
+        drop(state);
+        assert!(
+            runner
+                .transport
+                .serve_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backup_no_activation_when_healthy() {
+        let mut config = NodeConfig::default();
+        config.mode = NodeMode::BackupOnly;
+        let runner = NodeRunner::new(config, [0x42u8; 16], MixNode::new());
+
+        let content_id = [0x11u8; 32];
+        let primary = [0x22u8; 16];
+        runner
+            .register_backup_content(content_id, primary, vec![[0x33u8; 32]])
+            .await;
+
+        // Fresh registration: heartbeat is current, primary healthy.
+        let now = current_timestamp();
+        let activated = run_backup_health_tick(
+            &runner.backup_state,
+            &runner.config.backup_config,
+            &runner.transport,
+            &runner.leases,
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(activated, 0);
+
+        let state = runner.backup_state.lock().await;
+        assert!(!state.backed_up_content.get(&content_id).unwrap().is_active);
+        assert!(!state.any_active);
+        drop(state);
+        assert!(
+            !runner
+                .transport
+                .serve_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serve_enabled_flag() {
+        // Full nodes serve from the start.
+        let full = NodeRunner::new(NodeConfig::default(), [0x42u8; 16], MixNode::new());
+        assert!(
+            full.transport
+                .serve_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        // Backup nodes start dormant and flip on activation.
+        let mut config = NodeConfig::default();
+        config.mode = NodeMode::BackupOnly;
+        let backup = NodeRunner::new(config, [0x42u8; 16], MixNode::new());
+        assert!(
+            !backup
+                .transport
+                .serve_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        backup
+            .register_backup_content([0x11u8; 32], [0x22u8; 16], vec![[0x33u8; 32]])
+            .await;
+        let now = current_timestamp();
+        {
+            let mut state = backup.backup_state.lock().await;
+            state
+                .backed_up_content
+                .get_mut(&[0x11u8; 32])
+                .unwrap()
+                .last_heartbeat = now.saturating_sub(7200);
+        }
+        run_backup_health_tick(
+            &backup.backup_state,
+            &backup.config.backup_config,
+            &backup.transport,
+            &backup.leases,
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(
+            backup
+                .transport
+                .serve_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
 }

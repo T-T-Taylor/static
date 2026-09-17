@@ -82,6 +82,9 @@ pub struct NodeConfig {
     /// Hot storage rotation configuration (Freenet-style migration/caching)
     #[serde(default = "default_rotation_config")]
     pub rotation_config: static_storage::rotation::RotationConfig,
+    /// Backup-only mode configuration
+    #[serde(default = "default_backup_config")]
+    pub backup_config: BackupConfig,
 }
 
 /// Default for `NodeConfig::use_hybrid_crypto`: new nodes opt into hybrid
@@ -92,6 +95,55 @@ fn default_hybrid_crypto() -> bool {
 /// Default for `NodeConfig::rotation_config`
 fn default_rotation_config() -> static_storage::rotation::RotationConfig {
     static_storage::rotation::RotationConfig::default()
+}
+
+/// Configuration for backup-only mode
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BackupConfig {
+    /// Whether this backup node is enabled
+    pub enabled: bool,
+    /// Address of the primary content owner to monitor (required for
+    /// `--mode backup`). The node dials this address and resolves the
+    /// primary's node ID from the handshake.
+    pub primary_address: Option<String>,
+    /// Node ID of the primary content owner
+    ///
+    /// Normally resolved automatically from `primary_address` after the
+    /// first handshake. Can be set directly for programmatic use and
+    /// tests. When neither address nor ID is known, a backup never
+    /// activates (it has no liveness signal to monitor).
+    pub primary_node_id: Option<[u8; 16]>,
+    /// Heartbeat timeout in seconds
+    ///
+    /// The primary is considered failed once no inbound activity
+    /// (gossip, cover-adjacent traffic, swaps, requests) has been seen
+    /// for this long. Default: 5400 = 3x the 30-minute gossip/heartbeat
+    /// cadence.
+    pub heartbeat_timeout_secs: u64,
+    /// Whether to take over permanently on activation (default: true)
+    ///
+    /// When true, an activated backup keeps extending the leases of its
+    /// held chunks and stays the serving primary. When false, leases are
+    /// extended once at activation and then lapse naturally, so the
+    /// content expires if the original primary does not return.
+    pub permanent_takeover: bool,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            primary_address: None,
+            primary_node_id: None,
+            heartbeat_timeout_secs: 5400,
+            permanent_takeover: true,
+        }
+    }
+}
+
+/// Default for `NodeConfig::backup_config`
+fn default_backup_config() -> BackupConfig {
+    BackupConfig::default()
 }
 
 impl Default for NodeConfig {
@@ -110,6 +162,7 @@ impl Default for NodeConfig {
             sponsor: None,
             use_hybrid_crypto: default_hybrid_crypto(),
             rotation_config: default_rotation_config(),
+            backup_config: default_backup_config(),
         }
     }
 }
@@ -355,5 +408,19 @@ mod tests {
 
         // Clean up
         std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn test_backup_config_default() {
+        let config = BackupConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.primary_address, None);
+        assert_eq!(config.primary_node_id, None);
+        assert_eq!(config.heartbeat_timeout_secs, 5400);
+        assert!(config.permanent_takeover);
+
+        // NodeConfig carries it with serde defaults
+        let node_config = NodeConfig::default();
+        assert_eq!(node_config.backup_config, BackupConfig::default());
     }
 }

@@ -58,6 +58,14 @@ struct Cli {
     #[arg(long)]
     sponsor: Option<String>,
 
+    /// Primary node address to monitor (required for backup mode)
+    #[arg(long)]
+    backup_primary: Option<String>,
+
+    /// Heartbeat timeout in seconds (default: 5400 = 3x 30-min cadence)
+    #[arg(long, default_value_t = 5400)]
+    backup_timeout: u64,
+
     /// Use post-quantum hybrid Sphinx packets (default: true)
     ///
     /// Bare `--hybrid-crypto` means true; pass `--hybrid-crypto=false`
@@ -168,6 +176,22 @@ async fn main() -> Result<()> {
         anyhow::bail!("Seed-only mode requires --sponsor <addr>");
     }
 
+    if matches!(mode, static_node::NodeMode::BackupOnly) && cli.backup_primary.is_none() {
+        anyhow::bail!("Backup-only mode requires --backup-primary <addr>");
+    }
+
+    let backup_config = if matches!(mode, static_node::NodeMode::BackupOnly) {
+        static_node::BackupConfig {
+            enabled: true,
+            primary_address: cli.backup_primary.clone(),
+            primary_node_id: None,
+            heartbeat_timeout_secs: cli.backup_timeout,
+            permanent_takeover: true,
+        }
+    } else {
+        static_node::BackupConfig::default()
+    };
+
     let rotation_config = static_storage::rotation::RotationConfig {
         enabled: !cli.no_rotation,
         epoch_duration_secs: cli.rotation_epoch,
@@ -191,6 +215,7 @@ async fn main() -> Result<()> {
         sponsor: cli.sponsor.clone(),
         use_hybrid_crypto: cli.hybrid_crypto,
         rotation_config,
+        backup_config,
     };
 
     match cli.command {
@@ -249,6 +274,14 @@ async fn main() -> Result<()> {
             println!("Rotation: {}", if config.rotation_config.enabled { "enabled" } else { "disabled" });
             println!("Rotation percentage: {}%", config.rotation_config.rotation_percentage);
             println!("Caching: {}", if config.rotation_config.enable_caching { "enabled" } else { "disabled" });
+            if matches!(config.mode, static_node::NodeMode::BackupOnly) {
+                println!(
+                    "Backup primary: {}",
+                    config.backup_config.primary_address.as_deref().unwrap_or("<unconfigured>")
+                );
+                println!("Backup heartbeat timeout: {}s", config.backup_config.heartbeat_timeout_secs);
+                println!("Backup permanent takeover: {}", config.backup_config.permanent_takeover);
+            }
         }
         Commands::GenId => {
             let persistent_config = PersistentConfig::new();

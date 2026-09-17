@@ -70,7 +70,7 @@
 - Prepayment recorded in accounting as `prepaid_bytes`
 - Seed-only nodes only send seed packages when requested (rate limited)
 
-### 10. Backup-Only Node Mode with Health Checks
+### 10. Backup-Only Node Mode with Health Checks ✅ DONE
 - Dormant node that doesn't serve chunks
 - Maintains heartbeats and monitors primary node
 - Detects primary failure via missed heartbeats
