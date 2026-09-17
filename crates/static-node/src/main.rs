@@ -50,6 +50,14 @@ struct Cli {
     #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024)]
     max_storage: u64,
 
+    /// Node mode (full, seed, backup)
+    #[arg(long, default_value = "full")]
+    mode: String,
+
+    /// Sponsor peer address (required for seed-only mode)
+    #[arg(long)]
+    sponsor: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -115,6 +123,16 @@ async fn main() -> Result<()> {
         cli.cover_rate
     };
 
+    let mode = match cli.mode.to_lowercase().as_str() {
+        "seed" => static_node::NodeMode::SeedOnly,
+        "backup" => static_node::NodeMode::BackupOnly,
+        _ => static_node::NodeMode::Full,
+    };
+
+    if matches!(mode, static_node::NodeMode::SeedOnly) && cli.sponsor.is_none() {
+        anyhow::bail!("Seed-only mode requires --sponsor <addr>");
+    }
+
     let config = NodeConfig {
         data_dir: cli.data_dir.clone(),
         cover_traffic_rate_bps: cover_rate,
@@ -125,7 +143,8 @@ async fn main() -> Result<()> {
         bootstrap_peers: cli.peer.clone(),
         max_storage_bytes: cli.max_storage,
         tier,
-        ..Default::default()
+        mode,
+        sponsor: cli.sponsor.clone(),
     };
 
     match cli.command {
@@ -138,6 +157,10 @@ async fn main() -> Result<()> {
             tracing::info!("Starting Static node: {:02x?}", node_id);
             tracing::info!("P2P Listen address: {}", config.listen_addr);
             tracing::info!("API Listen address: {}", config.api_addr);
+            tracing::info!("Node mode: {:?}", config.mode);
+            if let Some(sponsor) = &config.sponsor {
+                tracing::info!("Sponsor: {}", sponsor);
+            }
             tracing::info!("Bandwidth tier: {:?}", config.tier);
             tracing::info!("Cover traffic: {} bps", config.cover_traffic_rate_bps);
             tracing::info!("Storage contribution: {} bytes", config.max_storage_bytes);
@@ -164,6 +187,10 @@ async fn main() -> Result<()> {
             println!("Data directory: {:?}", config.data_dir);
             println!("P2P address: {}", config.listen_addr);
             println!("API address: {}", config.api_addr);
+            println!("Node mode: {:?}", config.mode);
+            if let Some(sponsor) = &config.sponsor {
+                println!("Sponsor: {}", sponsor);
+            }
             println!("Bandwidth tier: {:?}", config.tier);
             println!("Cover traffic: {}", if config.cover_traffic_enabled { "enabled" } else { "disabled" });
             println!("Cover rate: {} bps", config.cover_traffic_rate_bps);

@@ -36,6 +36,9 @@ pub const MSG_SWAP_ACCEPT: u8 = 0x05;
 /// Swap reject message type
 pub const MSG_SWAP_REJECT: u8 = 0x06;
 
+/// Prepayment message type
+pub const MSG_PREPAYMENT: u8 = 0x07;
+
 /// Maximum message size (header + body + framing overhead)
 pub const MAX_MESSAGE_SIZE: usize = 1 + 4 + EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE;
 
@@ -65,6 +68,37 @@ pub enum WireMessage {
     SwapAccept(SwapAccept),
     /// Swap rejection (storage barter negotiation)
     SwapReject(SwapReject),
+    /// Prepayment from a seed-only node to a sponsor
+    Prepayment(Prepayment),
+}
+
+/// Prepayment from a seed-only node to a sponsor
+///
+/// Sent as direct wire maintenance traffic (like gossip), not
+/// Sphinx-wrapped. The sponsored chunks themselves are Sphinx-wrapped
+/// for privacy; the prepayment record is accounting metadata.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Prepayment {
+    /// The sending node's ID
+    pub from_node: NodeId,
+    /// Amount of bytes being prepaid
+    pub bytes: u64,
+    /// Content ID this prepayment is for
+    pub content_id: [u8; 32],
+    /// Signature proving the seed-only node authorized this payment
+    pub signature: Vec<u8>,
+}
+
+impl Prepayment {
+    /// Validate the prepayment fields (stub signature check)
+    ///
+    /// Currently checks non-zero bytes and non-empty signature.
+    /// TODO: Add ed25519-dalek for real signature verification
+    /// (deferred until post-quantum signature pass, TODO item 7).
+    pub fn validate(&self) -> bool {
+        // TODO: Add ed25519-dalek for real signature verification
+        self.bytes > 0 && !self.signature.is_empty()
+    }
 }
 
 /// Errors that can occur during wire protocol operations
@@ -197,6 +231,7 @@ pub fn serialize_message(msg: &WireMessage) -> Result<Vec<u8>, WireError> {
         WireMessage::SwapProposal(s) => (MSG_SWAP_PROPOSAL, serde_json::to_vec(s).map_err(|_| WireError::InvalidMessageType(0))?),
         WireMessage::SwapAccept(s) => (MSG_SWAP_ACCEPT, serde_json::to_vec(s).map_err(|_| WireError::InvalidMessageType(0))?),
         WireMessage::SwapReject(s) => (MSG_SWAP_REJECT, serde_json::to_vec(s).map_err(|_| WireError::InvalidMessageType(0))?),
+        WireMessage::Prepayment(p) => (MSG_PREPAYMENT, serde_json::to_vec(p).map_err(|_| WireError::InvalidMessageType(0))?),
     };
 
     let total_len = 1 + 4 + payload.len();
@@ -260,6 +295,9 @@ pub fn deserialize_message(data: &[u8]) -> Result<(WireMessage, usize), WireErro
         }
         MSG_SWAP_REJECT => {
             WireMessage::SwapReject(serde_json::from_slice(payload).map_err(|_| WireError::InvalidMessageType(msg_type))?)
+        }
+        MSG_PREPAYMENT => {
+            WireMessage::Prepayment(serde_json::from_slice(payload).map_err(|_| WireError::InvalidMessageType(msg_type))?)
         }
         _ => return Err(WireError::InvalidMessageType(msg_type)),
     };
@@ -537,5 +575,40 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
 
         let serialized = serialize_message(&msg).unwrap();
         assert!(serialized.len() <= MAX_MESSAGE_SIZE);
+    }
+
+    #[test]
+    fn test_prepayment_serialization() {
+        let pre = Prepayment {
+            from_node: [0x42u8; 16],
+            bytes: 1_048_576,
+            content_id: [0xABu8; 32],
+            // TODO: Add ed25519-dalek for real signature verification
+            signature: vec![0x01u8; 64],
+        };
+        assert!(pre.validate());
+        let msg = WireMessage::Prepayment(pre.clone());
+        let serialized = serialize_message(&msg).unwrap();
+        assert_eq!(serialized[0], MSG_PREPAYMENT);
+        let (deserialized, consumed) = deserialize_message(&serialized).unwrap();
+        assert_eq!(consumed, serialized.len());
+        match deserialized {
+            WireMessage::Prepayment(p) => {
+                assert_eq!(p.from_node, pre.from_node);
+                assert_eq!(p.bytes, pre.bytes);
+                assert_eq!(p.content_id, pre.content_id);
+                assert_eq!(p.signature, pre.signature);
+                assert!(p.validate());
+            }
+            _ => panic!("expected prepayment"),
+        }
+        // Invalid prepayments fail validation
+        let bad = Prepayment {
+            from_node: [0u8; 16],
+            bytes: 0,
+            content_id: [0u8; 32],
+            signature: vec![],
+        };
+        assert!(!bad.validate());
     }
 }

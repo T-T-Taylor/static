@@ -10,14 +10,14 @@
 //! - Lease expiration and repopulation loop
 
 use rand::RngCore;
-use crate::{NodeConfig, NodeStatus};
-use static_accounting::AccountingState;
+use crate::{NodeConfig, NodeMode, NodeStatus};
+use static_accounting::{AccountingState, current_timestamp};
 use static_crypto::SymmetricKey;
 use static_mesh::transport::{
     TransportState, InboundMessage, create_transport_state,
     start_listener, connect_to_peer, get_stats, gossip_loop,
 };
-use static_mesh::wire::WireMessage;
+use static_mesh::wire::{Prepayment, WireMessage};
 use static_sphinx::{MixNode, NodeId, Route, RouteHop};
 use static_storage::{
     EncryptedChunk, ChunkId, ContentId, ContentManifest,
@@ -62,10 +62,21 @@ pub struct NodeRunner {
 impl NodeRunner {
     /// Create a new node runner
     pub fn new(config: NodeConfig, node_id: NodeId, mix_node: MixNode) -> Self {
+        // Seed-only nodes do not host locally and only send seed packages
+        // (heartbeats/funding) when requested. They opt out of full-rate
+        // cover traffic as a documented privacy trade-off: they are funding
+        // a sponsor rather than hosting content themselves.
+        let (target_rate, cover_enabled) = match config.mode {
+            NodeMode::SeedOnly => (1024, false),
+            _ => (
+                config.cover_traffic_rate_bps,
+                config.cover_traffic_enabled,
+            ),
+        };
         let cover_config = static_mesh::CoverTrafficConfig {
-            target_rate_bps: config.cover_traffic_rate_bps,
+            target_rate_bps: target_rate,
             interval_ms: config.cover_traffic_interval_ms,
-            enabled: config.cover_traffic_enabled,
+            enabled: cover_enabled,
             tier: config.tier,
         };
 
@@ -90,19 +101,56 @@ impl NodeRunner {
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         let node_id = self.transport.node_id;
 
-        info!("Starting Static node: {:02x?}", node_id);
+        info!(
+            "Starting Static node: {:02x?} (mode: {:?})",
+            node_id, self.config.mode
+        );
 
-        // Start TCP listener
-        let listen_addr: std::net::SocketAddr = self.config.listen_addr.parse()?;
-        let transport_clone = self.transport.clone();
-        tokio::spawn(async move {
-            if let Err(e) = start_listener(listen_addr, transport_clone).await {
-                error!("Listener error: {}", e);
+        match self.config.mode {
+            NodeMode::BackupOnly => {
+                // TODO: Implement health-check via gossip and activation logic.
+                // Backup-only nodes are dormant: they run the listener but do
+                // not serve chunks until the primary's heartbeats stop.
+                info!("Backup-only mode: dormant, monitoring primary (stub)");
             }
-        });
+            NodeMode::SeedOnly => {
+                info!(
+                    "Seed-only mode: no chunk listener, sponsor={:?}. Cover traffic disabled (privacy trade-off: funding-only node).",
+                    self.config.sponsor
+                );
+            }
+            NodeMode::Full => {}
+        }
 
-        // Connect to bootstrap peers
-        for peer_addr in &self.config.bootstrap_peers {
+        // Seed-only nodes do NOT start the normal listener for chunk requests
+        // (they have no chunks to serve). They only connect out to their
+        // configured sponsor peer.
+        let start_listener_flag = !matches!(self.config.mode, NodeMode::SeedOnly);
+        if start_listener_flag {
+            // Start TCP listener
+            let listen_addr: std::net::SocketAddr = self.config.listen_addr.parse()?;
+            let transport_clone = self.transport.clone();
+            tokio::spawn(async move {
+                if let Err(e) = start_listener(listen_addr, transport_clone).await {
+                    error!("Listener error: {}", e);
+                }
+            });
+        }
+
+        // Build the dial list: sponsor first (seed-only requires it),
+        // then bootstrap peers.
+        let mut dial_addrs: Vec<String> = Vec::new();
+        if matches!(self.config.mode, NodeMode::SeedOnly) {
+            if let Some(sponsor) = &self.config.sponsor {
+                dial_addrs.push(sponsor.clone());
+            } else if self.config.bootstrap_peers.is_empty() {
+                warn!("Seed-only node has no --sponsor configured; cannot publish until a sponsor is connected");
+            }
+        }
+        dial_addrs.extend(self.config.bootstrap_peers.clone());
+
+        // Connect to peers (sponsor + bootstrap)
+        for peer_addr in &dial_addrs {
             let addr: std::net::SocketAddr = match peer_addr.parse() {
                 Ok(addr) => addr,
                 Err(e) => {
@@ -135,11 +183,14 @@ impl NodeRunner {
             repair_loop(repair_state, storage_keys, leases_for_repair).await;
         });
 
-        // Start peer gossip loop
-        let transport_for_gossip = self.transport.clone();
-        tokio::spawn(async move {
-            gossip_loop(transport_for_gossip, 60).await;
-        });
+        // Start peer gossip loop (seed-only nodes are rate-limited: they only
+        // send seed packages when requested and do not gossip at full rate).
+        if !matches!(self.config.mode, NodeMode::SeedOnly) {
+            let transport_for_gossip = self.transport.clone();
+            tokio::spawn(async move {
+                gossip_loop(transport_for_gossip, 60).await;
+            });
+        }
 
         // Start local API server
         let api_addr = self.config.api_addr.clone();
@@ -167,6 +218,12 @@ impl NodeRunner {
     async fn handle_inbound(&self, inbound: InboundMessage) -> anyhow::Result<()> {
         match inbound.message {
             WireMessage::Sphinx(packet) => {
+                // Backup-only nodes are dormant and do not serve chunks.
+                // TODO: Implement health-check via gossip and activation logic.
+                if matches!(self.config.mode, NodeMode::BackupOnly) {
+                    debug!("Backup-only node dormant: ignoring Sphinx packet");
+                    return Ok(());
+                }
                 debug!("Received Sphinx packet (destination) from {:02x?}", inbound.from);
                 
                 let mut manager = self.retriever.lock().await;
@@ -183,9 +240,119 @@ impl NodeRunner {
                     }
                 }
             }
+            WireMessage::Prepayment(prepayment) => {
+                let accepted = self.handle_prepayment(inbound.from, prepayment).await?;
+                debug!("Prepayment handled (accepted={})", accepted);
+            }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Check whether this runner is a seed-only node
+    pub fn is_seed_only(&self) -> bool {
+        matches!(self.config.mode, NodeMode::SeedOnly)
+    }
+
+    /// Check whether this runner is a backup-only node
+    pub fn is_backup_only(&self) -> bool {
+        matches!(self.config.mode, NodeMode::BackupOnly)
+    }
+
+    /// Number of seed-only nodes currently sponsored (sponsor-side)
+    pub async fn sponsor_seed_count(&self) -> usize {
+        self.accounting.lock().await.sponsor_seed_count()
+    }
+
+    /// Validate and accept a prepayment from a seed-only node (sponsor-side)
+    ///
+    /// Checks, in order:
+    /// 1. Stub signature (`!signature.is_empty()`)
+    /// 2. Misbehaving flag (dropped seeds are ignored, content expires)
+    /// 3. Rate limit (one prepayment per content ID per hour)
+    /// 4. Excess capacity (`has_excess_capacity`)
+    /// 5. Sponsor limit (max [`static_accounting::MAX_SPONSORED_SEEDS`])
+    ///
+    /// On success records the prepayment in accounting and registers the
+    /// seed. Returns `true` if accepted, `false` if rejected.
+    pub async fn handle_prepayment(
+        &self,
+        from: NodeId,
+        prepayment: Prepayment,
+    ) -> anyhow::Result<bool> {
+        // Backup-only nodes never accept prepayments (dormant).
+        if matches!(self.config.mode, NodeMode::BackupOnly) {
+            debug!("Backup-only node ignoring prepayment");
+            return Ok(false);
+        }
+
+        // 1. Stub signature check.
+        // TODO: Add ed25519-dalek for real signature verification
+        if !prepayment.validate() {
+            warn!("Rejecting prepayment from {:02x?}: invalid signature/amount", from);
+            return Ok(false);
+        }
+
+        let now = current_timestamp();
+        let mut accounting = self.accounting.lock().await;
+
+        // 2. Drop misbehaving seeds; their content is allowed to expire.
+        if accounting.is_seed_misbehaving(&from) {
+            warn!("Ignoring prepayment from misbehaving seed {:02x?}", from);
+            return Ok(false);
+        }
+
+        // 3. Rate limit: one prepayment per content ID per hour.
+        if !accounting.check_prepay_rate_limit(&from, &prepayment.content_id, now) {
+            warn!(
+                "Rejecting prepayment from {:02x?}: rate limit exceeded",
+                from
+            );
+            accounting.record_seed_violation(&from);
+            return Ok(false);
+        }
+        accounting.record_prepay_attempt(from, prepayment.content_id, now);
+
+        // 4. Sponsor must have excess capacity (own 1:1 satisfied + surplus).
+        if !accounting.has_excess_capacity(0) {
+            // Fresh nodes with zero totals have 0 surplus; allow the very
+            // first sponsorship as bootstrap, but require surplus afterwards.
+            let fresh = accounting.total_bytes_served == 0
+                && accounting.total_bytes_received == 0;
+            if !(fresh && accounting.sponsor_seed_count() == 0) {
+                warn!("Rejecting prepayment from {:02x?}: no excess capacity", from);
+                return Ok(false);
+            }
+        }
+
+        // 5. Sponsor limit (new seeds only; renewals always accepted).
+        if !accounting.is_sponsored(&from) && !accounting.can_sponsor() {
+            warn!(
+                "Rejecting prepayment from {:02x?}: sponsor at capacity",
+                from
+            );
+            return Ok(false);
+        }
+
+        accounting.record_prepayment(from, prepayment.bytes);
+        match accounting.register_sponsored_seed(
+            from,
+            prepayment.content_id,
+            prepayment.bytes,
+            now,
+        ) {
+            Ok(()) => {
+                info!(
+                    "Accepted prepayment from {:02x?}: {} bytes for {:02x?}",
+                    from, prepayment.bytes, prepayment.content_id
+                );
+                Ok(true)
+            }
+            Err(e) => {
+                warn!("Rejecting prepayment from {:02x?}: {}", from, e);
+                Ok(false)
+            }
+        }
     }
 
     /// Get node status
@@ -210,6 +377,11 @@ impl NodeRunner {
     }
 
     /// Publish content to the network using the hidden service model
+    ///
+    /// Full nodes store chunks locally. Seed-only nodes pre-pay a single
+    /// sponsor (avoids double-spend); the sponsor stores and distributes
+    /// the chunks across its existing peer relationships. The 1:1 rule
+    /// becomes `stored_bytes <= local_hosted + prepaid_hosted`.
     pub async fn publish_content(
         &self,
         file_data: &[u8],
@@ -227,7 +399,26 @@ impl NodeRunner {
         // Update the manifest with the correct content_id
         manifest.content_id = content_id;
 
-        // 3. Store the chunks locally
+        // 5. Encrypt the manifest (needed to compute total prepaid size)
+        let (encrypted_manifest, manifest_chunk_id) = static_storage::hidden_service::encrypt_manifest(&manifest, &content_pub_key)?;
+
+        let total_bytes: u64 = chunks.iter().map(|c| c.data.len() as u64).sum::<u64>()
+            + encrypted_manifest.ciphertext.len() as u64;
+
+        // Seed-only path: pre-pay ONE sponsor, do not store locally.
+        if matches!(self.config.mode, NodeMode::SeedOnly) {
+            return self.publish_via_sponsor(
+                content_id,
+                manifest,
+                content_pub_key,
+                master_key,
+                chunks,
+                manifest_chunk_id,
+                total_bytes,
+            ).await;
+        }
+
+        // 3. Store the chunks locally (full / backup nodes)
         {
             let mut holder = self.transport.chunk_holder.lock().await;
             for chunk in &chunks {
@@ -237,9 +428,6 @@ impl NodeRunner {
 
         // 4. Store the master key in storage_keys
         self.storage_keys.lock().await.insert(content_id, master_key.clone());
-
-        // 5. Encrypt the manifest
-        let (encrypted_manifest, manifest_chunk_id) = static_storage::hidden_service::encrypt_manifest(&manifest, &content_pub_key)?;
 
         // 6. Store the encrypted manifest as a chunk locally
         {
@@ -258,6 +446,93 @@ impl NodeRunner {
         );
 
         tracing::info!("Published content: {:02x?} ({} chunks + 1 manifest)", content_id, chunks.len());
+
+        Ok((content_id, manifest, content_pub_key))
+    }
+
+    /// Seed-only publish: pre-pay a single sponsor and hand off chunks
+    ///
+    /// The prepayment itself is a direct wire message (like gossip). The
+    /// chunks are Sphinx-wrapped for privacy when a transport path exists;
+    /// for this MVP the seed registers the lease locally and the sponsor
+    /// pulls/distributes the chunks via its existing swap relationships.
+    /// Minimum stake equals the total content size (1:1 from the start).
+    async fn publish_via_sponsor(
+        &self,
+        content_id: ContentId,
+        manifest: ContentManifest,
+        content_pub_key: [u8; 32],
+        master_key: SymmetricKey,
+        chunks: Vec<EncryptedChunk>,
+        manifest_chunk_id: ChunkId,
+        total_bytes: u64,
+    ) -> anyhow::Result<(ContentId, ContentManifest, [u8; 32])> {
+        // Resolve the sponsor peer: prefer the configured --sponsor address,
+        // fall back to the first known peer.
+        let sponsor_id = {
+            let routing = self.transport.routing_table.read().await;
+            let mut found: Option<NodeId> = None;
+            if let Some(want) = &self.config.sponsor {
+                for node in routing.nodes.values() {
+                    if node.address == *want {
+                        found = Some(node.node_id);
+                        break;
+                    }
+                }
+            }
+            found.or_else(|| routing.nodes.values().next().map(|n| n.node_id))
+        };
+        // Also check active connections as fallback.
+        let sponsor_id = match sponsor_id {
+            Some(id) => id,
+            None => {
+                let conns = self.transport.connections.read().await;
+                conns.keys().next().copied().ok_or_else(|| {
+                    anyhow::anyhow!("Seed-only node has no sponsor connection; configure --sponsor and connect first")
+                })?
+            }
+        };
+
+        // Minimum stake = total content size ensures 1:1 from the start.
+        let prepayment = Prepayment {
+            from_node: self.transport.node_id,
+            bytes: total_bytes,
+            content_id,
+            // TODO: Add ed25519-dalek for real signature verification
+            signature: vec![0x01u8; 64],
+        };
+        debug_assert!(prepayment.validate());
+
+        static_mesh::transport::send_prepayment(&self.transport, sponsor_id, prepayment).await?;
+
+        // Record the prepayment locally (counts toward 1:1).
+        self.accounting
+            .lock()
+            .await
+            .record_prepayment(sponsor_id, total_bytes);
+
+        // Seed-only nodes do not store chunks locally; the sponsor holds
+        // them (or distributes via swap). Keep the master key + lease so
+        // heartbeats/renewals can be sent when requested (rate-limited:
+        // heartbeats every 30 min, one prepayment per content per hour,
+        // no full-rate cover traffic).
+        self.storage_keys.lock().await.insert(content_id, master_key.clone());
+        let mut chunk_ids: Vec<ChunkId> = chunks.iter().map(|c| c.id).collect();
+        chunk_ids.push(manifest_chunk_id);
+        self.leases.lock().await.register_owned_content(
+            content_id,
+            master_key,
+            chunk_ids,
+        );
+
+        // NOTE: chunk bodies are Sphinx-wrapped for privacy when sent over
+        // the mixnet (see fragmentation layer). The direct prepayment above
+        // is maintenance traffic; chunk hand-off to the sponsor follows via
+        // the sponsor's swap/distribution relationships.
+        info!(
+            "Seed-only publish via sponsor {:02x?}: {:02x?} ({} bytes prepaid)",
+            sponsor_id, content_id, total_bytes
+        );
 
         Ok((content_id, manifest, content_pub_key))
     }

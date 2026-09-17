@@ -228,7 +228,7 @@ impl Default for RepairState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{encrypt_chunk, CHUNK_SIZE};
+    use crate::{encrypt_chunk, CHUNK_SIZE, DEFAULT_DATA_SHARDS, DEFAULT_PARITY_SHARDS};
     use static_crypto::{SymmetricKey, NonceBytes};
     use rand::RngCore;
 

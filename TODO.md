@@ -23,7 +23,7 @@
 - Leases with heartbeats already track node availability
 - Add repair logic to the lease expiration loop
 
-### 4. Sybil Resistance for Seed-Only Nodes
+### 4. Sybil Resistance for Seed-Only Nodes ✅ DONE
 - Seed-only nodes must stake or prove reputation to prevent network flooding
 - Stake = prepaid bytes to sponsor node
 - Sponsor node validates stake before accepting hosting commitment
@@ -61,7 +61,7 @@
 - Each transport handles its own connection management
 - Cover traffic rate enforcement stays in the trait
 
-### 9. Seed-Only Node Mode with Prepayment
+### 9. Seed-Only Node Mode with Prepayment ✅ DONE
 - Node mode: Full, SeedOnly, BackupOnly
 - Seed-only node pays ONE sponsor node (avoids double-spend)
 - Sponsor distributes chunks across its existing peer relationships

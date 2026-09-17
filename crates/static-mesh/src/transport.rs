@@ -225,6 +225,10 @@ pub async fn handle_incoming_connection(
                     warn!("Expected handshake, got SwapReject from {}", addr);
                     return;
                 }
+                WireMessage::Prepayment(_) => {
+                    warn!("Expected handshake, got Prepayment from {}", addr);
+                    return;
+                }
             }
         }
     }
@@ -306,6 +310,9 @@ pub async fn connect_to_peer(
                 }
                 WireMessage::SwapReject(_) => {
                     return Err(TransportError::HandshakeFailed("expected handshake, got swap reject".into()));
+                }
+                WireMessage::Prepayment(_) => {
+                    return Err(TransportError::HandshakeFailed("expected handshake, got prepayment".into()));
                 }
             }
         }
@@ -454,6 +461,24 @@ async fn handle_message(
         WireMessage::SwapReject(reject) => {
             debug!("Received swap rejection from {:02x?}: {:?}", from, reject.reason);
             state.swap_state.lock().await.rejected_swaps += 1;
+        }
+        WireMessage::Prepayment(prepayment) => {
+            // Prepayments are accounting metadata (like gossip): forward to
+            // the node runner for validation. NodeRunner::handle_inbound
+            // owns signature checks, rate limiting, sponsor limits, and
+            // accounting updates to preserve layering (mesh = transport,
+            // node = business logic).
+            debug!(
+                "Received prepayment from {:02x?} for content {:02x?} ({} bytes)",
+                from, prepayment.content_id, prepayment.bytes
+            );
+            let _ = state
+                .inbound_tx
+                .send(InboundMessage {
+                    from,
+                    message: WireMessage::Prepayment(prepayment),
+                })
+                .await;
         }
         WireMessage::Sphinx(packet) => {
             // Process the Sphinx packet through our mix node
@@ -724,6 +749,26 @@ pub async fn send_sphinx(
         .ok_or(TransportError::ConnectionNotFound(peer))?;
     
     sender.send(WireMessage::Sphinx(packet))
+        .await
+        .map_err(|_| TransportError::ChannelSend)
+}
+
+/// Send a prepayment to a sponsor peer
+///
+/// Prepayments are direct wire maintenance traffic (like gossip),
+/// not Sphinx-wrapped. Sponsored chunks themselves are Sphinx-wrapped.
+pub async fn send_prepayment(
+    state: &Arc<TransportState>,
+    peer: NodeId,
+    prepayment: crate::wire::Prepayment,
+) -> Result<(), TransportError> {
+    let connections = state.connections.read().await;
+    let sender = connections
+        .get(&peer)
+        .ok_or(TransportError::ConnectionNotFound(peer))?;
+
+    sender
+        .send(WireMessage::Prepayment(prepayment))
         .await
         .map_err(|_| TransportError::ChannelSend)
 }

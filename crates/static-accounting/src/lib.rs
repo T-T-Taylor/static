@@ -41,6 +41,12 @@ pub fn current_timestamp() -> u64 {
         .as_secs()
 }
 
+/// Maximum number of seed-only nodes a single sponsor will host
+pub const MAX_SPONSORED_SEEDS: usize = 5;
+
+/// Minimum interval between prepayments for the same content (1 hour)
+pub const PREPAY_RATE_LIMIT_SECS: u64 = 3600;
+
 /// Per-peer credit state
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PeerCredit {
@@ -56,6 +62,9 @@ pub struct PeerCredit {
     pub successful_challenges: u32,
     /// Number of failed Proof of Space-Time challenges
     pub failed_challenges: u32,
+    /// Bytes this node has prepaid to this peer (for seed-only mode)
+    #[serde(default)]
+    pub prepaid_bytes: u64,
 }
 
 impl PeerCredit {
@@ -68,6 +77,7 @@ impl PeerCredit {
             last_interaction: 0,
             successful_challenges: 0,
             failed_challenges: 0,
+            prepaid_bytes: 0,
         }
     }
 
@@ -121,11 +131,58 @@ impl PeerCredit {
             self.successful_challenges as f64 / total as f64
         }
     }
+
+    /// Check if prepaid balance covers a request (seed-only 1:1 via prepayment)
+    pub fn has_prepaid(&self, needed: u64) -> bool {
+        self.prepaid_bytes >= needed
+    }
+
+    /// Effective credit including prepayments (net_credit + prepaid_bytes)
+    pub fn effective_credit(&self) -> i64 {
+        self.net_credit + self.prepaid_bytes as i64
+    }
 }
 
 impl Default for PeerCredit {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Reputation info for a seed-only node sponsored by this node
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SponsoredSeedInfo {
+    /// The seed-only node's ID
+    pub node_id: NodeId,
+    /// Content IDs this seed has prepaid for
+    pub content_ids: Vec<[u8; 32]>,
+    /// Total bytes prepaid by this seed
+    pub total_prepaid: u64,
+    /// Heartbeats received from this seed
+    pub heartbeats_received: u64,
+    /// Prepayment renewals received
+    pub prepayment_renewals: u32,
+    /// Rate-limit / abuse violations
+    pub rate_violations: u32,
+    /// Last-seen timestamp (unix secs)
+    pub last_seen: u64,
+    /// Whether this seed was flagged as misbehaving (dropped)
+    pub misbehaving: bool,
+}
+
+impl SponsoredSeedInfo {
+    /// Create a new sponsored-seed record
+    pub fn new(node_id: NodeId, content_id: [u8; 32], prepaid: u64, now: u64) -> Self {
+        Self {
+            node_id,
+            content_ids: vec![content_id],
+            total_prepaid: prepaid,
+            heartbeats_received: 0,
+            prepayment_renewals: 0,
+            rate_violations: 0,
+            last_seen: now,
+            misbehaving: false,
+        }
     }
 }
 
@@ -142,6 +199,12 @@ pub struct AccountingState {
     pub min_ratio: f64,
     /// Bytes of credit granted to new peers (goodwill)
     pub initial_credit: u64,
+    /// Seed-only nodes this node sponsors (seed NodeId -> info)
+    #[serde(default)]
+    pub sponsored_seeds: HashMap<NodeId, SponsoredSeedInfo>,
+    /// Last prepayment timestamp per (seed, content_id) for rate limiting
+    #[serde(default)]
+    pub prepayment_attempts: HashMap<(NodeId, [u8; 32]), u64>,
 }
 
 impl AccountingState {
@@ -153,6 +216,8 @@ impl AccountingState {
             peers: HashMap::new(),
             min_ratio: 0.5,
             initial_credit: 10 * 1024 * 1024, // 10 MiB goodwill
+            sponsored_seeds: HashMap::new(),
+            prepayment_attempts: HashMap::new(),
         }
     }
 
@@ -177,12 +242,143 @@ impl AccountingState {
         self.get_or_create_peer(&peer).record_received(bytes, ts);
     }
 
+    /// Record a prepayment to a sponsor peer
+    ///
+    /// Prepayments count toward the seed-only node's 1:1 contribution:
+    /// `bytes_used <= local_hosted + prepaid_hosted`.
+    pub fn record_prepayment(&mut self, peer: NodeId, bytes: u64) {
+        self.get_or_create_peer(&peer).prepaid_bytes += bytes;
+    }
+
+    /// Get total prepaid bytes across all peers
+    pub fn total_prepaid_bytes(&self) -> u64 {
+        self.peers.values().map(|c| c.prepaid_bytes).sum()
+    }
+
+    /// Effective bytes contributed including prepayments
+    pub fn effective_bytes_served(&self) -> u64 {
+        self.total_bytes_served.saturating_add(self.total_prepaid_bytes())
+    }
+
+    /// Check if this node has excess capacity to act as a sponsor
+    ///
+    /// A sponsor must have its own 1:1 ratio satisfied with surplus:
+    /// `(served - used) > threshold`.
+    pub fn has_excess_capacity(&self, threshold: u64) -> bool {
+        (self.total_bytes_served as i64 - self.total_bytes_received as i64)
+            > threshold as i64
+    }
+
+    /// Check whether a prepayment is allowed under the rate limit
+    ///
+    /// A seed-only node may send at most one prepayment per content ID
+    /// per hour. Returns `true` if allowed.
+    pub fn check_prepay_rate_limit(
+        &self,
+        from: &NodeId,
+        content_id: &[u8; 32],
+        now: u64,
+    ) -> bool {
+        match self.prepayment_attempts.get(&(*from, *content_id)) {
+            None => true,
+            Some(last) => now.saturating_sub(*last) >= PREPAY_RATE_LIMIT_SECS,
+        }
+    }
+
+    /// Record a prepayment attempt for rate limiting
+    pub fn record_prepay_attempt(&mut self, from: NodeId, content_id: [u8; 32], now: u64) {
+        self.prepayment_attempts.insert((from, content_id), now);
+    }
+
+    /// Number of seed-only nodes currently sponsored
+    pub fn sponsor_seed_count(&self) -> usize {
+        self.sponsored_seeds
+            .values()
+            .filter(|s| !s.misbehaving)
+            .count()
+    }
+
+    /// Check whether this node can sponsor another seed (sponsor limit)
+    pub fn can_sponsor(&self) -> bool {
+        self.sponsor_seed_count() < MAX_SPONSORED_SEEDS
+    }
+
+    /// Check whether a seed is already sponsored by this node
+    pub fn is_sponsored(&self, seed: &NodeId) -> bool {
+        self.sponsored_seeds.contains_key(seed)
+    }
+
+    /// Register (or renew) a sponsored seed-only node
+    ///
+    /// Returns `Err` if the sponsor is at capacity and this is a new seed.
+    /// Existing seeds are treated as renewals and always accepted.
+    pub fn register_sponsored_seed(
+        &mut self,
+        seed: NodeId,
+        content_id: [u8; 32],
+        prepaid_bytes: u64,
+        now: u64,
+    ) -> Result<(), SponsorError> {
+        if let Some(info) = self.sponsored_seeds.get_mut(&seed) {
+            if !info.content_ids.contains(&content_id) {
+                info.content_ids.push(content_id);
+            }
+            info.total_prepaid += prepaid_bytes;
+            info.prepayment_renewals += 1;
+            info.last_seen = now;
+            return Ok(());
+        }
+        if !self.can_sponsor() {
+            return Err(SponsorError::AtCapacity);
+        }
+        self.sponsored_seeds
+            .insert(seed, SponsoredSeedInfo::new(seed, content_id, prepaid_bytes, now));
+        Ok(())
+    }
+
+    /// Record a heartbeat received from a sponsored seed (reputation)
+    pub fn record_seed_heartbeat(&mut self, seed: &NodeId, now: u64) {
+        if let Some(info) = self.sponsored_seeds.get_mut(seed) {
+            info.heartbeats_received += 1;
+            info.last_seen = now;
+        }
+    }
+
+    /// Record a rate-limit / abuse violation for a sponsored seed
+    pub fn record_seed_violation(&mut self, seed: &NodeId) {
+        if let Some(info) = self.sponsored_seeds.get_mut(seed) {
+            info.rate_violations += 1;
+            // Three strikes: flag as misbehaving; content is allowed to expire.
+            if info.rate_violations >= 3 {
+                info.misbehaving = true;
+            }
+        }
+    }
+
+    /// Check if a sponsored seed was flagged as misbehaving
+    pub fn is_seed_misbehaving(&self, seed: &NodeId) -> bool {
+        self.sponsored_seeds
+            .get(seed)
+            .map(|s| s.misbehaving)
+            .unwrap_or(false)
+    }
+
+    /// Check if a node is running (placeholder for API compat)
+    /// Returns true; real liveness is tracked via heartbeats/gossip.
+    pub fn is_seed_healthy(&self, seed: &NodeId) -> bool {
+        self.sponsored_seeds
+            .get(seed)
+            .map(|s| !s.misbehaving)
+            .unwrap_or(false)
+    }
+
     /// Check if a peer should be allowed to receive service
     ///
     /// A peer is allowed if:
     /// 1. They have sufficient net credit, OR
     /// 2. Their ratio is above the minimum, OR
-    /// 3. They are new (get initial credit)
+    /// 3. They are new (get initial credit), OR
+    /// 4. They have sufficient prepaid bytes (seed-only 1:1 via prepayment)
     pub fn should_serve(&self, peer: &NodeId, requested_bytes: u64) -> bool {
         let credit = self.peers.get(peer);
 
@@ -194,6 +390,15 @@ impl AccountingState {
             Some(c) => {
                 // Check net credit first
                 if c.has_credit(requested_bytes) {
+                    return true;
+                }
+
+                // Check prepaid bytes (seed-only 1:1 via prepayment).
+                // Additive path: does not alter existing credit/ratio logic.
+                if c.has_prepaid(requested_bytes) {
+                    return true;
+                }
+                if c.effective_credit() >= requested_bytes as i64 {
                     return true;
                 }
 
@@ -297,6 +502,23 @@ pub enum AccountingError {
     /// Peer not found
     #[error("peer not found")]
     PeerNotFound,
+}
+
+/// Errors that can occur during sponsor operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SponsorError {
+    /// Sponsor is at capacity (already sponsors MAX_SPONSORED_SEEDS seeds)
+    #[error("sponsor at capacity")]
+    AtCapacity,
+    /// Prepayment rate limit exceeded (one per content per hour)
+    #[error("prepayment rate limit exceeded")]
+    RateLimited,
+    /// Insufficient stake (prepayment must cover content size)
+    #[error("insufficient stake")]
+    InsufficientStake,
+    /// Seed was flagged as misbehaving
+    #[error("seed misbehaving")]
+    Misbehaving,
 }
 
 /// Create a new Proof of Space-Time challenge
@@ -730,5 +952,100 @@ mod tests {
 
         assert!(state.peers.contains_key(&peer1));
         assert!(!state.peers.contains_key(&peer2));
+    }
+
+    #[test]
+    fn test_prepayment_recording() {
+        let mut state = AccountingState::new();
+        let peer = random_node_id();
+        assert_eq!(state.total_prepaid_bytes(), 0);
+        state.record_prepayment(peer, 1000);
+        assert_eq!(state.peers[&peer].prepaid_bytes, 1000);
+        assert_eq!(state.total_prepaid_bytes(), 1000);
+        state.record_prepayment(peer, 500);
+        assert_eq!(state.total_prepaid_bytes(), 1500);
+    }
+
+    #[test]
+    fn test_excess_capacity_check() {
+        let mut state = AccountingState::new();
+        let peer = random_node_id();
+        // No surplus initially
+        assert!(!state.has_excess_capacity(0));
+        state.record_served(peer, 2000);
+        state.record_received(random_node_id(), 500);
+        // served - used = 1500 > 1000
+        assert!(state.has_excess_capacity(1000));
+        assert!(!state.has_excess_capacity(2000));
+    }
+
+    #[test]
+    fn test_seed_only_1to1_enforcement() {
+        let mut state = AccountingState::new();
+        let seed = random_node_id();
+        // Seed consumed more than its goodwill: bad ratio, no credit.
+        state.record_received(seed, state.initial_credit + 1);
+        assert!(!state.should_serve(&seed, 1));
+        // Prepayment satisfies 1:1: stored <= local + prepaid.
+        state.record_prepayment(seed, 5000);
+        assert!(state.should_serve(&seed, 1000));
+        assert_eq!(state.effective_bytes_served(), 5000);
+    }
+
+    #[test]
+    fn test_sybil_rate_limit() {
+        let mut state = AccountingState::new();
+        let seed = random_node_id();
+        let content = [0xABu8; 32];
+        let now = 1_000_000u64;
+        // First prepayment allowed
+        assert!(state.check_prepay_rate_limit(&seed, &content, now));
+        state.record_prepay_attempt(seed, content, now);
+        // Immediate second prepayment rejected
+        assert!(!state.check_prepay_rate_limit(&seed, &content, now + 10));
+        // After one hour allowed again
+        assert!(state.check_prepay_rate_limit(
+            &seed,
+            &content,
+            now + PREPAY_RATE_LIMIT_SECS
+        ));
+        // Different content ID is independent
+        let other = [0xCDu8; 32];
+        assert!(state.check_prepay_rate_limit(&seed, &other, now + 10));
+    }
+
+    #[test]
+    fn test_sponsor_limit() {
+        let mut state = AccountingState::new();
+        let now = 1_000_000u64;
+        // Fill sponsor slots
+        for i in 0..MAX_SPONSORED_SEEDS {
+            let mut id = [0u8; NODE_ID_SIZE];
+            id[0] = i as u8 + 1;
+            let content = [i as u8; 32];
+            assert!(state.can_sponsor());
+            state
+                .register_sponsored_seed(id, content, 1000, now)
+                .unwrap();
+        }
+        assert!(!state.can_sponsor());
+        assert_eq!(state.sponsor_seed_count(), MAX_SPONSORED_SEEDS);
+        // New seed rejected
+        let extra = [0xFFu8; NODE_ID_SIZE];
+        let result = state.register_sponsored_seed(extra, [0xEEu8; 32], 1000, now);
+        assert!(matches!(result, Err(SponsorError::AtCapacity)));
+        // Renewal from existing seed still accepted (does not consume slot)
+        let mut first = [0u8; NODE_ID_SIZE];
+        first[0] = 1;
+        assert!(state
+            .register_sponsored_seed(first, [0xDDu8; 32], 500, now)
+            .is_ok());
+        // Reputation: violations flag misbehaving seeds
+        state.record_seed_heartbeat(&first, now + 1);
+        assert_eq!(state.sponsored_seeds[&first].heartbeats_received, 1);
+        state.record_seed_violation(&first);
+        state.record_seed_violation(&first);
+        state.record_seed_violation(&first);
+        assert!(state.is_seed_misbehaving(&first));
     }
 }

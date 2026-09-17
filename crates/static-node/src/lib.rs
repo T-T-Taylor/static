@@ -24,14 +24,31 @@ pub mod runner;
 use static_crypto::SymmetricKey;
 use static_mesh::{MeshState, CoverTrafficConfig};
 use static_sphinx::MixNode;
-use static_storage::AccountingState;
+use static_accounting::AccountingState;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use rand::rngs::OsRng;
 use rand::RngCore;
 
+/// Node operation mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum NodeMode {
+    /// Full node: hosts and retrieves content normally
+    Full = 0,
+    /// Seed-only node: pre-pays a sponsor to host on its behalf
+    SeedOnly = 1,
+    /// Backup-only node: dormant until primary fails, then activates
+    BackupOnly = 2,
+}
+
+impl Default for NodeMode {
+    fn default() -> Self {
+        NodeMode::Full
+    }
+}
+
 /// Configuration for a Static node
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NodeConfig {
     /// Data directory for node storage
     pub data_dir: PathBuf,
@@ -51,6 +68,10 @@ pub struct NodeConfig {
     pub api_addr: String,
     /// Maximum storage to contribute in bytes
     pub max_storage_bytes: u64,
+    /// Node operation mode
+    pub mode: NodeMode,
+    /// Sponsor peer address (required for seed-only mode)
+    pub sponsor: Option<String>,
 }
 
 impl Default for NodeConfig {
@@ -65,6 +86,8 @@ impl Default for NodeConfig {
             bootstrap_peers: vec![],
             api_addr: "127.0.0.1:9050".to_string(),
             max_storage_bytes: 10 * 1024 * 1024 * 1024, // 10 GB
+            mode: NodeMode::Full,
+            sponsor: None,
         }
     }
 }
@@ -166,8 +189,8 @@ impl StaticNode {
             stored_chunks: self.stored_chunks.len(),
             published_content: self.published_content.len(),
             cover_traffic_enabled: self.mesh.cover_traffic.is_enabled(),
-            total_bytes_served: self.accounting.bytes_contributed,
-            total_bytes_received: self.accounting.bytes_used,
+            total_bytes_served: self.accounting.total_bytes_served,
+            total_bytes_received: self.accounting.total_bytes_received,
         }
     }
 
