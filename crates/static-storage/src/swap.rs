@@ -334,6 +334,16 @@ impl StorageCapacity {
     pub fn record_remove(&mut self, chunk_size: u64) {
         self.current_bytes = self.current_bytes.saturating_sub(chunk_size);
     }
+
+    /// Reconcile current_bytes with the actual bytes held
+    ///
+    /// `current_bytes` is a cached counter maintained by the store/remove
+    /// paths; any missed update drifts it from reality. Call this with
+    /// `ChunkHolder::total_bytes()` before capacity decisions (and
+    /// periodically as a safety net) so `can_accept()` decides on truth.
+    pub fn reconcile(&mut self, actual_bytes: u64) {
+        self.current_bytes = actual_bytes;
+    }
 }
 
 /// Decision function: should this node accept a swap proposal?
@@ -522,6 +532,50 @@ mod tests {
         // max_chunks_per_peer defaults to 100
         assert!(capacity.can_accept(1024, 99));
         assert!(!capacity.can_accept(1024, 100));
+    }
+
+    #[test]
+    fn test_reconcile_updates_current_bytes() {
+        let mut capacity = StorageCapacity::new(1024 * 1024 * 10);
+        capacity.record_accept(1024 * 1024 * 5);
+        assert_eq!(capacity.current_bytes, 1024 * 1024 * 5);
+        // Holder reality differs (e.g. untracked publish) -> snap to truth.
+        capacity.reconcile(1024 * 1024 * 8);
+        assert_eq!(capacity.current_bytes, 1024 * 1024 * 8);
+        capacity.reconcile(0);
+        assert_eq!(capacity.current_bytes, 0);
+    }
+
+    #[test]
+    fn test_record_accept_increments() {
+        let mut capacity = StorageCapacity::new(1024 * 1024 * 10);
+        assert_eq!(capacity.current_bytes, 0);
+        capacity.record_accept(100);
+        capacity.record_accept(200);
+        assert_eq!(capacity.current_bytes, 300);
+    }
+
+    #[test]
+    fn test_record_remove_decrements() {
+        let mut capacity = StorageCapacity::new(1024 * 1024 * 10);
+        capacity.record_accept(1000);
+        capacity.record_remove(400);
+        assert_eq!(capacity.current_bytes, 600);
+        // Saturates at zero instead of underflowing.
+        capacity.record_remove(10_000);
+        assert_eq!(capacity.current_bytes, 0);
+    }
+
+    #[test]
+    fn test_can_accept_after_reconcile() {
+        let mut capacity = StorageCapacity::new(1024);
+        // Drifted counter claims full -> rejects.
+        capacity.record_accept(1024);
+        assert!(!capacity.can_accept(1, 0));
+        // Reality is half-full -> reconcile restores correct decisions.
+        capacity.reconcile(512);
+        assert!(capacity.can_accept(512, 0));
+        assert!(!capacity.can_accept(513, 0));
     }
 
     #[test]

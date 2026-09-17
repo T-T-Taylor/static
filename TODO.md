@@ -113,4 +113,12 @@
   - Results returned via Sphinx SURBs (Single-Use Reply Blocks).
   - Compute providers earn higher accounting credit/tier.
   - Confidentiality options: Trusted Execution Environments (TEEs) or Homomorphic Encryption if the compute provider shouldn't see the data.
-  - Routing logic for compute requests vs. storage requests.
+   - Routing logic for compute requests vs. storage requests.
+
+## Technical Debt
+
+### 16. StorageCapacity Reconciliation ✅ DONE
+- Unified the dual `StorageCapacity` counters (runner + transport) into one shared `Arc`
+- `reconcile()` snaps the counter to `ChunkHolder::total_bytes()` before swap decisions and every 60 s
+- Publish, lease expiry, cache insert/evict paths maintain the counter incrementally
+- Swap accept/reject paths store nothing, so need no counter updates

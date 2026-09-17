@@ -443,7 +443,22 @@ async fn handle_message(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
-            
+
+            // Reconcile the shared capacity counter with holder reality
+            // before deciding: the counter is maintained incrementally and
+            // any missed update would otherwise corrupt the decision.
+            // (No record_accept here: accepting stores nothing in the
+            // holder — only metadata and a reply — so the holder total,
+            // and hence the counter, is unchanged by this path.)
+            let actual_bytes = {
+                let holder = state.chunk_holder.lock().await;
+                holder.total_bytes()
+            };
+            {
+                let mut capacity = state.storage_capacity.lock().await;
+                capacity.reconcile(actual_bytes);
+            }
+
             let capacity = state.storage_capacity.lock().await;
             let result = decide_on_swap(
                 &proposal,
@@ -775,15 +790,20 @@ pub async fn start_listener(
 }
 
 /// Create transport state
+///
+/// The `storage_capacity` is shared with the node's accounting layer
+/// (a single `Arc`, not a copy) so swap decisions, publish accounting,
+/// and periodic reconciliation all observe one counter. Callers size it
+/// from node configuration; there is no transport-level default.
 pub fn create_transport_state(
     node_id: NodeId,
     mix_node: MixNode,
     cover_config: crate::CoverTrafficConfig,
+    storage_capacity: Arc<Mutex<StorageCapacity>>,
 ) -> (Arc<TransportState>, mpsc::Receiver<InboundMessage>) {
     let (inbound_tx, inbound_rx) = mpsc::channel(CHANNEL_BUFFER);
     let routing_table = RoutingTable::new(node_id);
     let swap_state = SwapState::new();
-    let storage_capacity = StorageCapacity::new(10 * 1024 * 1024 * 1024); // 10 GB default
     let storage_key = static_crypto::SymmetricKey::random();
     let chunk_holder = ChunkHolder::new();
 
@@ -799,7 +819,7 @@ pub fn create_transport_state(
         inbound_tx,
         routing_table: Arc::new(RwLock::new(routing_table)),
         swap_state: Arc::new(Mutex::new(swap_state)),
-        storage_capacity: Arc::new(Mutex::new(storage_capacity)),
+        storage_capacity,
         storage_key: Arc::new(Mutex::new(storage_key)),
         chunk_holder: Arc::new(Mutex::new(chunk_holder)),
         previously_connected: Arc::new(RwLock::new(HashSet::new())),
@@ -901,13 +921,18 @@ mod tests {
         id
     }
 
+    /// Fresh 10 GB capacity for tests (mirrors the node default).
+    fn test_capacity() -> Arc<Mutex<StorageCapacity>> {
+        Arc::new(Mutex::new(StorageCapacity::new(10 * 1024 * 1024 * 1024)))
+    }
+
     #[tokio::test]
     async fn test_transport_state_creation() {
         let node_id = random_node_id();
         let mix_node = MixNode::new();
         let cover_config = crate::CoverTrafficConfig::default();
 
-        let (state, _rx) = create_transport_state(node_id, mix_node, cover_config);
+        let (state, _rx) = create_transport_state(node_id, mix_node, cover_config, test_capacity());
 
         assert_eq!(state.node_id, node_id);
         assert_eq!(state.connections.read().await.len(), 0);
@@ -928,7 +953,7 @@ mod tests {
         let mix_node = MixNode::new();
         let cover_config = crate::CoverTrafficConfig::default();
 
-        let (state, _rx) = create_transport_state(node_id, mix_node, cover_config);
+        let (state, _rx) = create_transport_state(node_id, mix_node, cover_config, test_capacity());
 
         let route = Route {
             hops: vec![RouteHop {
@@ -949,7 +974,7 @@ mod tests {
         let mix_node = MixNode::new();
         let cover_config = crate::CoverTrafficConfig::default();
 
-        let (state, _rx) = create_transport_state(node_id, mix_node, cover_config);
+        let (state, _rx) = create_transport_state(node_id, mix_node, cover_config, test_capacity());
 
         let stats = get_stats(&state).await;
         assert_eq!(stats.total_bytes_sent, 0);
@@ -966,7 +991,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (state1, _rx1) = create_transport_state(node1_id, node1_mix, cover_config.clone());
+        let (state1, _rx1) = create_transport_state(node1_id, node1_mix, cover_config.clone(), test_capacity());
 
         // Start listener for node1
         let listener_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -988,7 +1013,7 @@ mod tests {
         // Node2 connects to node1
         let node2_id = random_node_id();
         let node2_mix = MixNode::new();
-        let (state2, _rx2) = create_transport_state(node2_id, node2_mix, cover_config);
+        let (state2, _rx2) = create_transport_state(node2_id, node2_mix, cover_config, test_capacity());
 
         // Give listener a moment to start
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1023,9 +1048,9 @@ mod tests {
             ..Default::default()
         };
 
-        let (state_a, _rx_a) = create_transport_state(node_a_id, mix_a, cover_config.clone());
-        let (state_b, _rx_b) = create_transport_state(node_b_id, mix_b, cover_config.clone());
-        let (state_c, mut rx_c) = create_transport_state(node_c_id, mix_c, cover_config);
+        let (state_a, _rx_a) = create_transport_state(node_a_id, mix_a, cover_config.clone(), test_capacity());
+        let (state_b, _rx_b) = create_transport_state(node_b_id, mix_b, cover_config.clone(), test_capacity());
+        let (state_c, mut rx_c) = create_transport_state(node_c_id, mix_c, cover_config, test_capacity());
 
         // Start listeners for B and C
         let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();

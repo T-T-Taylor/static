@@ -92,13 +92,19 @@ impl NodeRunner {
             tier: config.tier,
         };
 
-        let (transport, inbound_rx) = create_transport_state(node_id, mix_node, cover_config);
+        // One shared capacity counter for the whole node: the swap
+        // decision path (transport), publish/cache accounting, and the
+        // periodic reconciler all observe the same object, so the
+        // counter cannot drift between layers.
+        let capacity = Arc::new(Mutex::new(StorageCapacity::new(config.max_storage_bytes)));
+        let (transport, inbound_rx) =
+            create_transport_state(node_id, mix_node, cover_config, capacity.clone());
 
         Self {
             transport,
             leases: Arc::new(Mutex::new(LeaseManager::new())),
             swaps: Arc::new(Mutex::new(SwapState::new())),
-            capacity: Arc::new(Mutex::new(StorageCapacity::new(config.max_storage_bytes))),
+            capacity,
             accounting: Arc::new(Mutex::new(AccountingState::default())),
             storage_keys: Arc::new(Mutex::new(HashMap::new())),
             retriever: Arc::new(Mutex::new(static_mesh::retrieval::RetrievalManager::new())),
@@ -183,8 +189,9 @@ impl NodeRunner {
         // Start lease expiration loop
         let leases = self.leases.clone();
         let chunks = self.transport.chunk_holder.clone();
+        let capacity_for_expiry = self.capacity.clone();
         tokio::spawn(async move {
-            lease_expiration_loop(leases, chunks).await;
+            lease_expiration_loop(leases, chunks, capacity_for_expiry).await;
         });
 
         // Start repair loop
@@ -217,6 +224,20 @@ impl NodeRunner {
                     PARTITION_THRESHOLD_SECS,
                     PARTITION_GRACE_PERIOD_SECS,
                 );
+            }
+        });
+
+        // Start capacity reconciliation loop (safety net).
+        // Individual store/remove paths maintain the shared counter
+        // incrementally, but any missed update drifts it; every 60 s the
+        // counter is snapped back to ChunkHolder::total_bytes().
+        let capacity_for_reconcile = self.capacity.clone();
+        let holder_for_reconcile = self.transport.chunk_holder.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                reconcile_capacity_once(&holder_for_reconcile, &capacity_for_reconcile).await;
             }
         });
 
@@ -631,6 +652,15 @@ impl NodeRunner {
             holder.add_chunk(manifest_chunk_id, encrypted_manifest.ciphertext.clone(), content_id);
         }
 
+        // 6b. Account the stored bytes toward the 1:1 contribution.
+        {
+            let mut capacity = self.capacity.lock().await;
+            for chunk in &chunks {
+                capacity.record_accept(chunk.data.len() as u64);
+            }
+            capacity.record_accept(encrypted_manifest.ciphertext.len() as u64);
+        }
+
         // 7. Register with lease manager
         let mut chunk_ids: Vec<ChunkId> = chunks.iter().map(|c| c.id).collect();
         chunk_ids.push(manifest_chunk_id); // Include the manifest chunk in the lease
@@ -877,32 +907,51 @@ impl NodeRunner {
 async fn lease_expiration_loop(
     leases: Arc<Mutex<LeaseManager>>,
     chunks: Arc<Mutex<ChunkHolder>>,
+    capacity: Arc<Mutex<StorageCapacity>>,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
 
     loop {
         interval.tick().await;
-        
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let mut leases = leases.lock().await;
-        let expired = leases.get_expired_chunks(current_time);
-
-        if !expired.is_empty() {
-            debug!("Found {} expired chunks", expired.len());
-            
-            let mut chunks = chunks.lock().await;
-            for chunk_id in &expired {
-                chunks.remove_chunk(chunk_id);
-                leases.remove_lease(chunk_id);
-            }
-        }
-
-        leases.cleanup_nonces(current_time);
+        expire_chunks_once(&leases, &chunks, &capacity).await;
     }
+}
+
+/// Run one lease-expiration sweep: drop expired chunks, release their
+/// leases, and subtract the freed bytes from capacity.
+///
+/// Lock order per chunk is holder → leases → capacity, each guard
+/// dropped before the next is taken, so sweeps never nest guards.
+async fn expire_chunks_once(
+    leases: &Arc<Mutex<LeaseManager>>,
+    chunks: &Arc<Mutex<ChunkHolder>>,
+    capacity: &Arc<Mutex<StorageCapacity>>,
+) -> usize {
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let expired = leases.lock().await.get_expired_chunks(current_time);
+
+    if !expired.is_empty() {
+        debug!("Found {} expired chunks", expired.len());
+
+        for chunk_id in &expired {
+            let chunk_size = {
+                let mut holder = chunks.lock().await;
+                let size = holder.get_chunk(chunk_id).map(|d| d.len() as u64).unwrap_or(0);
+                holder.remove_chunk(chunk_id);
+                size
+            };
+            leases.lock().await.remove_lease(chunk_id);
+            capacity.lock().await.record_remove(chunk_size);
+        }
+    }
+
+    leases.lock().await.cleanup_nonces(current_time);
+
+    expired.len()
 }
 
 
@@ -928,8 +977,75 @@ async fn repair_loop(
         // 5. If health is not healthy, call create_repair_plan()
         // 6. If a plan is created, retrieve remaining shards and reconstruct
         // 7. Re-distribute the reconstructed shards to new nodes
+        //
+        // Capacity invariant: when step 6/7 starts storing reconstructed
+        // chunks in the holder, each stored chunk MUST be paired with
+        // `capacity.record_accept(len)` (shared counter) so the 1:1
+        // accounting stays truthful. Nothing is stored yet, so no
+        // capacity call belongs here today.
         
         // For now, just log that the repair loop is running
         debug!("Repair loop tick. Active repairs: {}", repair_state.lock().await.active_count());
+    }
+}
+
+/// Reconcile the shared capacity counter with holder reality (one sweep)
+///
+/// Safety net for any store/remove path that misses its incremental
+/// update: snapshots `ChunkHolder::total_bytes()` then writes it into
+/// the counter. Guards are strictly sequential.
+async fn reconcile_capacity_once(
+    chunk_holder: &Arc<Mutex<ChunkHolder>>,
+    capacity: &Arc<Mutex<StorageCapacity>>,
+) -> u64 {
+    let actual_bytes = chunk_holder.lock().await.total_bytes();
+    capacity.lock().await.reconcile(actual_bytes);
+    actual_bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    async fn test_publish_updates_capacity() {
+        let config = NodeConfig::default();
+        let runner = NodeRunner::new(config, [0x42u8; 16], MixNode::new());
+
+        assert_eq!(runner.capacity.lock().await.current_bytes, 0);
+        let (_content_id, _manifest, _pubkey) =
+            runner.publish_content(b"capacity test payload").await.unwrap();
+
+        // Shared counter matches holder reality (chunks + manifest).
+        let actual = runner.transport.chunk_holder.lock().await.total_bytes();
+        assert!(actual > 0);
+        assert_eq!(runner.capacity.lock().await.current_bytes, actual);
+    }
+
+    #[tokio::test]
+    async fn test_lease_expiry_updates_capacity() {
+        use static_storage::heartbeat::LeaseManager;
+
+        let chunk_id = [0xABu8; 32];
+        let chunk_data = vec![0xCDu8; 1024];
+
+        let leases = Arc::new(Mutex::new(LeaseManager::new()));
+        let chunks = Arc::new(Mutex::new(ChunkHolder::new()));
+        let capacity = Arc::new(Mutex::new(StorageCapacity::new(10 * 1024 * 1024)));
+
+        // Store a chunk and account it, with a long-dead lease.
+        chunks.lock().await.add_chunk(chunk_id, chunk_data.clone(), [0u8; 32]);
+        capacity.lock().await.record_accept(chunk_data.len() as u64);
+        let now = current_timestamp();
+        let dead_lease = static_storage::create_lease(
+            &chunk_id,
+            &SymmetricKey::random(),
+            1,
+            now.saturating_sub(100_000),
+        );
+        leases.lock().await.add_lease(chunk_id, dead_lease);
+
+        let expired = expire_chunks_once(&leases, &chunks, &capacity).await;
+        assert_eq!(expired, 1);
+        assert!(chunks.lock().await.get_chunk(&chunk_id).is_none());
+        assert_eq!(capacity.lock().await.current_bytes, 0);
     }
 }
