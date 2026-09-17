@@ -16,7 +16,7 @@
 - No DHT needed — the mixnet is the discovery mechanism
 - Seed-only nodes (or their sponsors) act as introduction points by holding manifests
 
-### 3. Chunk Repair Protocol
+### 3. Chunk Repair Protocol ✅ DONE
 - When nodes leave, their chunks need re-replication
 - Detect chunk loss via erasure coding threshold
 - Trigger re-replication from remaining shards
