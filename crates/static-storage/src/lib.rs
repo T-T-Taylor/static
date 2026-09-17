@@ -15,6 +15,9 @@
 /// Storage swap barter protocol
 pub mod swap;
 
+/// Content integrity verification via Merkle trees
+pub mod integrity;
+
 /// Lease and heartbeat protocol
 pub mod heartbeat;
 

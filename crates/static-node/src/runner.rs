@@ -34,6 +34,7 @@ use static_storage::{
         MAX_COMPUTE_INPUT_SIZE, deserialize_payment_confirmation, deserialize_payment_request,
         serialize_payment_confirmation, serialize_payment_request,
     },
+    integrity::{MerkleProof, MerkleRoot},
     repair::RepairState,
     heartbeat::LeaseManager,
     retrieval::{ChunkHolder, ContentRetriever},
@@ -215,6 +216,15 @@ pub struct NodeRunner {
     pub backup_state: Arc<Mutex<BackupState>>,
     /// Compute state for tracking executions and payments
     pub compute_state: Arc<Mutex<ComputeState>>,
+    /// Merkle proofs for published content (chunk_id -> (root, proof))
+    ///
+    /// Generated at publish time over the encrypted chunks (data + parity).
+    /// Rotation swap proposals attach these so receivers can verify chunk
+    /// integrity. Stored for the node's lifetime (bounded by published
+    /// content); lease expiry does not clean them (MVP). The manifest
+    /// chunk intentionally has no proof: it stays with the publisher and
+    /// never rotates.
+    pub merkle_proofs: Arc<Mutex<HashMap<ChunkId, (MerkleRoot, MerkleProof)>>>,
     /// Blockchain watchers for payment verification (currency byte -> watcher)
     ///
     /// Built from the accepted currencies in [`NodeConfig::compute_config`].
@@ -290,6 +300,7 @@ impl NodeRunner {
             rotation_state: Arc::new(Mutex::new(RotationState::new())),
             backup_state: Arc::new(Mutex::new(BackupState::default())),
             compute_state: Arc::new(Mutex::new(ComputeState::default())),
+            merkle_proofs: Arc::new(Mutex::new(HashMap::new())),
             payment_watchers,
             inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
             config,
@@ -513,6 +524,7 @@ impl NodeRunner {
             let swaps_for_rotation = self.swaps.clone();
             let capacity_for_rotation = self.capacity.clone();
             let transport_for_rotation = self.transport.clone();
+            let merkle_proofs_for_rotation = self.merkle_proofs.clone();
             let rotation_node_id = self.transport.node_id;
             tokio::spawn(async move {
                 rotation_loop(
@@ -523,6 +535,7 @@ impl NodeRunner {
                     swaps_for_rotation,
                     capacity_for_rotation,
                     transport_for_rotation,
+                    merkle_proofs_for_rotation,
                     rotation_node_id,
                 )
                 .await;
@@ -1723,6 +1736,19 @@ impl NodeRunner {
             ).await;
         }
 
+        // Generate Merkle integrity proofs over the encrypted chunks (data
+        // + parity). Rotation swap proposals attach these so receivers can
+        // verify chunks are real shards of this content. The manifest
+        // chunk is intentionally left unproven: it stays with the
+        // publisher and never rotates.
+        let (content_root, chunk_proofs) = static_storage::integrity::generate_proofs(&chunks);
+        {
+            let mut proofs = self.merkle_proofs.lock().await;
+            for (chunk, proof) in chunks.iter().zip(chunk_proofs) {
+                proofs.insert(chunk.id, (content_root, proof));
+            }
+        }
+
         // 3. Store the chunks locally (full / backup nodes)
         {
             let mut holder = self.transport.chunk_holder.lock().await;
@@ -2336,6 +2362,7 @@ async fn rotation_loop(
     swaps: Arc<Mutex<SwapState>>,
     capacity: Arc<Mutex<StorageCapacity>>,
     transport: Arc<TransportState>,
+    merkle_proofs: Arc<Mutex<HashMap<ChunkId, (MerkleRoot, MerkleProof)>>>,
     node_id: NodeId,
 ) {
     // Note: tokio::interval ticks immediately on first tick; with an
@@ -2439,6 +2466,18 @@ async fn rotation_loop(
             };
 
             let chunk = EncryptedChunk { id: *chunk_id, data: data.clone() };
+            // Chunks without a stored proof (cached chunks, manifest
+            // chunks) can never pass receiver validation, so they are
+            // skipped rather than sent to certain rejection.
+            let Some((content_root, merkle_proof)) =
+                merkle_proofs.lock().await.get(chunk_id).cloned()
+            else {
+                debug!(
+                    "Skipping rotation of chunk {:02x?}: no Merkle proof",
+                    chunk_id
+                );
+                continue;
+            };
             // Leases here are minted with our own key: rotation proposals
             // are time-validated barters, not ownership proofs (MVP).
             let proposal = static_storage::swap::create_swap_proposal(
@@ -2446,6 +2485,8 @@ async fn rotation_loop(
                 chunk,
                 &master_key,
                 static_storage::swap::DEFAULT_LEASE_DURATION_SECS,
+                content_root,
+                merkle_proof,
             );
             swaps.lock().await.record_proposal(&proposal);
             if sender.send(WireMessage::SwapProposal(proposal)).await.is_ok() {

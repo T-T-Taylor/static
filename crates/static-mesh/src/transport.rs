@@ -1585,21 +1585,28 @@ mod tests {
     /// Build a swap proposal carrying a real chunk
     ///
     /// Chunk data must be exactly `CHUNK_SIZE + 16` bytes and the lease
-    /// must be valid, or `decide_on_swap` rejects the proposal.
+    /// must be valid, or `decide_on_swap` rejects the proposal. A genuine
+    /// single-chunk Merkle proof is generated so the integrity check
+    /// passes.
     fn test_swap_proposal(from: NodeId, chunk_id: [u8; 32], data: Vec<u8>) -> static_storage::swap::SwapProposal {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        let chunk = static_storage::EncryptedChunk { id: chunk_id, data };
+        let (content_root, proofs) =
+            static_storage::integrity::generate_proofs(std::slice::from_ref(&chunk));
         static_storage::swap::SwapProposal {
             from_node: from,
-            chunk: static_storage::EncryptedChunk { id: chunk_id, data },
+            chunk,
             lease: static_storage::ChunkLease {
                 chunk_id,
                 expires_at: now + 86400,
                 renewal_token: [0u8; 32],
             },
             encrypted_master_key: Vec::new(),
+            content_root,
+            merkle_proof: proofs.into_iter().next().expect("one chunk, one proof"),
         }
     }
 
@@ -1654,6 +1661,46 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(state.chunk_holder.lock().await.get_chunk(&chunk_id).is_none());
+        assert_eq!(state.storage_capacity.lock().await.current_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn test_dormant_swap_rejects_tampered_chunk() {
+        // Garbage-flooding protection end-to-end: a chunk tampered after
+        // proof generation must not be materialized by a dormant backup.
+        let (state, _rx) = create_transport_state(
+            random_node_id(),
+            MixNode::new(),
+            crate::CoverTrafficConfig::default(),
+            test_capacity(),
+        );
+        state
+            .serve_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let chunk_id = [0xB3u8; 32];
+        let mut proposal = test_swap_proposal(
+            random_node_id(),
+            chunk_id,
+            vec![0x5Eu8; static_storage::CHUNK_SIZE + 16],
+        );
+        let proof = proposal.merkle_proof.clone();
+        let root = proposal.content_root;
+        // Same size, different bytes: passes the size gate, fails integrity.
+        proposal.chunk.data[0] ^= 0xFF;
+        assert!(!static_storage::integrity::verify_chunk(
+            &proposal.chunk,
+            &proof,
+            &root
+        ));
+
+        handle_message(WireMessage::SwapProposal(proposal), &state, random_node_id())
+            .await
+            .unwrap();
+
+        // The tampered chunk was rejected (InvalidIntegrityTag), so the
+        // dormant backup stored nothing.
         assert!(state.chunk_holder.lock().await.get_chunk(&chunk_id).is_none());
         assert_eq!(state.storage_capacity.lock().await.current_bytes, 0);
     }

@@ -87,10 +87,22 @@
 - Bridge mode: Bluetooth node connects to TCP node for cover traffic
 - Store-and-forward instead of constant-rate
 
-### 12. Content Integrity Verification Tags
+### 12. Content Integrity Verification Tags ✅ DONE
 - Hosting nodes verify they hold valid chunks without learning content
 - Erasure coding verification tags
 - Prevents nodes from claiming to store chunks they don't have
+- Implementation: Merkle tree over the encrypted chunks (data + parity)
+  built at publish time (`static-storage/src/integrity.rs`, blake3:
+  leaf = blake3(data), node = blake3(l||r), Bitcoin-style odd-node
+  duplication). The publisher stores the root + per-chunk proofs;
+  `SwapProposal` carries `content_root` + `merkle_proof` and
+  `validate_swap_proposal` verifies the offered chunk, rejecting garbage
+  with `InvalidIntegrityTag` (= 4). Verified end-to-end at the transport
+  layer (tampered chunks are never materialized by dormant backups).
+  Limitations: the manifest chunk is intentionally unproven (stays with
+  the publisher, never rotates); proofs live for the node's lifetime
+  (bounded by published content); leaf/node hashes are not
+  domain-separated yet (future hardening: 0x00/0x01 tag bytes).
 
 ### 13. Withdrawal/Exit Protocol for Seed-Only Nodes
 - When seed-only node stops funding, content retires via lease expiry

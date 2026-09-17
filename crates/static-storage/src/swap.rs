@@ -20,6 +20,7 @@
 use crate::{
     EncryptedChunk, ChunkLease, ChunkId, NodeId,
     StorageError, create_lease, is_lease_valid,
+    integrity::{MerkleProof, MerkleRoot},
 };
 use static_crypto::SymmetricKey;
 use std::collections::HashMap;
@@ -57,6 +58,10 @@ pub struct SwapProposal {
     /// The master key (encrypted to the receiving node, or shared for barter)
     /// In a pure barter, the key is not shared - the chunk is opaque
     pub encrypted_master_key: Vec<u8>,
+    /// Merkle root of the content this chunk belongs to
+    pub content_root: MerkleRoot,
+    /// Merkle proof verifying this chunk against `content_root`
+    pub merkle_proof: MerkleProof,
 }
 
 /// A swap acceptance
@@ -96,6 +101,8 @@ pub enum SwapRejectReason {
     InvalidChunkSize = 2,
     /// Invalid lease
     InvalidLease = 3,
+    /// Chunk failed Merkle proof verification
+    InvalidIntegrityTag = 4,
 }
 
 impl TryFrom<u8> for SwapRejectReason {
@@ -107,6 +114,7 @@ impl TryFrom<u8> for SwapRejectReason {
             1 => Ok(SwapRejectReason::TooManyFromPeer),
             2 => Ok(SwapRejectReason::InvalidChunkSize),
             3 => Ok(SwapRejectReason::InvalidLease),
+            4 => Ok(SwapRejectReason::InvalidIntegrityTag),
             _ => Err(StorageError::InvalidChunkSize {
                 expected: 0,
                 actual: value as usize,
@@ -208,11 +216,17 @@ pub fn proposal_id(proposal: &SwapProposal) -> [u8; 32] {
 }
 
 /// Create a swap proposal for a chunk
+///
+/// `content_root` and `merkle_proof` come from
+/// [`crate::integrity::generate_proofs`] over the content's chunks; the
+/// receiver verifies them before accepting.
 pub fn create_swap_proposal(
     from_node: NodeId,
     chunk: EncryptedChunk,
     master_key: &SymmetricKey,
     lease_duration_secs: u64,
+    content_root: MerkleRoot,
+    merkle_proof: MerkleProof,
 ) -> SwapProposal {
     let lease = create_lease(
         &chunk.id,
@@ -230,6 +244,8 @@ pub fn create_swap_proposal(
         chunk,
         lease,
         encrypted_master_key: vec![],
+        content_root,
+        merkle_proof,
     }
 }
 
@@ -275,6 +291,7 @@ pub fn create_swap_reject(
 /// Checks:
 /// 1. Chunk size is correct (1 MiB + 16 byte tag)
 /// 2. Lease is valid
+/// 3. Chunk verifies against its Merkle proof and content root
 pub fn validate_swap_proposal(
     proposal: &SwapProposal,
     expected_chunk_size: usize,
@@ -288,6 +305,17 @@ pub fn validate_swap_proposal(
     // Check lease
     if !is_lease_valid(&proposal.lease, current_time) {
         return Err(SwapRejectReason::InvalidLease);
+    }
+
+    // Check integrity: the chunk must hash up the Merkle proof to the
+    // content root, proving it is a real shard of some published content
+    // (garbage-flooding protection).
+    if !crate::integrity::verify_chunk(
+        &proposal.chunk,
+        &proposal.merkle_proof,
+        &proposal.content_root,
+    ) {
+        return Err(SwapRejectReason::InvalidIntegrityTag);
     }
 
     Ok(())
@@ -394,13 +422,34 @@ mod tests {
         encrypt_chunk(&master, &nonce, 0, &plaintext).unwrap()
     }
 
+    /// Build a swap proposal carrying a genuine Merkle proof for its chunk
+    ///
+    /// Validation now verifies integrity, so every proposal under test
+    /// must carry a real proof generated over the chunk data.
+    fn make_proposal(
+        node_id: NodeId,
+        chunk: EncryptedChunk,
+        master: &SymmetricKey,
+        lease_duration_secs: u64,
+    ) -> SwapProposal {
+        let (root, proofs) = crate::integrity::generate_proofs(std::slice::from_ref(&chunk));
+        create_swap_proposal(
+            node_id,
+            chunk,
+            master,
+            lease_duration_secs,
+            root,
+            proofs.into_iter().next().expect("one chunk, one proof"),
+        )
+    }
+
     #[test]
     fn test_swap_proposal_creation() {
         let node_id = random_node_id();
         let chunk = random_chunk();
         let master = SymmetricKey::random();
 
-        let proposal = create_swap_proposal(
+        let proposal = make_proposal(
             node_id,
             chunk.clone(),
             &master,
@@ -451,8 +500,8 @@ mod tests {
         let chunk = random_chunk();
         let master = SymmetricKey::random();
 
-        let proposal1 = create_swap_proposal(node_id, chunk.clone(), &master, 3600);
-        let proposal2 = create_swap_proposal(node_id, chunk, &master, 3600);
+        let proposal1 = make_proposal(node_id, chunk.clone(), &master, 3600);
+        let proposal2 = make_proposal(node_id, chunk, &master, 3600);
 
         let id1 = proposal_id(&proposal1);
         let id2 = proposal_id(&proposal2);
@@ -467,8 +516,8 @@ mod tests {
         let chunk2 = random_chunk();
         let master = SymmetricKey::random();
 
-        let proposal1 = create_swap_proposal(node_id, chunk1, &master, 3600);
-        let proposal2 = create_swap_proposal(node_id, chunk2, &master, 3600);
+        let proposal1 = make_proposal(node_id, chunk1, &master, 3600);
+        let proposal2 = make_proposal(node_id, chunk2, &master, 3600);
 
         let id1 = proposal_id(&proposal1);
         let id2 = proposal_id(&proposal2);
@@ -482,7 +531,7 @@ mod tests {
         let chunk = random_chunk();
         let master = SymmetricKey::random();
 
-        let proposal = create_swap_proposal(node_id, chunk, &master, 3600);
+        let proposal = make_proposal(node_id, chunk, &master, 3600);
 
         let result = validate_swap_proposal(&proposal, CHUNK_SIZE + 16, current_timestamp());
         assert!(result.is_ok());
@@ -494,7 +543,7 @@ mod tests {
         let chunk = random_chunk();
         let master = SymmetricKey::random();
 
-        let proposal = create_swap_proposal(node_id, chunk, &master, 3600);
+        let proposal = make_proposal(node_id, chunk, &master, 3600);
 
         // Wrong expected size
         let result = validate_swap_proposal(&proposal, 512, current_timestamp());
@@ -507,12 +556,40 @@ mod tests {
         let chunk = random_chunk();
         let master = SymmetricKey::random();
 
-        let proposal = create_swap_proposal(node_id, chunk, &master, 3600);
+        let proposal = make_proposal(node_id, chunk, &master, 3600);
 
         // Check with time far in the future
         let future_time = current_timestamp() + 7200;
         let result = validate_swap_proposal(&proposal, CHUNK_SIZE + 16, future_time);
         assert_eq!(result.unwrap_err(), SwapRejectReason::InvalidLease);
+    }
+
+    #[test]
+    fn test_validate_valid_integrity() {
+        // A proposal carrying a genuine proof passes the integrity check.
+        let node_id = random_node_id();
+        let chunk = random_chunk();
+        let master = SymmetricKey::random();
+
+        let proposal = make_proposal(node_id, chunk, &master, 3600);
+
+        let result = validate_swap_proposal(&proposal, CHUNK_SIZE + 16, current_timestamp());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_invalid_integrity() {
+        // Tampering with the chunk data after proof generation (same size,
+        // different bytes) fails with InvalidIntegrityTag.
+        let node_id = random_node_id();
+        let master = SymmetricKey::random();
+
+        let proposal = make_proposal(node_id, random_chunk(), &master, 3600);
+        let mut tampered = proposal;
+        tampered.chunk.data[0] ^= 0xFF;
+
+        let result = validate_swap_proposal(&tampered, CHUNK_SIZE + 16, current_timestamp());
+        assert_eq!(result.unwrap_err(), SwapRejectReason::InvalidIntegrityTag);
     }
 
     #[test]
@@ -585,7 +662,7 @@ mod tests {
         let master = SymmetricKey::random();
         let capacity = StorageCapacity::new(1024 * 1024 * 100);
 
-        let proposal = create_swap_proposal(node_id, chunk, &master, 3600);
+        let proposal = make_proposal(node_id, chunk, &master, 3600);
 
         let result = decide_on_swap(&proposal, &capacity, 0, CHUNK_SIZE + 16, current_timestamp());
         assert!(result.is_ok());
@@ -598,7 +675,7 @@ mod tests {
         let master = SymmetricKey::random();
         let capacity = StorageCapacity::new(1024 * 100); // Only 100 KB
 
-        let proposal = create_swap_proposal(node_id, chunk, &master, 3600);
+        let proposal = make_proposal(node_id, chunk, &master, 3600);
 
         let result = decide_on_swap(&proposal, &capacity, 0, CHUNK_SIZE + 16, current_timestamp());
         assert_eq!(result.unwrap_err(), SwapRejectReason::NoCapacity);
@@ -611,7 +688,7 @@ mod tests {
         let master = SymmetricKey::random();
         let capacity = StorageCapacity::new(1024 * 1024 * 1000);
 
-        let proposal = create_swap_proposal(node_id, chunk, &master, 3600);
+        let proposal = make_proposal(node_id, chunk, &master, 3600);
 
         let result = decide_on_swap(&proposal, &capacity, 100, CHUNK_SIZE + 16, current_timestamp());
         assert_eq!(result.unwrap_err(), SwapRejectReason::TooManyFromPeer);
@@ -624,7 +701,7 @@ mod tests {
         let chunk = random_chunk();
         let master = SymmetricKey::random();
 
-        let proposal = create_swap_proposal(node_id, chunk.clone(), &master, 3600);
+        let proposal = make_proposal(node_id, chunk.clone(), &master, 3600);
         let _id = proposal_id(&proposal);
 
         state.record_proposal(&proposal);
@@ -646,7 +723,7 @@ mod tests {
         let chunk = random_chunk();
         let master = SymmetricKey::random();
 
-        let proposal = create_swap_proposal(node_id, chunk, &master, 3600);
+        let proposal = make_proposal(node_id, chunk, &master, 3600);
         state.record_proposal(&proposal);
 
         let stats = state.stats();
