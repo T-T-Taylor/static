@@ -62,9 +62,9 @@ pub enum ComputeError {
     /// Module content is not available locally or on the network
     #[error("module not found on network")]
     ModuleNotFound,
-    /// Offered fee is below the minimum accepted
-    #[error("fee insufficient")]
-    FeeInsufficient,
+    /// Payment problem (unsupported currency, quote failure, timeout)
+    #[error("payment error: {0}")]
+    Payment(String),
     /// Node is already executing the maximum number of requests
     #[error("capacity exceeded")]
     CapacityExceeded,

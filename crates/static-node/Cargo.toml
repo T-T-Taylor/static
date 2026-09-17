@@ -23,3 +23,5 @@ bytes.workspace = true
 hex = "0.4"
 thiserror.workspace = true
 wasmtime.workspace = true
+reqwest.workspace = true
+async-trait.workspace = true

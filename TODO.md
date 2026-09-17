@@ -133,3 +133,32 @@
 - `reconcile()` snaps the counter to `ChunkHolder::total_bytes()` before swap decisions and every 60 s
 - Publish, lease expiry, cache insert/evict paths maintain the counter incrementally
 - Swap accept/reject paths store nothing, so need no counter updates
+
+### 17. Cryptocurrency Payment for Compute ✅ DONE
+- Replaced compute barter entirely: `fee_offer`, `fee_charged`,
+  `fee_multiplier`, `MIN_COMPUTE_FEE` and the compute credit bookkeeping
+  (`record_served`/`record_received` call sites) are gone. Storage barter
+  (1:1 tit-for-tat) is unchanged.
+- Providers set their own pricing via CLI (`--compute-price`,
+  `--compute-currencies`, `--compute-confirmations`): per-execution flat
+  rate, per-CPU-second and per-MB rates (worst-case quote uses the
+  execution caps). All-zero pricing = free tier (immediate execution,
+  no payment round-trip).
+- Supported currencies: Monero (XMR), Darkfi (DARK), Navio (NAV). Wire
+  types (`Currency`, `PaymentRequest`, `PaymentConfirmation`, type bytes
+  0x05/0x06) live in `static-storage/src/compute.rs` as Sphinx-body
+  messages, indistinguishable from cover traffic.
+- Provider generates a fresh receive address per request (`create_address`
+  via monero-wallet-rpc) and watches the blockchain through daemon RPC
+  (`MoneroWatcher` reference implementation; Darkfi/Navio are stubs
+  returning `UnsupportedCurrency` until their RPC APIs stabilize).
+- Flow: `ComputeRequest` -> provider quotes `PaymentRequest` (0x05) ->
+  requester pays from their own wallet (outside Static) and sends
+  `PaymentConfirmation` (0x06) via a fresh 1-hop Sphinx message ->
+  provider's payment-watch loop (15 s tick) verifies confirmations
+  on-chain -> executes -> `ComputeResponse`. Unpaid quotes time out after
+  1 h with a courtesy error response carrying the original quote.
+- Requester-side API: `compute` returns a request ID; `compute_result`
+  surfaces `payment_required`/`payment_currency`/`payment_address`/
+  `payment_amount` while awaiting payment; new `compute_confirm` action
+  and CLI `compute-confirm` / `compute-result` subcommands.

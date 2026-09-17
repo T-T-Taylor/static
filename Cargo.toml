@@ -38,3 +38,4 @@ zeroize = { version = "1.7", features = ["derive"] }
 pqc_kyber = "0.7"
 async-trait = "0.1"
 wasmtime = { version = "26", default-features = false, features = ["cranelift", "runtime", "wat"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

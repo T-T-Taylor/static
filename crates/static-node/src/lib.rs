@@ -21,6 +21,9 @@ pub mod api;
 /// WASM compute execution (sandboxed module runtime)
 pub mod compute;
 
+/// Cryptocurrency payment support for compute (prepayment, blockchain watching)
+pub mod payment;
+
 /// Async node runner
 pub mod runner;
 
@@ -155,8 +158,9 @@ fn default_backup_config() -> BackupConfig {
 /// Configuration for compute offering (sandboxed WASM execution)
 ///
 /// A compute provider executes WASM modules for peers through the mixnet
-/// and earns storage credit at a higher rate than storage barter.
-/// Disabled by default; enable with `--compute-enabled`.
+/// and is paid in cryptocurrency prepayment (see [`payment`]). Disabled by
+/// default; enable with `--compute-enabled`. All-zero [`payment::ComputePricing`]
+/// (the default) offers free compute with no payment round-trip.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ComputeConfig {
     /// Whether this node accepts compute requests
@@ -167,9 +171,12 @@ pub struct ComputeConfig {
     pub max_cpu_ms: u64,
     /// Maximum memory per execution in megabytes
     pub max_memory_mb: u32,
-    /// Compute fee multiplier: 1 byte of compute earns N bytes of
-    /// storage credit
-    pub fee_multiplier: u64,
+    /// Provider's compute pricing (all-zero = free tier)
+    #[serde(default)]
+    pub pricing: crate::payment::ComputePricing,
+    /// Blockchain configuration for payment watching
+    #[serde(default)]
+    pub blockchain_config: crate::payment::BlockchainConfig,
 }
 
 impl Default for ComputeConfig {
@@ -179,7 +186,8 @@ impl Default for ComputeConfig {
             capacity: 4,
             max_cpu_ms: 5000,
             max_memory_mb: 64,
-            fee_multiplier: 10,
+            pricing: crate::payment::ComputePricing::default(),
+            blockchain_config: crate::payment::BlockchainConfig::default(),
         }
     }
 }

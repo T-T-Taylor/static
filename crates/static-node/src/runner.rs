@@ -14,6 +14,7 @@
 use rand::RngCore;
 use crate::{NodeConfig, NodeMode, NodeStatus, BackupConfig};
 use crate::compute::{build_request_packets, build_response_packets, execute_wasm, ComputeError};
+use crate::payment::{BlockchainWatcher, Currency};
 use static_accounting::{AccountingState, PeerCredit, current_timestamp};
 use static_crypto::SymmetricKey;
 use static_mesh::fragment::{deserialize_fragment, Reassembler};
@@ -28,7 +29,11 @@ use static_mesh::wire::{
 use static_sphinx::{MixNode, NodeId, Route, RouteHop};
 use static_storage::{
     EncryptedChunk, ChunkId, ContentId, ContentManifest,
-    compute::{ComputeRequest, ComputeResponse, ReturnRoute, MAX_COMPUTE_INPUT_SIZE},
+    compute::{
+        ComputeRequest, ComputeResponse, PaymentConfirmation, PaymentRequest, ReturnRoute,
+        MAX_COMPUTE_INPUT_SIZE, deserialize_payment_confirmation, deserialize_payment_request,
+        serialize_payment_confirmation, serialize_payment_request,
+    },
     repair::RepairState,
     heartbeat::LeaseManager,
     retrieval::{ChunkHolder, ContentRetriever},
@@ -76,8 +81,8 @@ pub struct BackupState {
     pub any_active: bool,
 }
 
-/// Minimum compute fee accepted by providers (bytes of storage credit)
-pub const MIN_COMPUTE_FEE: u64 = 1024;
+/// How often the provider payment-watch loop polls the blockchain (seconds)
+pub const PAYMENT_WATCH_INTERVAL_SECS: u64 = 15;
 
 /// Maximum stored compute results before the oldest are dropped
 ///
@@ -91,6 +96,7 @@ impl std::fmt::Debug for ComputeState {
             .field("active_executions", &self.active_executions.len())
             .field("cached_modules", &self.cached_modules.len())
             .field("pending_requests", &self.pending_requests.len())
+            .field("payment_pending", &self.payment_pending.len())
             .field("completed_results", &self.completed_results.len())
             .field(
                 "reassembler",
@@ -99,8 +105,6 @@ impl std::fmt::Debug for ComputeState {
                     self.reassembler.total_expected(),
                 ),
             )
-            .field("compute_bytes_served", &self.compute_bytes_served)
-            .field("compute_bytes_received", &self.compute_bytes_received)
             .field("successful_executions", &self.successful_executions)
             .field("failed_executions", &self.failed_executions)
             .finish()
@@ -119,8 +123,6 @@ pub struct ComputeExecution {
     pub module_content_id: ContentId,
     /// The input data
     pub input_data: Vec<u8>,
-    /// The fee offered
-    pub fee_offer: u64,
     /// When the execution was accepted
     pub started_at: u64,
 }
@@ -130,21 +132,39 @@ pub struct ComputeExecution {
 pub struct PendingComputeRequest {
     /// The request ID
     pub request_id: [u8; 32],
-    /// The provider node the request was routed to (for fee accounting)
+    /// The provider node the request was routed to
     pub provider: NodeId,
-    /// The fee offered
-    pub fee_offer: u64,
+    /// The provider's payment quote (set when a `PaymentRequest` arrives)
+    pub payment: Option<PaymentRequest>,
     /// When the request was submitted
     pub started_at: u64,
 }
 
+/// A paid compute request staged on the provider until payment confirms
+///
+/// Capacity counts staged and executing requests together, so unpaid
+/// quotes cannot be used to overrun the execution budget.
+#[derive(Debug, Clone)]
+pub struct PendingPayment {
+    /// The request ID
+    pub request_id: [u8; 32],
+    /// The original request, replayed once payment confirms
+    pub request: ComputeRequest,
+    /// The payment quote sent to the requester
+    pub payment: PaymentRequest,
+    /// When the payment request was sent
+    pub sent_at: u64,
+    /// Transaction hash claimed by the requester (verified on-chain)
+    pub claimed_tx_hash: Option<String>,
+}
+
 /// Overall compute state for the node
 ///
-/// Serves both protocol roles: `active_executions`/`cached_modules`
-/// track the provider side, `pending_requests`/`completed_results`
-/// track the requester side. `reassembler` reassembles inbound compute
-/// fragments (one reassembly in flight at a time; concurrent exchanges
-/// serialize on it).
+/// Serves both protocol roles: `active_executions`/`cached_modules`/
+/// `payment_pending` track the provider side, `pending_requests`/
+/// `completed_results` track the requester side. `reassembler`
+/// reassembles inbound compute fragments (one reassembly in flight at a
+/// time; concurrent exchanges serialize on it).
 #[derive(Default)]
 pub struct ComputeState {
     /// Active executions (request_id -> execution)
@@ -153,14 +173,12 @@ pub struct ComputeState {
     pub cached_modules: HashMap<ContentId, Vec<u8>>,
     /// Requests we issued and are awaiting responses for
     pub pending_requests: HashMap<[u8; 32], PendingComputeRequest>,
+    /// Paid requests staged until cryptocurrency payment confirms
+    pub payment_pending: HashMap<[u8; 32], PendingPayment>,
     /// Completed responses available for polling via the local API
     pub completed_results: HashMap<[u8; 32], ComputeResponse>,
-    /// Reassembler for inbound compute request/response fragments
+    /// Reassembler for inbound compute/payment fragments
     pub reassembler: Reassembler,
-    /// Total compute output bytes served (provider)
-    pub compute_bytes_served: u64,
-    /// Total compute output bytes received (requester)
-    pub compute_bytes_received: u64,
     /// Number of successful executions (provider)
     pub successful_executions: u64,
     /// Number of failed executions (provider)
@@ -195,8 +213,13 @@ pub struct NodeRunner {
     pub inbound_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<InboundMessage>>>,
     /// Backup state for tracking primary health and activation
     pub backup_state: Arc<Mutex<BackupState>>,
-    /// Compute state for tracking executions and fees
+    /// Compute state for tracking executions and payments
     pub compute_state: Arc<Mutex<ComputeState>>,
+    /// Blockchain watchers for payment verification (currency byte -> watcher)
+    ///
+    /// Built from the accepted currencies in [`NodeConfig::compute_config`].
+    /// Immutable after construction; tests may replace entries with mocks.
+    pub payment_watchers: HashMap<u8, Arc<dyn BlockchainWatcher>>,
     /// Node configuration
     pub config: NodeConfig,
 }
@@ -245,6 +268,15 @@ impl NodeRunner {
             transport.compute_capacity = config.compute_config.capacity.min(u8::MAX as u32) as u8;
         }
 
+        // Build blockchain watchers for the currencies this provider accepts.
+        let mut payment_watchers: HashMap<u8, Arc<dyn BlockchainWatcher>> = HashMap::new();
+        for currency in &config.compute_config.pricing.accepted_currencies {
+            payment_watchers.insert(
+                currency.to_byte(),
+                crate::payment::create_watcher(*currency, &config.compute_config.blockchain_config),
+            );
+        }
+
         Self {
             transport,
             leases: Arc::new(Mutex::new(LeaseManager::new())),
@@ -258,6 +290,7 @@ impl NodeRunner {
             rotation_state: Arc::new(Mutex::new(RotationState::new())),
             backup_state: Arc::new(Mutex::new(BackupState::default())),
             compute_state: Arc::new(Mutex::new(ComputeState::default())),
+            payment_watchers,
             inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
             config,
         }
@@ -496,6 +529,15 @@ impl NodeRunner {
             });
         }
 
+        // Start payment watch loop (provider side: confirms timed-out and
+        // paid compute requests; no-op for free-tier-only providers).
+        if self.config.compute_config.enabled {
+            let runner_for_payments = self.clone();
+            tokio::spawn(async move {
+                payment_watch_loop(runner_for_payments).await;
+            });
+        }
+
         // Start local API server
         let api_addr = self.config.api_addr.clone();
         let runner_ref = self.clone();
@@ -579,13 +621,13 @@ impl NodeRunner {
         Ok(())
     }
 
-    /// Reassemble a compute fragment and dispatch by message type byte
+    /// Reassemble a compute/payment fragment and dispatch by message type
     ///
     /// Inbound Sphinx bodies that are not chunk requests arrive here.
     /// Bodies that do not parse as fragments are ignored; reassembled
-    /// payloads whose type byte is not a compute message are discarded
-    /// (this keeps stray traffic — e.g. chunk responses — out of the
-    /// compute path).
+    /// payloads whose type byte is not a compute/payment message are
+    /// discarded (this keeps stray traffic — e.g. chunk responses — out
+    /// of the compute path).
     async fn handle_compute_fragment(self: &Arc<Self>, body: &[u8]) {
         let fragment = match deserialize_fragment(body) {
             Ok(fragment) => fragment,
@@ -629,55 +671,63 @@ impl NodeRunner {
                     Err(_) => debug!("Dropping malformed compute response"),
                 }
             }
+            Some(m) if m == static_storage::compute::MSG_PAYMENT_REQUEST => {
+                match deserialize_payment_request(&payload) {
+                    Ok(quote) => self.handle_payment_request(quote).await,
+                    Err(_) => debug!("Dropping malformed payment request"),
+                }
+            }
+            Some(m) if m == static_storage::compute::MSG_PAYMENT_CONFIRMATION => {
+                match deserialize_payment_confirmation(&payload) {
+                    Ok(confirmation) => self.handle_payment_confirmation(confirmation).await,
+                    Err(_) => debug!("Dropping malformed payment confirmation"),
+                }
+            }
             _ => debug!("Discarding non-compute payload after reassembly"),
         }
     }
 
     /// Handle a compute request (provider role)
     ///
-    /// Gates on compute-enabled, capacity, and fee; rejections get an
-    /// anonymous error response over the request's return route.
+    /// Free-tier providers (all-zero pricing) execute immediately. Paid
+    /// providers stage the request and quote a cryptocurrency payment;
+    /// execution is triggered by [`run_payment_watch_tick`] once the
+    /// payment confirms on-chain. Rejections get an anonymous error
+    /// response over the request's return route.
     async fn handle_compute_request(self: &Arc<Self>, request: ComputeRequest) {
         if !self.transport.compute_enabled {
             debug!("Ignoring compute request (compute disabled)");
             return;
         }
 
-        if let Err(err) = self.accept_compute_request(&request).await {
-            debug!("Rejecting compute request {:02x?}: {}", request.request_id, err);
-            let response = ComputeResponse {
-                request_id: request.request_id,
-                output_data: vec![],
-                success: false,
-                error: Some(err.to_string()),
-                cpu_time_ms: 0,
-                memory_used: 0,
-                fee_charged: 0,
-            };
-            if let Err(e) = self.send_compute_response(response, &request.return_route).await {
-                warn!("Failed to send compute rejection: {}", e);
+        if self.config.compute_config.pricing.is_free() {
+            if let Err(err) = self.accept_compute_request(&request).await {
+                debug!("Rejecting compute request {:02x?}: {}", request.request_id, err);
+                self.send_compute_error(&request, &err, false, None).await;
+                return;
             }
+
+            debug!("Accepted free-tier compute request {:02x?}", request.request_id);
+            let runner = self.clone();
+            tokio::spawn(async move {
+                runner.run_compute_execution(request).await;
+            });
             return;
         }
 
-        debug!(
-            "Accepted compute request {:02x?} (fee offer {})",
-            request.request_id, request.fee_offer
-        );
-
-        // Execute off the inbound loop; the provider's identity is not
-        // revealed to the requester beyond the mixnet's guarantees.
+        // Paid tier: stage the request off the inbound loop and quote a
+        // payment with a fresh receive address.
         let runner = self.clone();
         tokio::spawn(async move {
-            runner.run_compute_execution(request).await;
+            runner.initiate_paid_execution(request).await;
         });
     }
 
     /// Gate a compute request and register it as an active execution
     ///
-    /// Checks capacity and fee, then records the execution. Duplicate
-    /// request IDs are accepted idempotently (the first registration
-    /// wins) so retried fragments cannot double-book an execution.
+    /// Checks capacity, then records the execution. Duplicate request IDs
+    /// are accepted idempotently (the first registration wins) so retried
+    /// fragments cannot double-book an execution.
     async fn accept_compute_request(
         &self,
         request: &ComputeRequest,
@@ -690,9 +740,6 @@ impl NodeRunner {
         if state.active_executions.len() >= usize::from(self.transport.compute_capacity) {
             return Err(ComputeError::CapacityExceeded);
         }
-        if request.fee_offer < MIN_COMPUTE_FEE {
-            return Err(ComputeError::FeeInsufficient);
-        }
 
         state.active_executions.insert(
             request.request_id,
@@ -701,11 +748,141 @@ impl NodeRunner {
                 from_node: request.from_node,
                 module_content_id: request.module_content_id,
                 input_data: request.input_data.clone(),
-                fee_offer: request.fee_offer,
                 started_at: current_timestamp(),
             },
         );
         Ok(())
+    }
+
+    /// Stage a paid compute request and send the requester a payment quote
+    ///
+    /// Reserves a capacity slot (staged and executing requests count
+    /// together), generates a fresh receive address via the currency's
+    /// [`BlockchainWatcher`], and sends a [`PaymentRequest`] over the
+    /// request's return route. If the quote cannot be delivered the slot
+    /// is kept for retry and reclaimed by the payment timeout.
+    async fn initiate_paid_execution(self: Arc<Self>, request: ComputeRequest) {
+        let watcher = match Currency::from_byte(request.currency) {
+            Some(currency) if self.config.compute_config.pricing.accepts(currency) => {
+                self.payment_watchers.get(&currency.to_byte()).cloned()
+            }
+            _ => None,
+        };
+        let Some(watcher) = watcher else {
+            let err = ComputeError::Payment(format!(
+                "unsupported payment currency byte {}",
+                request.currency
+            ));
+            debug!("Rejecting compute request {:02x?}: {}", request.request_id, err);
+            self.send_compute_error(&request, &err, false, None).await;
+            return;
+        };
+
+        // Reserve the slot before the async address generation so retried
+        // fragments cannot double-book; only the first reservation quotes.
+        match self.reserve_payment_slot(&request).await {
+            Err(err) => {
+                debug!("Rejecting compute request {:02x?}: {}", request.request_id, err);
+                self.send_compute_error(&request, &err, false, None).await;
+                return;
+            }
+            Ok(false) => return, // duplicate fragment; the first quote wins
+            Ok(true) => {}
+        }
+
+        let address = match watcher.generate_address().await {
+            Ok(address) => address,
+            Err(e) => {
+                warn!(
+                    "Address generation failed for compute request {:02x?}: {}",
+                    request.request_id, e
+                );
+                self.compute_state
+                    .lock()
+                    .await
+                    .payment_pending
+                    .remove(&request.request_id);
+                let err = ComputeError::Payment(e.to_string());
+                self.send_compute_error(&request, &err, false, None).await;
+                return;
+            }
+        };
+
+        let payment = PaymentRequest {
+            request_id: request.request_id,
+            currency: watcher.currency(),
+            amount: self.config.compute_config.pricing.amount_due(
+                self.config.compute_config.max_cpu_ms,
+                u64::from(self.config.compute_config.max_memory_mb),
+            ),
+            address,
+            required_confirmations: self.config.compute_config.pricing.required_confirmations,
+        };
+
+        {
+            let mut state = self.compute_state.lock().await;
+            match state.payment_pending.get_mut(&request.request_id) {
+                Some(entry) => {
+                    entry.payment = payment.clone();
+                    entry.sent_at = current_timestamp();
+                }
+                // The slot vanished (only the payment tick removes entries);
+                // drop silently rather than resurrect it.
+                None => return,
+            }
+        }
+
+        if let Err(e) = self.send_payment_request(&payment, &request.return_route).await {
+            warn!(
+                "Failed to deliver payment quote for {:02x?}: {} (kept for timeout)",
+                request.request_id, e
+            );
+        } else {
+            info!(
+                "Quoted {} {} for compute request {:02x?} (address {})",
+                payment.amount,
+                payment.currency.as_str(),
+                request.request_id,
+                payment.address
+            );
+        }
+    }
+
+    /// Reserve a payment slot (dedupe + capacity check with a placeholder
+    /// quote). Returns `Ok(true)` for a fresh reservation, `Ok(false)` for
+    /// an already-tracked request.
+    async fn reserve_payment_slot(
+        &self,
+        request: &ComputeRequest,
+    ) -> Result<bool, ComputeError> {
+        let mut state = self.compute_state.lock().await;
+        if state.active_executions.contains_key(&request.request_id)
+            || state.payment_pending.contains_key(&request.request_id)
+        {
+            return Ok(false);
+        }
+        if state.active_executions.len() + state.payment_pending.len()
+            >= usize::from(self.transport.compute_capacity)
+        {
+            return Err(ComputeError::CapacityExceeded);
+        }
+        state.payment_pending.insert(
+            request.request_id,
+            PendingPayment {
+                request_id: request.request_id,
+                request: request.clone(),
+                payment: PaymentRequest {
+                    request_id: request.request_id,
+                    currency: Currency::Monero, // placeholder until quoted
+                    amount: 0,
+                    address: String::new(),
+                    required_confirmations: 0,
+                },
+                sent_at: current_timestamp(),
+                claimed_tx_hash: None,
+            },
+        );
+        Ok(true)
     }
 
     /// Fetch a WASM module from cache or the network (provider role)
@@ -750,7 +927,6 @@ impl NodeRunner {
             .insert(request.module_content_id, module_bytes.clone());
 
         let compute_config = self.config.compute_config.clone();
-        let input_len = request.input_data.len();
         let input_data = request.input_data.clone();
         let exec = tokio::task::spawn_blocking(move || {
             execute_wasm(
@@ -765,20 +941,12 @@ impl NodeRunner {
         match exec {
             Ok(Ok((output_data, cpu_time_ms, memory_used))) => {
                 let output_len = output_data.len();
-                let fee = ((input_len as u64 + output_len as u64)
-                    * self.config.compute_config.fee_multiplier)
-                    .min(request.fee_offer);
 
                 {
                     let mut state = self.compute_state.lock().await;
                     state.active_executions.remove(&request.request_id);
                     state.successful_executions += 1;
-                    state.compute_bytes_served += output_len as u64;
                 }
-                self.accounting
-                    .lock()
-                    .await
-                    .record_served(request.from_node, fee);
 
                 debug!(
                     "Compute execution {:02x?} succeeded: {} bytes output, {} ms",
@@ -792,7 +960,8 @@ impl NodeRunner {
                     error: None,
                     cpu_time_ms,
                     memory_used,
-                    fee_charged: fee,
+                    payment_required: false,
+                    payment_request: vec![],
                 };
                 if let Err(e) = self.send_compute_response(response, &request.return_route).await {
                     warn!("Failed to send compute response: {}", e);
@@ -834,10 +1003,40 @@ impl NodeRunner {
             error: Some(error.to_string()),
             cpu_time_ms: 0,
             memory_used: 0,
-            fee_charged: 0,
+            payment_required: false,
+            payment_request: vec![],
         };
         if let Err(e) = self.send_compute_response(response, &request.return_route).await {
             warn!("Failed to send compute error response: {}", e);
+        }
+    }
+
+    /// Send an error `ComputeResponse` for a request
+    ///
+    /// Used for pre-execution rejections. When `payment_required` is set,
+    /// `quote` is embedded so the requester can still see what to pay.
+    async fn send_compute_error(
+        &self,
+        request: &ComputeRequest,
+        error: &ComputeError,
+        payment_required: bool,
+        quote: Option<&PaymentRequest>,
+    ) {
+        let response = ComputeResponse {
+            request_id: request.request_id,
+            output_data: vec![],
+            success: false,
+            error: Some(error.to_string()),
+            cpu_time_ms: 0,
+            memory_used: 0,
+            payment_required,
+            payment_request: match quote {
+                Some(q) => serialize_payment_request(q).unwrap_or_default(),
+                None => vec![],
+            },
+        };
+        if let Err(e) = self.send_compute_response(response, &request.return_route).await {
+            warn!("Failed to send compute rejection: {}", e);
         }
     }
 
@@ -847,7 +1046,29 @@ impl NodeRunner {
         response: ComputeResponse,
         return_route: &ReturnRoute,
     ) -> anyhow::Result<()> {
-        let packets = build_response_packets(&response, return_route)?;
+        let packets = build_response_packets(&response, return_route)
+            .map_err(|e| anyhow::anyhow!("response packet build failed: {}", e))?;
+        self.send_packets(packets, return_route).await
+    }
+
+    /// Send a payment quote over the request's return route
+    async fn send_payment_request(
+        &self,
+        quote: &PaymentRequest,
+        return_route: &ReturnRoute,
+    ) -> anyhow::Result<()> {
+        let payload = serialize_payment_request(quote)?;
+        let route = return_route.to_sphinx_route();
+        let packets = build_fragment_packets(&payload, &route)?;
+        self.send_packets(packets, return_route).await
+    }
+
+    /// Send pre-built Sphinx packets to a return route's first hop
+    async fn send_packets(
+        &self,
+        packets: Vec<static_sphinx::SphinxPacket>,
+        return_route: &ReturnRoute,
+    ) -> anyhow::Result<()> {
         let first_hop = return_route
             .hops
             .first()
@@ -860,34 +1081,28 @@ impl NodeRunner {
                 let _ = sender.send(WireMessage::Sphinx(packet)).await;
             }
         } else {
-            anyhow::bail!("no connection to compute return route first hop");
+            anyhow::bail!("no connection to return route first hop");
         }
         Ok(())
     }
 
     /// Handle a compute response (requester role)
     ///
-    /// Records the result for API polling and books the charged fee
-    /// against the provider the request was routed to.
+    /// Records the result for API polling.
     async fn handle_compute_response(&self, response: ComputeResponse) {
-        let provider = {
+        {
             let mut state = self.compute_state.lock().await;
-            let Some(pending) = state.pending_requests.remove(&response.request_id) else {
+            if state
+                .pending_requests
+                .remove(&response.request_id)
+                .is_none()
+            {
                 debug!(
                     "Ignoring compute response for unknown request {:02x?}",
                     response.request_id
                 );
                 return;
-            };
-            state.compute_bytes_received += response.output_data.len() as u64;
-            pending.provider
-        };
-
-        if response.fee_charged > 0 {
-            self.accounting
-                .lock()
-                .await
-                .record_received(provider, response.fee_charged);
+            }
         }
 
         if response.success {
@@ -911,15 +1126,69 @@ impl NodeRunner {
         state.completed_results.insert(response.request_id, response);
     }
 
+    /// Handle a payment quote from a provider (requester role)
+    ///
+    /// Attaches the quote to the matching pending request so the local
+    /// API can surface the payment address and amount.
+    async fn handle_payment_request(&self, quote: PaymentRequest) {
+        let mut state = self.compute_state.lock().await;
+        match state.pending_requests.get_mut(&quote.request_id) {
+            Some(pending) => {
+                info!(
+                    "Payment quote for compute request {:02x?}: {} {} to {}",
+                    quote.request_id,
+                    quote.amount,
+                    quote.currency.as_str(),
+                    quote.address
+                );
+                pending.payment = Some(quote);
+            }
+            None => debug!(
+                "Ignoring payment request for unknown compute request {:02x?}",
+                quote.request_id
+            ),
+        }
+    }
+
+    /// Handle a payment confirmation from a requester (provider role)
+    ///
+    /// Records the claimed transaction hash; [`run_payment_watch_tick`]
+    /// verifies the payment on-chain (the claim is only a hint).
+    async fn handle_payment_confirmation(&self, confirmation: PaymentConfirmation) {
+        let mut state = self.compute_state.lock().await;
+        match state.payment_pending.get_mut(&confirmation.request_id) {
+            Some(entry) => {
+                if entry.payment.currency != confirmation.currency {
+                    debug!(
+                        "Payment confirmation currency mismatch for compute request {:02x?}",
+                        confirmation.request_id
+                    );
+                    return;
+                }
+                debug!(
+                    "Payment claimed for compute request {:02x?} (tx {})",
+                    confirmation.request_id, confirmation.tx_hash
+                );
+                entry.claimed_tx_hash = Some(confirmation.tx_hash);
+            }
+            None => debug!(
+                "Ignoring payment confirmation for unknown compute request {:02x?}",
+                confirmation.request_id
+            ),
+        }
+    }
+
     /// Submit a compute request to the most capable compute peer
     ///
-    /// Returns the request ID used to poll for the result via
-    /// [`NodeRunner::compute_result`].
+    /// `currency` selects the cryptocurrency the requester intends to pay
+    /// in (ignored by free-tier providers). Returns the request ID used to
+    /// poll for the quote via [`NodeRunner::pending_payment`] and for the
+    /// result via [`NodeRunner::compute_result`].
     pub async fn submit_compute_request(
         &self,
         module_content_pub_key: &[u8; 32],
         input_data: Vec<u8>,
-        fee_offer: u64,
+        currency: Currency,
     ) -> anyhow::Result<[u8; 32]> {
         if input_data.len() > MAX_COMPUTE_INPUT_SIZE {
             anyhow::bail!(
@@ -927,9 +1196,6 @@ impl NodeRunner {
                 input_data.len(),
                 MAX_COMPUTE_INPUT_SIZE
             );
-        }
-        if fee_offer < MIN_COMPUTE_FEE {
-            anyhow::bail!("fee too low: {} (min {})", fee_offer, MIN_COMPUTE_FEE);
         }
 
         let routing_table = self.transport.routing_table.read().await;
@@ -964,7 +1230,8 @@ impl NodeRunner {
             from_node: our_node_id,
             module_content_id,
             module_content_pub_key: *module_content_pub_key,
-            fee_offer,
+            currency: currency.to_byte(),
+            payment_address: vec![], // the provider quotes a fresh address
             request_id,
             return_route,
             input_data,
@@ -984,7 +1251,7 @@ impl NodeRunner {
             PendingComputeRequest {
                 request_id,
                 provider: peer.node_id,
-                fee_offer,
+                payment: None,
                 started_at: current_timestamp(),
             },
         );
@@ -1000,6 +1267,75 @@ impl NodeRunner {
             request_id, peer.node_id
         );
         Ok(request_id)
+    }
+
+    /// Poll the payment quote for a submitted compute request
+    ///
+    /// Returns `None` until the provider's `PaymentRequest` arrives.
+    pub async fn pending_payment(&self, request_id: &[u8; 32]) -> Option<PaymentRequest> {
+        self.compute_state
+            .lock()
+            .await
+            .pending_requests
+            .get(request_id)
+            .and_then(|pending| pending.payment.clone())
+    }
+
+    /// Send a payment confirmation to the compute provider (requester role)
+    ///
+    /// Called from the local API after the user has sent the on-chain
+    /// payment from their own wallet. The confirmation travels as a fresh
+    /// 1-hop Sphinx message to the provider node the request was routed
+    /// to (same MVP pattern as chunk retrieval).
+    pub async fn confirm_compute_payment(
+        &self,
+        request_id: &[u8; 32],
+        tx_hash: String,
+    ) -> anyhow::Result<()> {
+        let (provider, currency) = {
+            let state = self.compute_state.lock().await;
+            let pending = state
+                .pending_requests
+                .get(request_id)
+                .ok_or_else(|| anyhow::anyhow!("unknown compute request"))?;
+            let quote = pending
+                .payment
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("no payment quote received yet"))?;
+            (pending.provider, quote.currency)
+        };
+
+        let confirmation = PaymentConfirmation {
+            request_id: *request_id,
+            tx_hash,
+            currency,
+        };
+        let payload = serialize_payment_confirmation(&confirmation)?;
+        let forward_route = Route {
+            hops: vec![RouteHop {
+                public_key: self.provider_mix_key(provider).await,
+                node_id: provider,
+            }],
+            destination: provider,
+        };
+        let packets = build_fragment_packets(&payload, &forward_route)?;
+        for packet in packets {
+            send_sphinx(&self.transport, provider, packet).await?;
+        }
+
+        info!("Sent payment confirmation for compute request {:02x?}", request_id);
+        Ok(())
+    }
+
+    /// Look up a peer's mix public key from the routing table
+    async fn provider_mix_key(&self, provider: NodeId) -> [u8; 32] {
+        let routing_table = self.transport.routing_table.read().await;
+        routing_table
+            .nodes
+            .values()
+            .find(|n| n.node_id == provider)
+            .map(|n| n.public_key)
+            .unwrap_or([0u8; 32])
     }
 
     /// Poll a submitted compute request for its completed result
@@ -1699,6 +2035,146 @@ impl NodeRunner {
             }
             drop(r);
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+}
+
+/// Fragment a payload into Sphinx packets for the given route
+fn build_fragment_packets(
+    payload: &[u8],
+    route: &static_sphinx::Route,
+) -> Result<Vec<static_sphinx::SphinxPacket>, ComputeError> {
+    let mut packets = Vec::new();
+    for fragment in static_mesh::fragment::fragment_payload(payload) {
+        let body = static_mesh::fragment::serialize_fragment(&fragment);
+        let packet = static_sphinx::create_packet(route, &body)
+            .map_err(|_| ComputeError::SphinxError)?;
+        packets.push(packet);
+    }
+    Ok(packets)
+}
+
+/// Background loop polling the blockchain for pending compute payments
+async fn payment_watch_loop(runner: Arc<NodeRunner>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+        PAYMENT_WATCH_INTERVAL_SECS.max(1),
+    ));
+    loop {
+        interval.tick().await;
+        run_payment_watch_tick(&runner).await;
+    }
+}
+
+/// Run one payment-watch sweep (provider side)
+///
+/// 1. Times out staged requests past `payment_timeout_secs`, sending a
+///    courtesy error response that carries the original quote.
+/// 2. Asks each staged request's blockchain watcher for confirmations; a
+///    fully confirmed payment moves the staged request into execution.
+///
+/// No two guards are ever held at once: state snapshots are cloned under
+/// short locks and watchers are awaited guard-free.
+pub(crate) async fn run_payment_watch_tick(runner: &Arc<NodeRunner>) {
+    let now = current_timestamp();
+    let timeout_secs = runner
+        .config
+        .compute_config
+        .blockchain_config
+        .payment_timeout_secs;
+
+    // 1. Timeout sweep
+    let expired: Vec<[u8; 32]> = {
+        let state = runner.compute_state.lock().await;
+        state
+            .payment_pending
+            .iter()
+            .filter(|(_, entry)| now.saturating_sub(entry.sent_at) > timeout_secs)
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    for request_id in expired {
+        let entry = runner
+            .compute_state
+            .lock()
+            .await
+            .payment_pending
+            .remove(&request_id);
+        if let Some(entry) = entry {
+            warn!("Compute request {:02x?} payment timed out", request_id);
+            let err = ComputeError::Payment("payment timeout".to_string());
+            runner
+                .send_compute_error(&entry.request, &err, true, Some(&entry.payment))
+                .await;
+        }
+    }
+
+    // 2. Confirmation sweep
+    let staged: Vec<PendingPayment> = {
+        let state = runner.compute_state.lock().await;
+        state.payment_pending.values().cloned().collect()
+    };
+    for entry in staged {
+        let Some(watcher) = runner.payment_watchers.get(&entry.payment.currency.to_byte())
+        else {
+            continue;
+        };
+        let confirmations = watcher
+            .check_payment(
+                &entry.payment.address,
+                entry.payment.amount,
+                entry.claimed_tx_hash.as_deref(),
+            )
+            .await;
+
+        match confirmations {
+            Ok(Some(confirmations))
+                if confirmations >= entry.payment.required_confirmations =>
+            {
+                let staged = runner
+                    .compute_state
+                    .lock()
+                    .await
+                    .payment_pending
+                    .remove(&entry.request_id);
+                let Some(staged) = staged else { continue };
+
+                // Re-check capacity before moving into execution; if the
+                // node filled up while payment was in flight, the request
+                // goes back to staged and the next tick retries.
+                {
+                    let mut state = runner.compute_state.lock().await;
+                    if state.active_executions.len()
+                        >= usize::from(runner.transport.compute_capacity)
+                    {
+                        state.payment_pending.insert(staged.request_id, staged);
+                        continue;
+                    }
+                    state.active_executions.insert(
+                        staged.request_id,
+                        ComputeExecution {
+                            request_id: staged.request_id,
+                            from_node: staged.request.from_node,
+                            module_content_id: staged.request.module_content_id,
+                            input_data: staged.request.input_data.clone(),
+                            started_at: current_timestamp(),
+                        },
+                    );
+                }
+
+                info!(
+                    "Payment for compute request {:02x?} confirmed ({} confirmations); executing",
+                    staged.request_id, confirmations
+                );
+                let runner_clone = runner.clone();
+                tokio::spawn(async move {
+                    runner_clone.run_compute_execution(staged.request).await;
+                });
+            }
+            Ok(_) => {}
+            Err(e) => debug!(
+                "Payment check for compute request {:02x?} failed: {}",
+                entry.request_id, e
+            ),
         }
     }
 }
@@ -2429,12 +2905,13 @@ mod tests {
         );
     }
 
-    fn test_compute_request(request_id: [u8; 32], fee_offer: u64) -> ComputeRequest {
+    fn test_compute_request(request_id: [u8; 32]) -> ComputeRequest {
         ComputeRequest {
             from_node: [0x11u8; 16],
             module_content_id: [0x22u8; 32],
             module_content_pub_key: [0x33u8; 32],
-            fee_offer,
+            currency: crate::payment::Currency::Monero.to_byte(),
+            payment_address: vec![], // empty in initial requests
             request_id,
             return_route: ReturnRoute {
                 hops: vec![],
@@ -2444,15 +2921,42 @@ mod tests {
         }
     }
 
+    /// Mock blockchain watcher: returns a fixed address and a settable
+    /// confirmation count.
+    struct MockWatcher {
+        confirmations: std::sync::Mutex<Option<u32>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BlockchainWatcher for MockWatcher {
+        async fn generate_address(&self) -> Result<String, crate::payment::PaymentError> {
+            Ok("mock-address-0123456789".to_string())
+        }
+
+        async fn check_payment(
+            &self,
+            _address: &str,
+            expected_amount: u64,
+            _tx_hash: Option<&str>,
+        ) -> Result<Option<u32>, crate::payment::PaymentError> {
+            // The watch tick must verify the quoted amount.
+            assert_eq!(expected_amount, 100);
+            Ok(*self.confirmations.lock().unwrap())
+        }
+
+        fn currency(&self) -> crate::payment::Currency {
+            crate::payment::Currency::Monero
+        }
+    }
+
     #[tokio::test]
     async fn test_compute_state_creation() {
         let state = ComputeState::default();
         assert!(state.active_executions.is_empty());
         assert!(state.cached_modules.is_empty());
         assert!(state.pending_requests.is_empty());
+        assert!(state.payment_pending.is_empty());
         assert!(state.completed_results.is_empty());
-        assert_eq!(state.compute_bytes_served, 0);
-        assert_eq!(state.compute_bytes_received, 0);
         assert_eq!(state.successful_executions, 0);
         assert_eq!(state.failed_executions, 0);
     }
@@ -2469,38 +2973,17 @@ mod tests {
 
         // First request is accepted and tracked.
         runner
-            .accept_compute_request(&test_compute_request([0xA1u8; 32], 5000))
+            .accept_compute_request(&test_compute_request([0xA1u8; 32]))
             .await
             .expect("first request should be accepted");
         assert_eq!(runner.compute_state.lock().await.active_executions.len(), 1);
 
         // Second concurrent request exceeds capacity and is rejected.
         let err = runner
-            .accept_compute_request(&test_compute_request([0xA2u8; 32], 5000))
+            .accept_compute_request(&test_compute_request([0xA2u8; 32]))
             .await
             .expect_err("second request should be rejected");
         assert!(matches!(err, ComputeError::CapacityExceeded));
-    }
-
-    #[tokio::test]
-    async fn test_compute_fee_check() {
-        let mut config = NodeConfig::default();
-        config.compute_config = crate::ComputeConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        let runner = Arc::new(NodeRunner::new(config, [0x42u8; 16], MixNode::new()));
-
-        let err = runner
-            .accept_compute_request(&test_compute_request([0xB1u8; 32], MIN_COMPUTE_FEE - 1))
-            .await
-            .expect_err("low-fee request should be rejected");
-        assert!(matches!(err, ComputeError::FeeInsufficient));
-
-        runner
-            .accept_compute_request(&test_compute_request([0xB2u8; 32], MIN_COMPUTE_FEE))
-            .await
-            .expect("minimum fee should be accepted");
     }
 
     #[tokio::test]
@@ -2512,7 +2995,7 @@ mod tests {
         };
         let runner = Arc::new(NodeRunner::new(config, [0x42u8; 16], MixNode::new()));
 
-        let request = test_compute_request([0xC1u8; 32], 5000);
+        let request = test_compute_request([0xC1u8; 32]);
         runner
             .accept_compute_request(&request)
             .await
@@ -2535,13 +3018,12 @@ mod tests {
         let runner = Arc::new(NodeRunner::new(NodeConfig::default(), [0x42u8; 16], MixNode::new()));
 
         let request_id = [0xD1u8; 32];
-        let provider = [0x99u8; 16];
         runner.compute_state.lock().await.pending_requests.insert(
             request_id,
             PendingComputeRequest {
                 request_id,
-                provider,
-                fee_offer: 10_000,
+                provider: [0x99u8; 16],
+                payment: None,
                 started_at: current_timestamp(),
             },
         );
@@ -2553,21 +3035,17 @@ mod tests {
             error: None,
             cpu_time_ms: 10,
             memory_used: 4096,
-            fee_charged: 3_000,
+            payment_required: false,
+            payment_request: vec![],
         };
         runner.handle_compute_response(response).await;
 
+        // Result stored for polling; no barter credits are booked anymore.
         let state = runner.compute_state.lock().await;
         assert!(state.pending_requests.is_empty());
-        assert_eq!(state.compute_bytes_received, 3);
         let stored = state.completed_results.get(&request_id).expect("result stored");
-        assert_eq!(stored.fee_charged, 3_000);
-        drop(state);
-
-        // Fee booked against the provider the request was routed to.
-        let accounting = runner.accounting.lock().await;
-        let credit = accounting.peers.get(&provider).expect("credit entry");
-        assert_eq!(credit.bytes_received, 3_000);
+        assert_eq!(stored.output_data, vec![1, 2, 3]);
+        assert!(runner.accounting.lock().await.peers.is_empty());
     }
 
     #[tokio::test]
@@ -2576,7 +3054,7 @@ mod tests {
         let runner = Arc::new(NodeRunner::new(NodeConfig::default(), [0x42u8; 16], MixNode::new()));
         assert!(!runner.transport.compute_enabled);
 
-        let payload = static_storage::compute::serialize_request(&test_compute_request([0xE1u8; 32], 5000))
+        let payload = static_storage::compute::serialize_request(&test_compute_request([0xE1u8; 32]))
             .unwrap();
         for fragment in static_mesh::fragment::fragment_payload(&payload) {
             let body = static_mesh::fragment::serialize_fragment(&fragment);
@@ -2585,5 +3063,187 @@ mod tests {
 
         // Disabled nodes neither track nor execute compute requests.
         assert!(runner.compute_state.lock().await.active_executions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_compute_request_no_fee_field() {
+        // Wire layout: [0x03][16][32][32][currency 1][addr_len 4][addr..]
+        // [request_id 32][hops 4][dest 16][input_len 4][input..]. The
+        // 8-byte fee_offer field is gone; the currency byte sits at
+        // offset 81 where the fee used to start.
+        let mut request = test_compute_request([0xE2u8; 32]);
+        request.input_data.clear();
+        let serialized = static_storage::compute::serialize_request(&request).unwrap();
+
+        assert_eq!(serialized[0], static_storage::compute::MSG_COMPUTE_REQUEST);
+        assert_eq!(serialized[81], crate::payment::Currency::Monero.to_byte());
+        assert_eq!(&serialized[82..86], &0u32.to_be_bytes());
+        // 1+16+32+32+1+4+0+32+4+16+4 = 142 bytes (the old layout was 150).
+        assert_eq!(serialized.len(), 142);
+
+        let back = static_storage::compute::deserialize_request(&serialized).unwrap();
+        assert_eq!(back, request);
+    }
+
+    #[tokio::test]
+    async fn test_compute_response_no_fee_field() {
+        let response = ComputeResponse {
+            request_id: [0xD2u8; 32],
+            output_data: vec![0xABu8; 8],
+            success: true,
+            error: None,
+            cpu_time_ms: 1,
+            memory_used: 2,
+            payment_required: false,
+            payment_request: vec![],
+        };
+        let serialized = static_storage::compute::serialize_response(&response).unwrap();
+
+        assert_eq!(serialized[0], static_storage::compute::MSG_COMPUTE_RESPONSE);
+        // 1+32+1+4+8+8+1+4+0+4+8 = 71 bytes (the old fee_charged layout
+        // was 78).
+        assert_eq!(serialized.len(), 71);
+
+        let back = static_storage::compute::deserialize_response(&serialized).unwrap();
+        assert_eq!(back, response);
+    }
+
+    #[tokio::test]
+    async fn test_payment_flow_integration() {
+        let mut config = NodeConfig::default();
+        config.compute_config = crate::ComputeConfig {
+            enabled: true,
+            pricing: crate::payment::ComputePricing {
+                price_per_execution: 100,
+                accepted_currencies: vec![crate::payment::Currency::Monero],
+                required_confirmations: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut runner = NodeRunner::new(config, [0x42u8; 16], MixNode::new());
+        let mock = Arc::new(MockWatcher {
+            confirmations: std::sync::Mutex::new(None),
+        });
+        runner
+            .payment_watchers
+            .insert(crate::payment::Currency::Monero.to_byte(), mock.clone());
+        let runner = Arc::new(runner);
+
+        // 1. A paid request arrives -> staged with a fresh-address quote.
+        let request = test_compute_request([0xF1u8; 32]);
+        let payload = static_storage::compute::serialize_request(&request).unwrap();
+        for fragment in static_mesh::fragment::fragment_payload(&payload) {
+            let body = static_mesh::fragment::serialize_fragment(&fragment);
+            runner.handle_compute_fragment(&body).await;
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let state = runner.compute_state.lock().await;
+            if let Some(entry) = state.payment_pending.get(&request.request_id) {
+                assert!(state.active_executions.is_empty());
+                assert_eq!(entry.payment.address, "mock-address-0123456789");
+                assert_eq!(entry.payment.amount, 100);
+                assert_eq!(entry.payment.currency, crate::payment::Currency::Monero);
+                assert_eq!(entry.payment.required_confirmations, 1);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "request was never staged"
+            );
+            drop(state);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // 2. The requester claims the payment with a tx hash.
+        runner
+            .handle_payment_confirmation(PaymentConfirmation {
+                request_id: request.request_id,
+                tx_hash: "cafebabe".to_string(),
+                currency: crate::payment::Currency::Monero,
+            })
+            .await;
+        assert_eq!(
+            runner
+                .compute_state
+                .lock()
+                .await
+                .payment_pending
+                .get(&request.request_id)
+                .unwrap()
+                .claimed_tx_hash
+                .as_deref(),
+            Some("cafebabe")
+        );
+
+        // 3. The payment confirms on-chain -> execution starts. It fails
+        //    fast (no peers to fetch the module from) and is counted.
+        *mock.confirmations.lock().unwrap() = Some(1);
+        run_payment_watch_tick(&runner).await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let state = runner.compute_state.lock().await;
+            if state.payment_pending.is_empty() && state.failed_executions >= 1 {
+                assert!(state.active_executions.is_empty());
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "execution did not finish in time"
+            );
+            drop(state);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_payment_timeout() {
+        let mut config = NodeConfig::default();
+        config.compute_config = crate::ComputeConfig {
+            enabled: true,
+            pricing: crate::payment::ComputePricing {
+                price_per_execution: 100,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut runner = NodeRunner::new(config, [0x42u8; 16], MixNode::new());
+        runner.payment_watchers.insert(
+            crate::payment::Currency::Monero.to_byte(),
+            Arc::new(MockWatcher {
+                confirmations: std::sync::Mutex::new(None),
+            }),
+        );
+        let runner = Arc::new(runner);
+
+        // Stage a request whose quote was sent 90 minutes ago (past the
+        // default 3600 s payment timeout).
+        let request = test_compute_request([0xF2u8; 32]);
+        runner.compute_state.lock().await.payment_pending.insert(
+            request.request_id,
+            PendingPayment {
+                request_id: request.request_id,
+                request: request.clone(),
+                payment: PaymentRequest {
+                    request_id: request.request_id,
+                    currency: crate::payment::Currency::Monero,
+                    amount: 100,
+                    address: "addr".to_string(),
+                    required_confirmations: 1,
+                },
+                sent_at: current_timestamp().saturating_sub(5400),
+                claimed_tx_hash: None,
+            },
+        );
+
+        // A payment that never arrived does not trigger execution.
+        run_payment_watch_tick(&runner).await;
+
+        let state = runner.compute_state.lock().await;
+        assert!(state.payment_pending.is_empty());
+        assert!(state.active_executions.is_empty());
     }
 }

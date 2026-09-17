@@ -109,6 +109,23 @@ struct Cli {
     #[arg(long, default_value_t = 4)]
     compute_capacity: u32,
 
+    /// Compute price per execution in atomic units (e.g. 0.001 XMR =
+    /// 1000000000 atomic). Default 0 = free compute (no payment required)
+    #[arg(long)]
+    compute_price: Option<u64>,
+
+    /// Accepted payment currencies, comma-separated (xmr, dark, nav)
+    #[arg(long, default_value = "xmr")]
+    compute_currencies: String,
+
+    /// Required blockchain confirmations before executing paid compute
+    #[arg(long, default_value_t = 1)]
+    compute_confirmations: u32,
+
+    /// Monero wallet RPC URL (monero-wallet-rpc, not monerod)
+    #[arg(long, default_value = "http://127.0.0.1:18082/json_rpc")]
+    monero_rpc: String,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -141,10 +158,25 @@ enum Commands {
         module_key: String,
         /// Hex-encoded input data for the module
         input: String,
-        /// Fee offer in bytes of storage credit
-        #[arg(long, default_value_t = 10240)]
-        fee: u64,
+        /// Payment currency (xmr, dark, or nav)
+        #[arg(long, default_value = "xmr")]
+        currency: String,
         /// Seconds to wait for the result before giving up (0 = submit only)
+        #[arg(long, default_value_t = 30)]
+        wait: u64,
+    },
+    /// Confirm an on-chain compute payment (after paying the quoted address)
+    ComputeConfirm {
+        /// Hex-encoded compute request ID from the compute command
+        request_id: String,
+        /// Transaction hash of the on-chain payment
+        tx_hash: String,
+    },
+    /// Poll the result of a previously submitted compute request
+    ComputeResult {
+        /// Hex-encoded compute request ID
+        request_id: String,
+        /// Seconds to keep polling (0 = single check)
         #[arg(long, default_value_t = 30)]
         wait: u64,
     },
@@ -153,20 +185,40 @@ enum Commands {
 #[derive(Serialize, Deserialize, Debug)]
 struct ApiRequest {
     action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     content_pub_key: Option<String>,
-    compute_fee: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compute_currency: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tx_hash: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ApiResponse {
     status: String,
     message: String,
+    #[serde(default)]
     content_id: Option<String>,
+    #[serde(default)]
     manifest: Option<static_storage::ContentManifest>,
+    #[serde(default)]
     data: Option<String>,
+    #[serde(default)]
     content_pub_key: Option<String>,
+    #[serde(default)]
     request_id: Option<String>,
+    #[serde(default)]
+    payment_required: bool,
+    #[serde(default)]
+    payment_currency: Option<String>,
+    #[serde(default)]
+    payment_address: Option<String>,
+    #[serde(default)]
+    payment_amount: Option<u64>,
 }
 
 
@@ -224,6 +276,21 @@ async fn main() -> Result<()> {
         min_lease_remaining_secs: 3600,
     };
 
+    let compute_currencies = cli
+        .compute_currencies
+        .split(',')
+        .map(|ticker| ticker.trim())
+        .filter(|ticker| !ticker.is_empty())
+        .map(|ticker| {
+            static_node::payment::Currency::from_str(ticker).ok_or_else(|| {
+                anyhow::anyhow!("Unsupported compute currency '{}' (accepted: xmr, dark, nav)", ticker)
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if compute_currencies.is_empty() {
+        anyhow::bail!("--compute-currencies must name at least one currency (xmr, dark, nav)");
+    }
+
     let config = NodeConfig {
         data_dir: cli.data_dir.clone(),
         cover_traffic_rate_bps: cover_rate,
@@ -242,6 +309,16 @@ async fn main() -> Result<()> {
         compute_config: static_node::ComputeConfig {
             enabled: cli.compute_enabled,
             capacity: cli.compute_capacity,
+            pricing: static_node::payment::ComputePricing {
+                price_per_execution: cli.compute_price.unwrap_or(0),
+                accepted_currencies: compute_currencies,
+                required_confirmations: cli.compute_confirmations,
+                ..Default::default()
+            },
+            blockchain_config: static_node::payment::BlockchainConfig {
+                monero_rpc_url: cli.monero_rpc.clone(),
+                ..Default::default()
+            },
             ..Default::default()
         },
     };
@@ -335,12 +412,14 @@ async fn main() -> Result<()> {
         Commands::Publish { file_path } => {
             let file_data = std::fs::read(&file_path)?;
             let data_hex = hex::encode(&file_data);
-            
+
             let request = ApiRequest {
                 action: "publish".into(),
                 data: Some(data_hex),
                 content_pub_key: None,
-                compute_fee: None,
+                compute_currency: None,
+                request_id: None,
+                tx_hash: None,
             };
             
             let response = send_api_request(&config.api_addr, &request).await?;
@@ -369,7 +448,9 @@ async fn main() -> Result<()> {
                 action: "retrieve".into(),
                 data: None,
                 content_pub_key: Some(content_pub_key),
-                compute_fee: None,
+                compute_currency: None,
+                request_id: None,
+                tx_hash: None,
             };
             
             let response = send_api_request(&config.api_addr, &request).await?;
@@ -386,12 +467,14 @@ async fn main() -> Result<()> {
                 eprintln!("Retrieve failed: {}", response.message);
             }
         }
-        Commands::Compute { module_key, input, fee, wait } => {
+        Commands::Compute { module_key, input, currency, wait } => {
             let request = ApiRequest {
                 action: "compute".into(),
                 data: Some(input),
                 content_pub_key: Some(module_key),
-                compute_fee: Some(fee),
+                compute_currency: Some(currency),
+                request_id: None,
+                tx_hash: None,
             };
 
             let response = send_api_request(&config.api_addr, &request).await?;
@@ -406,50 +489,107 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("Compute accepted but no request ID returned"))?;
             println!("Compute request submitted. Request ID: {}", request_id);
 
-            if wait == 0 {
-                println!("Poll for the result: static-node status  (or re-run with --wait)");
-                return Ok(());
+            if wait > 0 {
+                poll_compute_result(&config.api_addr, &request_id, wait).await;
+            } else {
+                println!("Poll for the result: static-node compute-result {} --wait", request_id);
             }
+        }
+        Commands::ComputeConfirm { request_id, tx_hash } => {
+            let request = ApiRequest {
+                action: "compute_confirm".into(),
+                data: None,
+                content_pub_key: None,
+                compute_currency: None,
+                request_id: Some(request_id.clone()),
+                tx_hash: Some(tx_hash),
+            };
 
-            // Poll the local API until the result arrives or the wait
-            // budget is exhausted.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait);
-            while std::time::Instant::now() < deadline {
-                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-
-                let poll = ApiRequest {
-                    action: "compute_result".into(),
-                    data: Some(request_id.clone()),
-                    content_pub_key: None,
-                    compute_fee: None,
-                };
-                let poll_response = send_api_request(&config.api_addr, &poll).await?;
-
-                match poll_response.status.as_str() {
-                    "ok" => {
-                        let output_hex = poll_response.data.unwrap_or_default();
-                        if poll_response.message.contains("failed") {
-                            eprintln!("Compute execution failed: {}", output_hex);
-                        } else {
-                            println!("Compute output (hex): {}", output_hex);
-                        }
-                        return Ok(());
-                    }
-                    "pending" => continue,
-                    _ => {
-                        eprintln!("Compute failed: {}", poll_response.message);
-                        return Ok(());
-                    }
-                }
+            let response = send_api_request(&config.api_addr, &request).await?;
+            if response.status == "ok" {
+                println!("{}", response.message);
+                println!("Poll for the result: static-node compute-result {} --wait 600", request_id);
+            } else {
+                eprintln!("Compute confirm failed: {}", response.message);
             }
-            println!(
-                "Result not ready yet. Poll again later with request ID: {}",
-                request_id
-            );
+        }
+        Commands::ComputeResult { request_id, wait } => {
+            poll_compute_result(&config.api_addr, &request_id, wait).await;
         }
     }
 
     Ok(())
+}
+
+/// Poll the local API until a compute result arrives or the wait budget
+/// is exhausted. When the provider quotes a payment the user pays from
+/// their own wallet, then confirms via `static-node compute-confirm`;
+/// polling keeps running in case the payment confirms within the budget.
+async fn poll_compute_result(api_addr: &str, request_id: &str, wait_secs: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+    let mut payment_announced = false;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+        let poll = ApiRequest {
+            action: "compute_result".into(),
+            data: Some(request_id.to_string()),
+            content_pub_key: None,
+            compute_currency: None,
+            request_id: None,
+            tx_hash: None,
+        };
+        let poll_response = match send_api_request(api_addr, &poll).await {
+            Ok(response) => response,
+            Err(e) => {
+                eprintln!("Poll failed: {}", e);
+                return;
+            }
+        };
+
+        match poll_response.status.as_str() {
+            "ok" => {
+                let output_hex = poll_response.data.unwrap_or_default();
+                if poll_response.message.contains("failed") {
+                    eprintln!("Compute execution failed: {}", output_hex);
+                } else {
+                    println!("Compute output (hex): {}", output_hex);
+                }
+                return;
+            }
+            "pending" => {
+                if poll_response.payment_required && !payment_announced {
+                    payment_announced = true;
+                    println!(
+                        "Payment required: {} {} to {}",
+                        poll_response.payment_amount.unwrap_or(0),
+                        poll_response.payment_currency.unwrap_or_default(),
+                        poll_response.payment_address.unwrap_or_default()
+                    );
+                    println!(
+                        "Send the payment from your wallet, then run:\n  static-node compute-confirm {} <tx_hash>",
+                        request_id
+                    );
+                    println!("Polling for the result...");
+                }
+            }
+            _ => {
+                eprintln!("Compute failed: {}", poll_response.message);
+                return;
+            }
+        }
+    }
+    if payment_announced {
+        println!(
+            "Payment not confirmed yet. After paying, confirm with:\n  static-node compute-confirm {} <tx_hash>",
+            request_id
+        );
+    } else {
+        println!(
+            "Result not ready yet. Poll again later: static-node compute-result {} --wait",
+            request_id
+        );
+    }
 }
 
 async fn send_api_request(api_addr: &str, request: &ApiRequest) -> Result<ApiResponse> {
