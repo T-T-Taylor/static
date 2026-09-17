@@ -11,13 +11,16 @@
 
 use rand::RngCore;
 use crate::{NodeConfig, NodeMode, NodeStatus};
-use static_accounting::{AccountingState, current_timestamp};
+use static_accounting::{AccountingState, PeerCredit, current_timestamp};
 use static_crypto::SymmetricKey;
 use static_mesh::transport::{
     TransportState, InboundMessage, create_transport_state,
     start_listener, connect_to_peer, get_stats, gossip_loop,
 };
-use static_mesh::wire::{Prepayment, WireMessage};
+use static_mesh::wire::{
+    AccountingReconciliation, Prepayment, ReconciliationEntry, WireMessage,
+    MAX_RECONCILIATION_ENTRIES,
+};
 use static_sphinx::{MixNode, NodeId, Route, RouteHop};
 use static_storage::{
     EncryptedChunk, ChunkId, ContentId, ContentManifest,
@@ -30,6 +33,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn, error, debug};
+
+/// Peers idle longer than this are treated as possibly partitioned (1 hour)
+pub const PARTITION_THRESHOLD_SECS: u64 = 3600;
+
+/// Extra prune grace for possibly-partitioned peers (24 hours, additive)
+pub const PARTITION_GRACE_PERIOD_SECS: u64 = 86400;
+
+/// Default inactivity threshold before pruning a peer (7 days)
+pub const PRUNE_MAX_AGE_SECS: u64 = 86400 * 7;
 
 /// The running Static node
 pub struct NodeRunner {
@@ -192,6 +204,74 @@ impl NodeRunner {
             });
         }
 
+        // Start accounting prune loop with partition grace.
+        // Partitioned-but-alive peers get PARTITION_GRACE_PERIOD_SECS extra
+        // before eviction so a healed partition can still reconcile.
+        let accounting_for_prune = self.accounting.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                accounting_for_prune.lock().await.prune_inactive_peers_with_grace(
+                    PRUNE_MAX_AGE_SECS,
+                    PARTITION_THRESHOLD_SECS,
+                    PARTITION_GRACE_PERIOD_SECS,
+                );
+            }
+        });
+
+        // Start reconciliation loop: proactively reconnect to peers idle
+        // longer than PARTITION_THRESHOLD_SECS. The reactive path
+        // (is_reconnection in handle_inbound) covers already-reconnected
+        // peers; this covers peers still disconnected.
+        let accounting_for_recon = self.accounting.clone();
+        let transport_for_recon = self.transport.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
+            loop {
+                interval.tick().await;
+                let current_time = current_timestamp();
+                let partitioned: Vec<NodeId> = {
+                    let accounting = accounting_for_recon.lock().await;
+                    accounting
+                        .peers
+                        .iter()
+                        .filter(|(_, credit)| {
+                            current_time.saturating_sub(credit.last_interaction)
+                                > PARTITION_THRESHOLD_SECS
+                        })
+                        .map(|(id, _)| *id)
+                        .collect()
+                };
+                for peer_id in partitioned {
+                    if transport_for_recon.connections.read().await.contains_key(&peer_id) {
+                        continue;
+                    }
+                    let addr_opt = {
+                        transport_for_recon
+                            .routing_table
+                            .read()
+                            .await
+                            .get_node(&peer_id)
+                            .map(|n| n.address.clone())
+                    };
+                    let addr_str = match addr_opt {
+                        Some(a) => a,
+                        None => continue,
+                    };
+                    let addr: std::net::SocketAddr = match addr_str.parse() {
+                        Ok(a) => a,
+                        Err(_) => continue,
+                    };
+                    let transport = transport_for_recon.clone();
+                    tokio::spawn(async move {
+                        // Success triggers reconciliation via the
+                        // is_reconnection signal in handle_inbound.
+                        let _ = connect_to_peer(addr, transport).await;
+                    });
+                }
+            }
+        });
         // Start local API server
         let api_addr = self.config.api_addr.clone();
         let runner_ref = self.clone();
@@ -216,6 +296,17 @@ impl NodeRunner {
 
     /// Handle an inbound message from the transport layer
     async fn handle_inbound(&self, inbound: InboundMessage) -> anyhow::Result<()> {
+        // Reactive partition-heal path: the transport flags the
+        // handshake-echo of a previously-connected peer. Exchange
+        // accounting state now; the message itself (handshake echo)
+        // carries no accounting data.
+        if inbound.is_reconnection {
+            info!("Partition heal detected with peer {:02x?}", inbound.from);
+            if let Err(e) = self.trigger_reconciliation(inbound.from).await {
+                warn!("Reconciliation trigger failed for {:02x?}: {}", inbound.from, e);
+            }
+        }
+
         match inbound.message {
             WireMessage::Sphinx(packet) => {
                 // Backup-only nodes are dormant and do not serve chunks.
@@ -244,8 +335,113 @@ impl NodeRunner {
                 let accepted = self.handle_prepayment(inbound.from, prepayment).await?;
                 debug!("Prepayment handled (accepted={})", accepted);
             }
+            WireMessage::AccountingReconciliation(recon) => {
+                self.process_reconciliation(recon).await?;
+            }
             _ => {}
         }
+        Ok(())
+    }
+
+    /// Convert local accounting state into batched wire entries
+    fn reconciliation_batches(
+        peers: &HashMap<NodeId, PeerCredit>,
+        total_served: u64,
+        total_received: u64,
+        from_node: NodeId,
+        now: u64,
+    ) -> Vec<AccountingReconciliation> {
+        let entries: Vec<ReconciliationEntry> = peers
+            .iter()
+            .map(|(peer_id, credit)| ReconciliationEntry {
+                peer_id: *peer_id,
+                bytes_served: credit.bytes_served,
+                bytes_received: credit.bytes_received,
+                net_credit: credit.net_credit,
+                last_interaction: credit.last_interaction,
+                prepaid_bytes: credit.prepaid_bytes,
+                successful_challenges: credit.successful_challenges,
+                failed_challenges: credit.failed_challenges,
+            })
+            .collect();
+        if entries.is_empty() {
+            return vec![AccountingReconciliation {
+                from_node,
+                peer_credits: vec![],
+                total_bytes_served: total_served,
+                total_bytes_received: total_received,
+                timestamp: now,
+            }];
+        }
+        entries
+            .chunks(MAX_RECONCILIATION_ENTRIES)
+            .map(|chunk| AccountingReconciliation {
+                from_node,
+                peer_credits: chunk.to_vec(),
+                total_bytes_served: total_served,
+                total_bytes_received: total_received,
+                timestamp: now,
+            })
+            .collect()
+    }
+
+    /// Trigger reconciliation with a reconnected peer (partition heal)
+    ///
+    /// Exports local state and sends it in batches of at most
+    /// [`MAX_RECONCILIATION_ENTRIES`] entries. Locks are never held
+    /// across `.await` pairs: accounting is cloned then dropped before
+    /// touching connections.
+    pub async fn trigger_reconciliation(&self, peer: NodeId) -> anyhow::Result<()> {
+        let (peers, total_served, total_received) = {
+            let accounting = self.accounting.lock().await;
+            (
+                accounting.peers.clone(),
+                accounting.total_bytes_served,
+                accounting.total_bytes_received,
+            )
+        };
+        let batches = Self::reconciliation_batches(
+            &peers,
+            total_served,
+            total_received,
+            self.transport.node_id,
+            current_timestamp(),
+        );
+        let count = batches.len();
+        for batch in batches {
+            static_mesh::transport::send_reconciliation(&self.transport, peer, batch).await?;
+        }
+        info!("Sent {} reconciliation batch(es) to {:02x?}", count, peer);
+        Ok(())
+    }
+
+    /// Process an incoming reconciliation batch (last-write-wins merge)
+    pub async fn process_reconciliation(
+        &self,
+        recon: AccountingReconciliation,
+    ) -> anyhow::Result<()> {
+        let incoming: Vec<(NodeId, PeerCredit)> = recon
+            .peer_credits
+            .iter()
+            .map(|e| {
+                let mut credit = PeerCredit::new();
+                credit.bytes_served = e.bytes_served;
+                credit.bytes_received = e.bytes_received;
+                credit.net_credit = e.net_credit;
+                credit.prepaid_bytes = e.prepaid_bytes;
+                credit.successful_challenges = e.successful_challenges;
+                credit.failed_challenges = e.failed_challenges;
+                credit.last_interaction = e.last_interaction;
+                (e.peer_id, credit)
+            })
+            .collect();
+        // Totals in the message are informational (no global ledger).
+        self.accounting.lock().await.reconcile(&incoming);
+        info!(
+            "Reconciled accounting with {:02x?} ({} entries)",
+            recon.from_node,
+            incoming.len()
+        );
         Ok(())
     }
 

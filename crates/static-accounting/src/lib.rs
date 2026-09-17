@@ -450,6 +450,89 @@ impl AccountingState {
         self.peers
             .retain(|_, credit| now - credit.last_interaction < max_age_secs);
     }
+
+    /// Remove inactive peers, giving partitioned peers a grace period
+    ///
+    /// Peers flagged by [`AccountingState::was_partitioned`] are retained
+    /// for an additional `grace_secs` beyond `max_age_secs` so a healed
+    /// partition can still reconcile instead of losing history.
+    pub fn prune_inactive_peers_with_grace(
+        &mut self,
+        max_age_secs: u64,
+        partition_threshold_secs: u64,
+        grace_secs: u64,
+    ) {
+        let now = current_timestamp();
+        self.peers.retain(|_, credit| {
+            let age = now.saturating_sub(credit.last_interaction);
+            if age > partition_threshold_secs {
+                age < max_age_secs.saturating_add(grace_secs)
+            } else {
+                age < max_age_secs
+            }
+        });
+    }
+
+    /// Export peer credits for reconciliation with a reconnected peer
+    ///
+    /// Returns owned `(peer_id, credit)` pairs. The caller (which owns
+    /// both accounting and wire types) converts these into wire
+    /// `ReconciliationEntry` values, batching at ~50 per message.
+    pub fn export_for_reconciliation(&self) -> Vec<(NodeId, PeerCredit)> {
+        self.peers
+            .iter()
+            .map(|(id, credit)| (*id, credit.clone()))
+            .collect()
+    }
+
+    /// Reconcile with a peer's exported accounting state (last-write-wins)
+    ///
+    /// For each incoming `(peer_id, credit)` entry:
+    /// 1. Unknown peer → adopt the incoming entry.
+    /// 2. Known peer with newer `last_interaction` → adopt incoming.
+    /// 3. Known peer with newer-or-equal local entry → keep ours.
+    ///
+    /// Idempotent: processing the same batch twice yields the same state,
+    /// so multi-message batched exchanges converge. Sender totals are
+    /// informational only — no global consistency is enforced (accounting
+    /// stays purely local, peer-to-peer).
+    pub fn reconcile(&mut self, incoming: &[(NodeId, PeerCredit)]) {
+        for (peer_id, remote) in incoming {
+            match self.peers.get_mut(peer_id) {
+                Some(ours) => {
+                    if remote.last_interaction > ours.last_interaction {
+                        ours.bytes_served = remote.bytes_served;
+                        ours.bytes_received = remote.bytes_received;
+                        ours.net_credit = remote.net_credit;
+                        ours.prepaid_bytes = remote.prepaid_bytes;
+                        ours.successful_challenges = remote.successful_challenges;
+                        ours.failed_challenges = remote.failed_challenges;
+                        ours.last_interaction = remote.last_interaction;
+                    }
+                }
+                None => {
+                    self.peers.insert(*peer_id, remote.clone());
+                }
+            }
+        }
+    }
+
+    /// Check if a peer was in a partition (unreachable for a long time)
+    ///
+    /// Returns true if the peer is still recorded but its
+    /// `last_interaction` is older than `partition_threshold_secs`.
+    /// Unknown peers return false.
+    pub fn was_partitioned(
+        &self,
+        peer: &NodeId,
+        partition_threshold_secs: u64,
+        current_time: u64,
+    ) -> bool {
+        match self.peers.get(peer) {
+            Some(credit) => current_time.saturating_sub(credit.last_interaction) > partition_threshold_secs,
+            None => false,
+        }
+    }
 }
 
 impl Default for AccountingState {
@@ -1047,5 +1130,111 @@ mod tests {
         state.record_seed_violation(&first);
         state.record_seed_violation(&first);
         assert!(state.is_seed_misbehaving(&first));
+    }
+
+    fn make_remote_credit(served: u64, received: u64, last: u64) -> PeerCredit {
+        let mut c = PeerCredit::new();
+        c.bytes_served = served;
+        c.bytes_received = received;
+        c.net_credit = served as i64 - received as i64;
+        c.last_interaction = last;
+        c
+    }
+
+    #[test]
+    fn test_reconciliation_new_peer() {
+        let mut state = AccountingState::new();
+        let peer = random_node_id();
+        assert!(!state.peers.contains_key(&peer));
+        let remote = make_remote_credit(1000, 200, 5000);
+        state.reconcile(&[(peer, remote)]);
+        let adopted = &state.peers[&peer];
+        assert_eq!(adopted.bytes_served, 1000);
+        assert_eq!(adopted.bytes_received, 200);
+        assert_eq!(adopted.net_credit, 800);
+        assert_eq!(adopted.last_interaction, 5000);
+    }
+
+    #[test]
+    fn test_reconciliation_last_write_wins() {
+        let mut state = AccountingState::new();
+        let peer = random_node_id();
+        let mut ours = make_remote_credit(5000, 1000, 9000);
+        ours.prepaid_bytes = 111;
+        state.peers.insert(peer, ours);
+        // Incoming is older — keep ours (incl. prepaid).
+        let mut stale = make_remote_credit(100, 100, 1000);
+        stale.prepaid_bytes = 999;
+        state.reconcile(&[(peer, stale)]);
+        let kept = &state.peers[&peer];
+        assert_eq!(kept.bytes_served, 5000);
+        assert_eq!(kept.prepaid_bytes, 111);
+        assert_eq!(kept.last_interaction, 9000);
+    }
+
+    #[test]
+    fn test_reconciliation_older_overwritten() {
+        let mut state = AccountingState::new();
+        let peer = random_node_id();
+        let mut ours = make_remote_credit(100, 100, 1000);
+        ours.prepaid_bytes = 1;
+        ours.successful_challenges = 2;
+        state.peers.insert(peer, ours);
+        // Incoming is newer — adopt everything.
+        let mut fresh = make_remote_credit(7000, 3000, 9000);
+        fresh.prepaid_bytes = 42;
+        fresh.successful_challenges = 7;
+        fresh.failed_challenges = 3;
+        state.reconcile(&[(peer, fresh)]);
+        let adopted = &state.peers[&peer];
+        assert_eq!(adopted.bytes_served, 7000);
+        assert_eq!(adopted.bytes_received, 3000);
+        assert_eq!(adopted.prepaid_bytes, 42);
+        assert_eq!(adopted.successful_challenges, 7);
+        assert_eq!(adopted.failed_challenges, 3);
+        assert_eq!(adopted.last_interaction, 9000);
+    }
+
+    #[test]
+    fn test_partition_detection() {
+        let mut state = AccountingState::new();
+        let peer = random_node_id();
+        let now = current_timestamp();
+        let credit = make_remote_credit(100, 100, now - 5000);
+        state.peers.insert(peer, credit);
+        // Age 5000 > threshold 3600 → partitioned.
+        assert!(state.was_partitioned(&peer, 3600, now));
+        // Recent peer is not partitioned.
+        let fresh = random_node_id();
+        state
+            .peers
+            .insert(fresh, make_remote_credit(100, 100, now - 500));
+        assert!(!state.was_partitioned(&fresh, 3600, now));
+        // Unknown peer → false.
+        assert!(!state.was_partitioned(&random_node_id(), 3600, now));
+        // Grace pruning keeps the partitioned peer: max_age 6000 covers
+        // age 5000, and grace extends it further.
+        state.prune_inactive_peers_with_grace(6000, 3600, 86400);
+        assert!(state.peers.contains_key(&peer));
+        assert!(state.peers.contains_key(&fresh));
+        // Tight threshold with no grace prunes the old peer only.
+        state.prune_inactive_peers_with_grace(1000, 3600, 0);
+        assert!(!state.peers.contains_key(&peer));
+        assert!(state.peers.contains_key(&fresh));
+    }
+
+    #[test]
+    fn test_reconciliation_preserves_prepayments() {
+        let mut state = AccountingState::new();
+        let peer = random_node_id();
+        let mut remote = make_remote_credit(2000, 500, 8000);
+        remote.prepaid_bytes = 12345;
+        state.reconcile(&[(peer, remote)]);
+        assert_eq!(state.peers[&peer].prepaid_bytes, 12345);
+        assert_eq!(state.total_prepaid_bytes(), 12345);
+        // Export round-trips the prepaid field.
+        let exported = state.export_for_reconciliation();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].1.prepaid_bytes, 12345);
     }
 }

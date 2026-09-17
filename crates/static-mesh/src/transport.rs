@@ -24,7 +24,7 @@ use static_sphinx::{
     SphinxPacket, MixNode, process_packet, RoutingFlag,
     NodeId,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -87,6 +87,12 @@ pub struct TransportState {
     pub storage_key: Arc<Mutex<static_crypto::SymmetricKey>>,
     /// Chunks this node is holding
     pub chunk_holder: Arc<Mutex<ChunkHolder>>,
+    /// Node IDs previously connected but since disconnected
+    ///
+    /// Used to distinguish partition heals (reconnections) from
+    /// first-time connections. Populated on disconnect, consumed on
+    /// the next successful handshake with the same node ID.
+    pub previously_connected: Arc<RwLock<HashSet<NodeId>>>,
 }
 
 /// An inbound message from a peer
@@ -96,6 +102,12 @@ pub struct InboundMessage {
     pub from: NodeId,
     /// The message content
     pub message: WireMessage,
+    /// Whether this peer was previously connected (partition heal)
+    ///
+    /// When true, the receiver should trigger accounting reconciliation
+    /// with this peer. Transport sets this on the handshake-echo signal
+    /// sent after a reconnection; all regular messages carry false.
+    pub is_reconnection: bool,
 }
 
 /// Errors that can occur during transport operations
@@ -193,6 +205,22 @@ pub async fn handle_incoming_connection(
                     // Set up connection
                     let (tx, rx) = mpsc::channel::<WireMessage>(CHANNEL_BUFFER);
                     state.connections.write().await.insert(hs.node_id, tx.clone());
+
+                    // Partition-heal detection: if this node ID was connected
+                    // before, this handshake is a reconnection. Signal the
+                    // runner via a handshake-echo InboundMessage so it can
+                    // trigger accounting reconciliation.
+                    if state.previously_connected.write().await.remove(&hs.node_id) {
+                        debug!("Partition heal detected (inbound) with {:02x?}", hs.node_id);
+                        let _ = state
+                            .inbound_tx
+                            .send(InboundMessage {
+                                from: hs.node_id,
+                                message: WireMessage::Handshake(hs.clone()),
+                                is_reconnection: true,
+                            })
+                            .await;
+                    }
                     
                     // Spawn write loop
                     let write_state = state.clone();
@@ -227,6 +255,10 @@ pub async fn handle_incoming_connection(
                 }
                 WireMessage::Prepayment(_) => {
                     warn!("Expected handshake, got Prepayment from {}", addr);
+                    return;
+                }
+                WireMessage::AccountingReconciliation(_) => {
+                    warn!("Expected handshake, got AccountingReconciliation from {}", addr);
                     return;
                 }
             }
@@ -283,6 +315,19 @@ pub async fn connect_to_peer(
 
                     let (tx, rx) = mpsc::channel::<WireMessage>(CHANNEL_BUFFER);
                     state.connections.write().await.insert(hs.node_id, tx.clone());
+
+                    // Partition-heal detection (outbound side).
+                    if state.previously_connected.write().await.remove(&hs.node_id) {
+                        debug!("Partition heal detected (outbound) with {:02x?}", hs.node_id);
+                        let _ = state
+                            .inbound_tx
+                            .send(InboundMessage {
+                                from: hs.node_id,
+                                message: WireMessage::Handshake(hs.clone()),
+                                is_reconnection: true,
+                            })
+                            .await;
+                    }
                     
                     let write_state = state.clone();
                     let peer_id = hs.node_id;
@@ -313,6 +358,9 @@ pub async fn connect_to_peer(
                 }
                 WireMessage::Prepayment(_) => {
                     return Err(TransportError::HandshakeFailed("expected handshake, got prepayment".into()));
+                }
+                WireMessage::AccountingReconciliation(_) => {
+                    return Err(TransportError::HandshakeFailed("expected handshake, got reconciliation".into()));
                 }
             }
         }
@@ -363,7 +411,10 @@ async fn read_loop(
         }
     }
 
-    // Clean up connection
+    // Clean up connection and remember the peer for heal detection.
+    // A later handshake with the same node ID is a partition heal,
+    // not a first-time connection.
+    state.previously_connected.write().await.insert(peer_id);
     state.connections.write().await.remove(&peer_id);
 }
 
@@ -477,6 +528,24 @@ async fn handle_message(
                 .send(InboundMessage {
                     from,
                     message: WireMessage::Prepayment(prepayment),
+                    is_reconnection: false,
+                })
+                .await;
+        }
+        WireMessage::AccountingReconciliation(recon) => {
+            // Reconciliation batches are accounting metadata: forward to
+            // the runner, which owns last-write-wins merging.
+            debug!(
+                "Received accounting reconciliation from {:02x?} ({} entries)",
+                from,
+                recon.peer_credits.len()
+            );
+            let _ = state
+                .inbound_tx
+                .send(InboundMessage {
+                    from,
+                    message: WireMessage::AccountingReconciliation(recon),
+                    is_reconnection: false,
                 })
                 .await;
         }
@@ -539,6 +608,7 @@ async fn handle_message(
                                         },
                                         body,
                                     }),
+                                    is_reconnection: false,
                                 }).await;
                             }
                         }
@@ -732,6 +802,7 @@ pub fn create_transport_state(
         storage_capacity: Arc::new(Mutex::new(storage_capacity)),
         storage_key: Arc::new(Mutex::new(storage_key)),
         chunk_holder: Arc::new(Mutex::new(chunk_holder)),
+        previously_connected: Arc::new(RwLock::new(HashSet::new())),
     });
 
     (state, inbound_rx)
@@ -769,6 +840,27 @@ pub async fn send_prepayment(
 
     sender
         .send(WireMessage::Prepayment(prepayment))
+        .await
+        .map_err(|_| TransportError::ChannelSend)
+}
+
+/// Send an accounting reconciliation batch to a reconnected peer
+///
+/// Reconciliation traffic is direct wire maintenance (like gossip),
+/// not Sphinx-wrapped. Large states are split by the caller into
+/// batches of at most `crate::wire::MAX_RECONCILIATION_ENTRIES`.
+pub async fn send_reconciliation(
+    state: &Arc<TransportState>,
+    peer: NodeId,
+    reconciliation: crate::wire::AccountingReconciliation,
+) -> Result<(), TransportError> {
+    let connections = state.connections.read().await;
+    let sender = connections
+        .get(&peer)
+        .ok_or(TransportError::ConnectionNotFound(peer))?;
+
+    sender
+        .send(WireMessage::AccountingReconciliation(reconciliation))
         .await
         .map_err(|_| TransportError::ChannelSend)
 }

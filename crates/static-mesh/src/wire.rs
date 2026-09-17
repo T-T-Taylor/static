@@ -39,6 +39,16 @@ pub const MSG_SWAP_REJECT: u8 = 0x06;
 /// Prepayment message type
 pub const MSG_PREPAYMENT: u8 = 0x07;
 
+/// Accounting reconciliation message type
+pub const MSG_ACCOUNTING_RECONCILIATION: u8 = 0x08;
+
+/// Maximum peer credit entries per reconciliation message (batching cap)
+///
+/// Keeps serialized reconciliation messages under `MAX_MESSAGE_SIZE`.
+/// Nodes with more peers send multiple messages; `reconcile()` is
+/// idempotent so batches converge to the same result.
+pub const MAX_RECONCILIATION_ENTRIES: usize = 50;
+
 /// Maximum message size (header + body + framing overhead)
 pub const MAX_MESSAGE_SIZE: usize = 1 + 4 + EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE;
 
@@ -70,6 +80,8 @@ pub enum WireMessage {
     SwapReject(SwapReject),
     /// Prepayment from a seed-only node to a sponsor
     Prepayment(Prepayment),
+    /// Accounting state reconciliation (exchange peer credits after partition heal)
+    AccountingReconciliation(AccountingReconciliation),
 }
 
 /// Prepayment from a seed-only node to a sponsor
@@ -99,6 +111,52 @@ impl Prepayment {
         // TODO: Add ed25519-dalek for real signature verification
         self.bytes > 0 && !self.signature.is_empty()
     }
+}
+
+/// A single peer credit entry for reconciliation
+///
+/// Mirrors the fields of `static-accounting::PeerCredit` needed for
+/// timestamp-based last-write-wins. Defined here (rather than in
+/// `static-accounting`) so `static-mesh` does not gain a dependency
+/// on `static-accounting`; `static-node` converts between the two.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReconciliationEntry {
+    /// The peer node ID this credit is for
+    pub peer_id: NodeId,
+    /// Bytes served to this peer
+    pub bytes_served: u64,
+    /// Bytes received from this peer
+    pub bytes_received: u64,
+    /// Net credit (served - received)
+    pub net_credit: i64,
+    /// Last interaction timestamp (for last-write-wins)
+    pub last_interaction: u64,
+    /// Prepaid bytes (for seed-only sponsor tracking)
+    pub prepaid_bytes: u64,
+    /// Successful challenges
+    pub successful_challenges: u32,
+    /// Failed challenges
+    pub failed_challenges: u32,
+}
+
+/// A message to reconcile accounting state after a network partition
+///
+/// Sent as direct wire maintenance traffic (like gossip/prepayment).
+/// Large peer sets are split into batches of at most
+/// [`MAX_RECONCILIATION_ENTRIES`] entries; receivers process batches
+/// sequentially since reconciliation is idempotent.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AccountingReconciliation {
+    /// The sending node's ID
+    pub from_node: NodeId,
+    /// The sending node's peer credits (subset relevant to the receiver)
+    pub peer_credits: Vec<ReconciliationEntry>,
+    /// The sending node's total_bytes_served
+    pub total_bytes_served: u64,
+    /// The sending node's total_bytes_received
+    pub total_bytes_received: u64,
+    /// Timestamp of this reconciliation message
+    pub timestamp: u64,
 }
 
 /// Errors that can occur during wire protocol operations
@@ -232,6 +290,7 @@ pub fn serialize_message(msg: &WireMessage) -> Result<Vec<u8>, WireError> {
         WireMessage::SwapAccept(s) => (MSG_SWAP_ACCEPT, serde_json::to_vec(s).map_err(|_| WireError::InvalidMessageType(0))?),
         WireMessage::SwapReject(s) => (MSG_SWAP_REJECT, serde_json::to_vec(s).map_err(|_| WireError::InvalidMessageType(0))?),
         WireMessage::Prepayment(p) => (MSG_PREPAYMENT, serde_json::to_vec(p).map_err(|_| WireError::InvalidMessageType(0))?),
+        WireMessage::AccountingReconciliation(r) => (MSG_ACCOUNTING_RECONCILIATION, serde_json::to_vec(r).map_err(|_| WireError::InvalidMessageType(0))?),
     };
 
     let total_len = 1 + 4 + payload.len();
@@ -298,6 +357,9 @@ pub fn deserialize_message(data: &[u8]) -> Result<(WireMessage, usize), WireErro
         }
         MSG_PREPAYMENT => {
             WireMessage::Prepayment(serde_json::from_slice(payload).map_err(|_| WireError::InvalidMessageType(msg_type))?)
+        }
+        MSG_ACCOUNTING_RECONCILIATION => {
+            WireMessage::AccountingReconciliation(serde_json::from_slice(payload).map_err(|_| WireError::InvalidMessageType(msg_type))?)
         }
         _ => return Err(WireError::InvalidMessageType(msg_type)),
     };
@@ -610,5 +672,78 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
             signature: vec![],
         };
         assert!(!bad.validate());
+    }
+
+    #[test]
+    fn test_reconciliation_entry_serialization() {
+        let entry = ReconciliationEntry {
+            peer_id: [0x11u8; 16],
+            bytes_served: 5000,
+            bytes_received: 1000,
+            net_credit: 4000,
+            last_interaction: 1_700_000,
+            prepaid_bytes: 777,
+            successful_challenges: 9,
+            failed_challenges: 1,
+        };
+        let json = serde_json::to_vec(&entry).unwrap();
+        let back: ReconciliationEntry = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.peer_id, entry.peer_id);
+        assert_eq!(back.bytes_served, 5000);
+        assert_eq!(back.net_credit, 4000);
+        assert_eq!(back.prepaid_bytes, 777);
+        assert_eq!(back.successful_challenges, 9);
+    }
+
+    #[test]
+    fn test_accounting_reconciliation_serialization() {
+        let entries = vec![
+            ReconciliationEntry {
+                peer_id: [0x01u8; 16],
+                bytes_served: 100,
+                bytes_received: 50,
+                net_credit: 50,
+                last_interaction: 1000,
+                prepaid_bytes: 0,
+                successful_challenges: 1,
+                failed_challenges: 0,
+            },
+            ReconciliationEntry {
+                peer_id: [0x02u8; 16],
+                bytes_served: 200,
+                bytes_received: 300,
+                net_credit: -100,
+                last_interaction: 2000,
+                prepaid_bytes: 1234,
+                successful_challenges: 0,
+                failed_challenges: 2,
+            },
+        ];
+        let recon = AccountingReconciliation {
+            from_node: [0xAAu8; 16],
+            peer_credits: entries,
+            total_bytes_served: 10_000,
+            total_bytes_received: 8_000,
+            timestamp: 1_700_000,
+        };
+        let msg = WireMessage::AccountingReconciliation(recon.clone());
+        let serialized = serialize_message(&msg).unwrap();
+        assert_eq!(serialized[0], MSG_ACCOUNTING_RECONCILIATION);
+        assert!(serialized.len() <= MAX_MESSAGE_SIZE);
+        let (deserialized, consumed) = deserialize_message(&serialized).unwrap();
+        assert_eq!(consumed, serialized.len());
+        match deserialized {
+            WireMessage::AccountingReconciliation(r) => {
+                assert_eq!(r.from_node, recon.from_node);
+                assert_eq!(r.peer_credits.len(), 2);
+                assert_eq!(r.peer_credits[1].prepaid_bytes, 1234);
+                assert_eq!(r.peer_credits[1].net_credit, -100);
+                assert_eq!(r.total_bytes_served, 10_000);
+                assert_eq!(r.timestamp, 1_700_000);
+            }
+            _ => panic!("expected reconciliation"),
+        }
+        // Batching cap keeps messages small.
+        assert!(MAX_RECONCILIATION_ENTRIES <= 50);
     }
 }

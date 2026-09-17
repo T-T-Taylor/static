@@ -29,7 +29,7 @@
 - Sponsor node validates stake before accepting hosting commitment
 - Rate limit seed-only nodes to only sending seed packages (heartbeats/funding) when requested
 
-### 5. Network Partition Handling for Accounting
+### 5. Network Partition Handling for Accounting ✅ DONE
 - Local accounting may diverge during partitions
 - On partition heal, nodes exchange accounting state
 - Reconcile discrepancies (last-write-wins or timestamp-based)
