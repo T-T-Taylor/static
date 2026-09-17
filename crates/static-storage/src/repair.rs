@@ -15,7 +15,6 @@
 use crate::{
     EncryptedChunk, ChunkId, ContentId, ContentManifest,
     StorageError, erasure_decode, erasure_encode,
-    DEFAULT_DATA_SHARDS, DEFAULT_PARITY_SHARDS,
 };
 use std::collections::HashMap;
 

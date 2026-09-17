@@ -21,6 +21,7 @@ use static_mesh::wire::WireMessage;
 use static_sphinx::{MixNode, NodeId, Route, RouteHop};
 use static_storage::{
     EncryptedChunk, ChunkId, ContentId, ContentManifest,
+    repair::RepairState,
     heartbeat::LeaseManager,
     retrieval::{ChunkHolder, ContentRetriever},
     swap::{SwapState, StorageCapacity},
@@ -47,6 +48,8 @@ pub struct NodeRunner {
     /// Content retriever for assembling files from chunks
     /// Content retriever for assembling files from chunks
     pub content_retriever: Arc<Mutex<ContentRetriever>>,
+    /// Repair state for tracking chunk repairs
+    pub repair_state: Arc<Mutex<RepairState>>,
     /// Content retriever for tracking pending chunk retrievals
     /// Retrieval manager for tracking pending network fragments
     pub retriever: Arc<Mutex<static_mesh::retrieval::RetrievalManager>>,
@@ -77,6 +80,7 @@ impl NodeRunner {
             storage_keys: Arc::new(Mutex::new(HashMap::new())),
             retriever: Arc::new(Mutex::new(static_mesh::retrieval::RetrievalManager::new())),
             content_retriever: Arc::new(Mutex::new(ContentRetriever::new())),
+            repair_state: Arc::new(Mutex::new(RepairState::new())),
             inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
             config,
         }
@@ -121,6 +125,14 @@ impl NodeRunner {
         let chunks = self.transport.chunk_holder.clone();
         tokio::spawn(async move {
             lease_expiration_loop(leases, chunks).await;
+        });
+
+        // Start repair loop
+        let repair_state = self.repair_state.clone();
+        let storage_keys = self.storage_keys.clone();
+        let leases_for_repair = self.leases.clone();
+        tokio::spawn(async move {
+            repair_loop(repair_state, storage_keys, leases_for_repair).await;
         });
 
         // Start peer gossip loop
@@ -296,6 +308,7 @@ impl NodeRunner {
         let timeout = tokio::time::sleep(std::time::Duration::from_secs(10));
         tokio::pin!(timeout);
 
+        #[allow(unused_assignments)]
         let mut encrypted_manifest_data: Option<Vec<u8>> = None;
         
         loop {
@@ -418,5 +431,34 @@ async fn lease_expiration_loop(
         }
 
         leases.cleanup_nonces(current_time);
+    }
+}
+
+
+/// Background loop to periodically check content health and trigger repairs
+async fn repair_loop(
+    repair_state: Arc<Mutex<RepairState>>,
+    storage_keys: Arc<Mutex<HashMap<ContentId, SymmetricKey>>>,
+    leases: Arc<Mutex<LeaseManager>>,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // Check every 5 minutes
+
+    loop {
+        interval.tick().await;
+        
+        let _storage_keys = storage_keys.lock().await;
+        let _leases = leases.lock().await;
+        
+        // In a full implementation, we would:
+        // 1. Iterate through all owned content (storage_keys)
+        // 2. For each content, send health check requests to the network
+        // 3. Aggregate copy counts for each chunk
+        // 4. Call check_content_health() with the aggregated counts
+        // 5. If health is not healthy, call create_repair_plan()
+        // 6. If a plan is created, retrieve remaining shards and reconstruct
+        // 7. Re-distribute the reconstructed shards to new nodes
+        
+        // For now, just log that the repair loop is running
+        debug!("Repair loop tick. Active repairs: {}", repair_state.lock().await.active_count());
     }
 }
