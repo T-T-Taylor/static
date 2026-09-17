@@ -24,6 +24,9 @@ pub mod retrieval;
 /// Hidden service discovery and encrypted manifests
 pub mod hidden_service;
 
+/// Chunk repair protocol
+pub mod repair;
+
 use static_crypto::{SymmetricKey, NonceBytes, encrypt, decrypt};
 use blake3;
 use reed_solomon_erasure::galois_8::ReedSolomon;
