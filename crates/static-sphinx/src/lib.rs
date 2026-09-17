@@ -7,6 +7,8 @@
 pub mod surb;
 
 use static_crypto::SymmetricKey;
+use static_crypto::{KemKeypair, derive_hybrid_shared_secret};
+use static_crypto::{KEM_CIPHERTEXT_SIZE, KEM_PUBLIC_KEY_SIZE};
 use blake3;
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use curve25519_dalek::scalar::Scalar;
@@ -34,6 +36,21 @@ pub const ROUTING_INFO_SIZE: usize = MAX_HOPS * SLOT_SIZE;
 
 /// Size of the ephemeral key in bytes
 pub const EPHEMERAL_KEY_SIZE: usize = 32;
+
+/// Sphinx packet version: classical X25519-only key agreement
+pub const SPHINX_VERSION_CLASSICAL: u8 = 0;
+
+/// Sphinx packet version: hybrid X25519 + ML-KEM-768 key agreement
+pub const SPHINX_VERSION_HYBRID: u8 = 1;
+
+/// HKDF context for deriving per-hop keys from hybrid shared secrets
+pub const HYBRID_HOP_CONTEXT: &str = "sphinx/hybrid-hop";
+
+/// Size of one ML-KEM-768 ciphertext in bytes (re-exported for sizing)
+pub const HYBRID_KEM_CIPHERTEXT_SIZE: usize = KEM_CIPHERTEXT_SIZE;
+
+/// Size of one ML-KEM-768 public key in bytes (re-exported for sizing)
+pub const HYBRID_KEM_PUBLIC_KEY_SIZE: usize = KEM_PUBLIC_KEY_SIZE;
 
 /// Total header size
 pub const HEADER_SIZE: usize = EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE;
@@ -99,6 +116,8 @@ pub struct Route {
 /// A Sphinx packet header
 #[derive(Debug, Clone)]
 pub struct SphinxHeader {
+    /// Packet version: 0 = classical (X25519), 1 = hybrid (X25519 + ML-KEM)
+    pub version: u8,
     /// The ephemeral public key (blinded at each hop)
     pub ephemeral_key: [u8; EPHEMERAL_KEY_SIZE],
     /// The encrypted routing information
@@ -112,6 +131,12 @@ pub struct SphinxHeader {
 pub struct SphinxPacket {
     /// The packet header
     pub header: SphinxHeader,
+    /// ML-KEM ciphertexts, one per remaining hop (hybrid v1 only)
+    ///
+    /// Flat concatenation (`n * KEM_CIPHERTEXT_SIZE` bytes). Each hop
+    /// decapsulates and strips the first ciphertext before forwarding.
+    /// Always empty for classical v0 packets.
+    pub kem_ciphertexts: Vec<u8>,
     /// The encrypted body
     pub body: Vec<u8>,
 }
@@ -162,6 +187,18 @@ pub enum SphinxError {
     /// Body too large
     #[error("body too large")]
     BodyTooLarge,
+    /// Packet version not supported by this operation
+    ///
+    /// Classical `process_packet` rejects v1 packets (use
+    /// `process_packet_hybrid`); hybrid processing rejects unknown versions.
+    #[error("unsupported sphinx packet version: {0}")]
+    UnsupportedVersion(u8),
+    /// ML-KEM ciphertext invalid or decapsulation failed
+    #[error("invalid ML-KEM ciphertext")]
+    InvalidKemCiphertext,
+    /// ML-KEM public key has the wrong size
+    #[error("invalid ML-KEM public key size")]
+    InvalidKemPublicKey,
 }
 
 // ---- Internal key derivation ----
@@ -341,12 +378,13 @@ pub fn create_packet(route: &Route, body: &[u8]) -> Result<SphinxPacket, SphinxE
     }
 
     let header = SphinxHeader {
+        version: SPHINX_VERSION_CLASSICAL,
         ephemeral_key: alphas[0],
         routing_info,
         mac: macs[0],
     };
 
-    Ok(SphinxPacket { header, body: body_bytes })
+    Ok(SphinxPacket { header, kem_ciphertexts: Vec::new(), body: body_bytes })
 }
 
 // ---- Public API: Packet processing ----
@@ -355,7 +393,16 @@ pub fn create_packet(route: &Route, body: &[u8]) -> Result<SphinxPacket, SphinxE
 ///
 /// Uses non-clamped scalar multiplication to match the sender's
 /// blinding computation.
+///
+/// Classical-only: rejects hybrid (v1) packets with
+/// [`SphinxError::UnsupportedVersion`] — use [`process_packet_hybrid`].
 pub fn process_packet(node: &mut MixNode, packet: SphinxPacket) -> Result<ProcessedPacket, SphinxError> {
+    if packet.header.version == SPHINX_VERSION_HYBRID {
+        return Err(SphinxError::UnsupportedVersion(packet.header.version));
+    }
+    if packet.header.version != SPHINX_VERSION_CLASSICAL {
+        return Err(SphinxError::UnsupportedVersion(packet.header.version));
+    }
     if packet.header.routing_info.len() != ROUTING_INFO_SIZE {
         return Err(SphinxError::InvalidPacketSize);
     }
@@ -420,15 +467,339 @@ pub fn process_packet(node: &mut MixNode, packet: SphinxPacket) -> Result<Proces
         }
         RoutingFlag::Forward => {
             let forward_header = SphinxHeader {
+                version: packet.header.version,
                 ephemeral_key: new_ephemeral,
                 routing_info: new_routing_info,
                 mac: next_mac,
             };
             let forward_packet = SphinxPacket {
                 header: forward_header,
+                kem_ciphertexts: Vec::new(),
                 body: new_body,
             };
             Ok(ProcessedPacket {
+                next_hop,
+                flag,
+                forward_packet: Some(forward_packet),
+                body: None,
+            })
+        }
+    }
+}
+
+// ---- Hybrid (post-quantum) key agreement ----
+
+/// A hop in a hybrid route: classical X25519 key plus ML-KEM-768 key
+#[derive(Debug, Clone)]
+pub struct HybridRouteHop {
+    /// The mix node's ID
+    pub node_id: NodeId,
+    /// The mix node's classical public key (Montgomery point bytes)
+    pub classical_public_key: PubKeyBytes,
+    /// The mix node's ML-KEM-768 public key bytes
+    pub kem_public_key: Vec<u8>,
+}
+
+/// A route for hybrid Sphinx packets
+#[derive(Debug, Clone)]
+pub struct HybridRoute {
+    /// The mix nodes in order
+    pub hops: Vec<HybridRouteHop>,
+    /// The final destination ID
+    pub destination: NodeId,
+}
+
+/// A mix node that supports both classical and hybrid Sphinx packets
+///
+/// Holds the classical Curve25519 keys (via [`MixNode`]) plus a
+/// post-quantum ML-KEM-768 keypair. Classical packets are processed
+/// with the inner node; hybrid packets additionally decapsulate the
+/// per-hop KEM ciphertext and combine both shared secrets.
+pub struct HybridMixNode {
+    /// Classical Curve25519 keys and replay tags
+    pub classical: MixNode,
+    /// Post-quantum ML-KEM-768 keys
+    pub kem: KemKeypair,
+}
+
+/// Result of processing a hybrid packet at a mix node
+#[derive(Debug)]
+pub struct HybridProcessedPacket {
+    /// The next hop's node ID
+    pub next_hop: NodeId,
+    /// The routing flag
+    pub flag: RoutingFlag,
+    /// The packet to forward (None if destination)
+    pub forward_packet: Option<SphinxPacket>,
+    /// The decrypted body (Some only at destination)
+    pub body: Option<Vec<u8>>,
+}
+
+impl HybridMixNode {
+    /// Create a new hybrid mix node with fresh classical and KEM keys
+    pub fn new() -> Self {
+        Self {
+            classical: MixNode::new(),
+            kem: KemKeypair::random(),
+        }
+    }
+
+    /// Wrap an existing classical mix node, generating a fresh KEM keypair
+    pub fn from_mix_node(classical: MixNode) -> Self {
+        Self {
+            classical,
+            kem: KemKeypair::random(),
+        }
+    }
+
+    /// This node's ID (same as the classical inner node)
+    pub fn node_id(&self) -> NodeId {
+        self.classical.node_id
+    }
+
+    /// This node's classical public key bytes
+    pub fn classical_public_key(&self) -> PubKeyBytes {
+        self.classical.public_key
+    }
+
+    /// This node's ML-KEM public key bytes (to advertise to peers)
+    pub fn kem_public_key_bytes(&self) -> Vec<u8> {
+        self.kem.public_bytes()
+    }
+
+    /// A route hop descriptor for this node
+    pub fn as_hop(&self) -> HybridRouteHop {
+        HybridRouteHop {
+            node_id: self.classical.node_id,
+            classical_public_key: self.classical.public_key,
+            kem_public_key: self.kem.public_bytes(),
+        }
+    }
+}
+
+impl Default for HybridMixNode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Create a hybrid Sphinx packet for a route.
+///
+/// Per-hop keys combine X25519 (with the same running-scalar blinding
+/// as classical packets) and a fresh ML-KEM encapsulation to that hop:
+/// `hop_key = derive_hybrid_shared_secret(classical_dh, kem_ss)`.
+/// Routing/MAC/body construction is otherwise identical to classical,
+/// so cover properties are preserved. One KEM ciphertext per hop rides
+/// in the packet; each hop strips its own before forwarding.
+pub fn create_packet_hybrid(route: &HybridRoute, body: &[u8]) -> Result<SphinxPacket, SphinxError> {
+    let n = route.hops.len();
+    if n == 0 || n > MAX_HOPS {
+        return Err(SphinxError::RouteTooLong);
+    }
+    if body.len() > BODY_SIZE {
+        return Err(SphinxError::BodyTooLarge);
+    }
+    for hop in &route.hops {
+        if hop.kem_public_key.len() != KEM_PUBLIC_KEY_SIZE {
+            return Err(SphinxError::InvalidKemPublicKey);
+        }
+    }
+
+    let ephemeral_scalar = random_scalar();
+    let ephemeral_pub = (&BASE_POINT * &ephemeral_scalar).0;
+
+    // Compute hybrid shared secrets with running scalar blinding
+    let mut hop_keys = Vec::with_capacity(n);
+    let mut alphas = Vec::with_capacity(n);
+    let mut kem_ciphertexts: Vec<u8> = Vec::with_capacity(n * KEM_CIPHERTEXT_SIZE);
+    let mut current_alpha = ephemeral_pub;
+    let mut current_scalar = ephemeral_scalar.clone();
+
+    for i in 0..n {
+        // Classical component (blinded DH, as in create_packet)
+        let pub_point = MontgomeryPoint(route.hops[i].classical_public_key);
+        let shared_point = &pub_point * &current_scalar;
+        let classical_shared = SymmetricKey::from_bytes(shared_point.0);
+
+        // Post-quantum component (fresh encapsulation per hop)
+        let (kem_shared, ciphertext) = KemKeypair::encapsulate_to(&route.hops[i].kem_public_key)
+            .map_err(|_| SphinxError::InvalidKemPublicKey)?;
+        kem_ciphertexts.extend_from_slice(&ciphertext);
+
+        // Hybrid combination: both must break to recover hop keys
+        let hybrid_shared =
+            derive_hybrid_shared_secret(&classical_shared, &kem_shared, HYBRID_HOP_CONTEXT);
+        hop_keys.push(derive_hop_keys(&hybrid_shared));
+
+        alphas.push(current_alpha);
+
+        if i < n - 1 {
+            let blind = blinding_factor(&hybrid_shared);
+            current_scalar = &current_scalar * &blind;
+            let alpha_point = MontgomeryPoint(current_alpha);
+            current_alpha = (&alpha_point * &blind).0;
+        }
+    }
+
+    // Build routing blocks and MACs (identical construction, hybrid keys)
+    let mut blocks: Vec<[u8; SLOT_SIZE]> = vec![[0u8; SLOT_SIZE]; n];
+    let mut enc_blocks: Vec<[u8; SLOT_SIZE]> = vec![[0u8; SLOT_SIZE]; n];
+    let mut macs: Vec<Mac> = vec![[0u8; MAC_SIZE]; n];
+
+    for i in (0..n).rev() {
+        if i == n - 1 {
+            blocks[i][..NODE_ID_SIZE].copy_from_slice(&route.destination);
+            blocks[i][NODE_ID_SIZE] = RoutingFlag::Destination as u8;
+        } else {
+            blocks[i][..NODE_ID_SIZE].copy_from_slice(&route.hops[i + 1].node_id);
+            blocks[i][NODE_ID_SIZE] = RoutingFlag::Forward as u8;
+            blocks[i][NODE_ID_SIZE + FLAG_SIZE..].copy_from_slice(&macs[i + 1]);
+        }
+
+        enc_blocks[i] = blocks[i];
+        xor_slot(&hop_keys[i].stream_key, &mut enc_blocks[i]);
+        macs[i] = compute_mac(&hop_keys[i].mac_key, &alphas[i], &enc_blocks[i]);
+    }
+
+    let mut routing_info = vec![0u8; ROUTING_INFO_SIZE];
+    for i in 0..n {
+        routing_info[i * SLOT_SIZE..(i + 1) * SLOT_SIZE].copy_from_slice(&enc_blocks[i]);
+    }
+    routing_info[n * SLOT_SIZE..].copy_from_slice(&random_bytes(ROUTING_INFO_SIZE - n * SLOT_SIZE));
+
+    let mut body_bytes = vec![0u8; BODY_SIZE];
+    body_bytes[..body.len()].copy_from_slice(body);
+    for i in (0..n).rev() {
+        xor_body(&hop_keys[i].body_key, &mut body_bytes);
+    }
+
+    let header = SphinxHeader {
+        version: SPHINX_VERSION_HYBRID,
+        ephemeral_key: alphas[0],
+        routing_info,
+        mac: macs[0],
+    };
+
+    Ok(SphinxPacket { header, kem_ciphertexts, body: body_bytes })
+}
+
+/// Process a hybrid Sphinx packet at a mix node.
+///
+/// Decapsulates this hop's KEM ciphertext, recombines with the classical
+/// DH share, and processes routing exactly like a classical hop.
+/// Rejects non-hybrid packets with [`SphinxError::UnsupportedVersion`].
+pub fn process_packet_hybrid(
+    node: &mut HybridMixNode,
+    packet: SphinxPacket,
+) -> Result<HybridProcessedPacket, SphinxError> {
+    let secret = node.kem.secret_bytes();
+    process_packet_hybrid_with_keys(&mut node.classical, &secret, packet)
+}
+
+/// Process a hybrid packet with a split key store
+///
+/// Same as [`process_packet_hybrid`] but takes the classical [`MixNode`]
+/// (replay tags live here, shared with the classical path) and the raw
+/// ML-KEM secret bytes separately. Transports that keep one mix node
+/// plus a standalone KEM pair use this entry point.
+pub fn process_packet_hybrid_with_keys(
+    classical: &mut MixNode,
+    kem_secret: &[u8],
+    packet: SphinxPacket,
+) -> Result<HybridProcessedPacket, SphinxError> {
+    if packet.header.version != SPHINX_VERSION_HYBRID {
+        return Err(SphinxError::UnsupportedVersion(packet.header.version));
+    }
+    if packet.header.routing_info.len() != ROUTING_INFO_SIZE {
+        return Err(SphinxError::InvalidPacketSize);
+    }
+    if packet.body.len() != BODY_SIZE {
+        return Err(SphinxError::InvalidPacketSize);
+    }
+    if packet.kem_ciphertexts.len() < KEM_CIPHERTEXT_SIZE
+        || packet.kem_ciphertexts.len() % KEM_CIPHERTEXT_SIZE != 0
+    {
+        return Err(SphinxError::InvalidKemCiphertext);
+    }
+
+    // Split off this hop's ciphertext; the rest forwards on.
+    let (our_ct, rest_cts) = packet.kem_ciphertexts.split_at(KEM_CIPHERTEXT_SIZE);
+
+    // Classical component
+    let alpha_point = MontgomeryPoint(packet.header.ephemeral_key);
+    let shared_point = &alpha_point * &classical.private_key;
+    let classical_shared = SymmetricKey::from_bytes(shared_point.0);
+
+    // Post-quantum component
+    let kem_shared = static_crypto::KemKeypair::decapsulate_with(kem_secret, our_ct)
+        .map_err(|_| SphinxError::InvalidKemCiphertext)?;
+
+    let hybrid_shared =
+        derive_hybrid_shared_secret(&classical_shared, &kem_shared, HYBRID_HOP_CONTEXT);
+    let keys = derive_hop_keys(&hybrid_shared);
+
+    // Check replay (shared tag space with classical path)
+    if classical.seen_tags.contains(&keys.tag) {
+        return Err(SphinxError::ReplayDetected);
+    }
+    classical.seen_tags.insert(keys.tag);
+
+    // Verify MAC
+    let first_slot: &[u8; SLOT_SIZE] = packet.header.routing_info[..SLOT_SIZE]
+        .try_into()
+        .map_err(|_| SphinxError::InvalidPacketSize)?;
+    let expected_mac = compute_mac(&keys.mac_key, &packet.header.ephemeral_key, first_slot);
+    if packet.header.mac != expected_mac {
+        return Err(SphinxError::MacVerificationFailed);
+    }
+
+    // Decrypt first routing block
+    let mut block = *first_slot;
+    xor_slot(&keys.stream_key, &mut block);
+
+    let mut next_hop = [0u8; NODE_ID_SIZE];
+    next_hop.copy_from_slice(&block[..NODE_ID_SIZE]);
+    let flag = RoutingFlag::try_from(block[NODE_ID_SIZE])?;
+    let mut next_mac = [0u8; MAC_SIZE];
+    next_mac.copy_from_slice(&block[NODE_ID_SIZE + FLAG_SIZE..]);
+
+    // Shift routing info left, fill with random padding
+    let mut new_routing_info = vec![0u8; ROUTING_INFO_SIZE];
+    new_routing_info[..ROUTING_INFO_SIZE - SLOT_SIZE]
+        .copy_from_slice(&packet.header.routing_info[SLOT_SIZE..]);
+    new_routing_info[ROUTING_INFO_SIZE - SLOT_SIZE..]
+        .copy_from_slice(&random_bytes(SLOT_SIZE));
+
+    // Blind ephemeral key for next hop
+    let blind = blinding_factor(&hybrid_shared);
+    let new_ephemeral = (&alpha_point * &blind).0;
+
+    // Peel one body encryption layer
+    let mut new_body = packet.body;
+    xor_body(&keys.body_key, &mut new_body);
+
+    match flag {
+        RoutingFlag::Destination => {
+            Ok(HybridProcessedPacket {
+                next_hop,
+                flag,
+                forward_packet: None,
+                body: Some(new_body),
+            })
+        }
+        RoutingFlag::Forward => {
+            let forward_header = SphinxHeader {
+                version: SPHINX_VERSION_HYBRID,
+                ephemeral_key: new_ephemeral,
+                routing_info: new_routing_info,
+                mac: next_mac,
+            };
+            let forward_packet = SphinxPacket {
+                header: forward_header,
+                kem_ciphertexts: rest_cts.to_vec(),
+                body: new_body,
+            };
+            Ok(HybridProcessedPacket {
                 next_hop,
                 flag,
                 forward_packet: Some(forward_packet),
@@ -713,5 +1084,136 @@ mod tests {
 
         let node2 = MixNode::from_private_key([0x42u8; 32], [0x11u8; NODE_ID_SIZE]);
         assert_eq!(node2.node_id, [0x11u8; NODE_ID_SIZE]);
+    }
+
+    fn create_hybrid_route(n: usize) -> (Vec<HybridMixNode>, HybridRoute) {
+        let mut nodes = Vec::with_capacity(n);
+        let mut hops = Vec::with_capacity(n);
+        for _ in 0..n {
+            let node = HybridMixNode::new();
+            hops.push(node.as_hop());
+            nodes.push(node);
+        }
+        let destination = random_node_id();
+        let route = HybridRoute { hops, destination };
+        (nodes, route)
+    }
+
+    #[test]
+    fn test_hybrid_sphinx_single_hop() {
+        let (mut nodes, route) = create_hybrid_route(1);
+        let body = b"hybrid hello";
+        let packet = create_packet_hybrid(&route, body).unwrap();
+
+        assert_eq!(packet.header.version, SPHINX_VERSION_HYBRID);
+        assert_eq!(packet.kem_ciphertexts.len(), KEM_CIPHERTEXT_SIZE);
+
+        let result = process_packet_hybrid(&mut nodes[0], packet).unwrap();
+        assert_eq!(result.flag, RoutingFlag::Destination);
+        assert_eq!(result.next_hop, route.destination);
+        assert!(result.forward_packet.is_none());
+
+        let decrypted = result.body.unwrap();
+        assert_eq!(&decrypted[..body.len()], body);
+    }
+
+    #[test]
+    fn test_hybrid_sphinx_multi_hop() {
+        let (mut nodes, route) = create_hybrid_route(3);
+        let body = b"hybrid multi hop";
+        let packet = create_packet_hybrid(&route, body).unwrap();
+        assert_eq!(packet.kem_ciphertexts.len(), 3 * KEM_CIPHERTEXT_SIZE);
+
+        let result0 = process_packet_hybrid(&mut nodes[0], packet).unwrap();
+        assert_eq!(result0.flag, RoutingFlag::Forward);
+        assert_eq!(result0.next_hop, nodes[1].node_id());
+        let fwd0 = result0.forward_packet.unwrap();
+        assert_eq!(fwd0.kem_ciphertexts.len(), 2 * KEM_CIPHERTEXT_SIZE);
+
+        let result1 = process_packet_hybrid(&mut nodes[1], fwd0).unwrap();
+        assert_eq!(result1.flag, RoutingFlag::Forward);
+        assert_eq!(result1.next_hop, nodes[2].node_id());
+
+        let result2 =
+            process_packet_hybrid(&mut nodes[2], result1.forward_packet.unwrap()).unwrap();
+        assert_eq!(result2.flag, RoutingFlag::Destination);
+
+        let decrypted = result2.body.unwrap();
+        assert_eq!(&decrypted[..body.len()], body);
+    }
+
+    #[test]
+    fn test_hybrid_sphinx_max_hops() {
+        let (mut nodes, route) = create_hybrid_route(MAX_HOPS);
+        let body = b"hybrid max hops";
+        let packet = create_packet_hybrid(&route, body).unwrap();
+
+        let mut current_packet = packet;
+        for i in 0..MAX_HOPS - 1 {
+            let result = process_packet_hybrid(&mut nodes[i], current_packet).unwrap();
+            assert_eq!(result.flag, RoutingFlag::Forward);
+            current_packet = result.forward_packet.unwrap();
+        }
+
+        let result = process_packet_hybrid(&mut nodes[MAX_HOPS - 1], current_packet).unwrap();
+        assert_eq!(result.flag, RoutingFlag::Destination);
+        assert_eq!(&result.body.unwrap()[..body.len()], body);
+    }
+
+    #[test]
+    fn test_hybrid_sphinx_replay_detection() {
+        let (mut nodes, route) = create_hybrid_route(1);
+        let body = b"hybrid replay";
+        let packet = create_packet_hybrid(&route, body).unwrap();
+
+        let result1 = process_packet_hybrid(&mut nodes[0], packet.clone()).unwrap();
+        assert_eq!(&result1.body.unwrap()[..body.len()], body);
+
+        let result2 = process_packet_hybrid(&mut nodes[0], packet);
+        assert!(matches!(result2, Err(SphinxError::ReplayDetected)));
+    }
+
+    #[test]
+    fn test_hybrid_sphinx_indistinguishability() {
+        let (_nodes, route) = create_hybrid_route(3);
+        let body = b"hybrid indistinguishability probe";
+        let packet = create_packet_hybrid(&route, body).unwrap();
+
+        // Ciphertext blobs look random (not all zeros, differ per packet)
+        assert!(packet.kem_ciphertexts.iter().any(|&b| b != 0));
+        let packet2 = create_packet_hybrid(&route, body).unwrap();
+        assert_ne!(packet.kem_ciphertexts, packet2.kem_ciphertexts);
+
+        // Body and routing info hide the plaintext
+        let body_bytes: &[u8] = body.as_ref();
+        assert_ne!(&packet.body[..body_bytes.len()], body_bytes);
+        assert!(packet.header.mac.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn test_classical_backward_compat() {
+        // Classical packets still route on plain MixNodes after versioning.
+        let (mut nodes, route) = create_route(2);
+        let body = b"legacy classical";
+        let packet = create_packet(&route, body).unwrap();
+        assert_eq!(packet.header.version, SPHINX_VERSION_CLASSICAL);
+        assert!(packet.kem_ciphertexts.is_empty());
+
+        let result0 = process_packet(&mut nodes[0], packet).unwrap();
+        assert_eq!(result0.flag, RoutingFlag::Forward);
+        let result1 =
+            process_packet(&mut nodes[1], result0.forward_packet.unwrap()).unwrap();
+        assert_eq!(&result1.body.unwrap()[..body.len()], body);
+
+        // Classical processor rejects hybrid packets (version routing).
+        let (mut hnodes, hroute) = create_hybrid_route(1);
+        let hpacket = create_packet_hybrid(&hroute, body).unwrap();
+        let err = process_packet(&mut nodes[0], hpacket).unwrap_err();
+        assert!(matches!(err, SphinxError::UnsupportedVersion(1)));
+
+        // Hybrid processor rejects classical packets.
+        let cpacket = create_packet(&route, body).unwrap();
+        let err = process_packet_hybrid(&mut hnodes[0], cpacket).unwrap_err();
+        assert!(matches!(err, SphinxError::UnsupportedVersion(0)));
     }
 }

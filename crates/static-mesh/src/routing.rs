@@ -26,6 +26,12 @@ pub struct KnownNode {
     pub public_key: [u8; 32],
     /// The node's network address
     pub address: String,
+    /// The node's ML-KEM-768 public key (for hybrid Sphinx)
+    ///
+    /// Learned via direct handshake. `None` for legacy peers or entries
+    /// learned via gossip (gossip strips KEM keys to bound message size).
+    #[serde(default)]
+    pub kem_public_key: Option<Vec<u8>>,
 }
 
 /// Peer gossip message
@@ -152,6 +158,10 @@ impl RoutingTable {
     }
 
     /// Create a gossip message containing a random sample of known peers
+    ///
+    /// KEM public keys are stripped from gossiped entries to bound message
+    /// size (each ML-KEM key is ~1 KiB). KEM keys propagate via direct
+    /// handshake only; hybrid routes use handshake-known peers.
     pub fn create_gossip(&self, max_peers: usize) -> PeerGossip {
         let mut nodes: Vec<&KnownNode> = self.nodes.values().collect();
         nodes.shuffle(&mut rand::thread_rng());
@@ -159,13 +169,55 @@ impl RoutingTable {
         let peers: Vec<KnownNode> = nodes
             .into_iter()
             .take(max_peers.min(MAX_GOSSIP_PEERS))
-            .cloned()
+            .map(|n| {
+                let mut stripped = n.clone();
+                stripped.kem_public_key = None;
+                stripped
+            })
             .collect();
 
         PeerGossip {
             from_node: self.our_node_id,
             peers,
         }
+    }
+
+    /// Build a hybrid Sphinx route to a destination
+    ///
+    /// Returns `None` unless every hop (intermediates plus destination)
+    /// has a known ML-KEM public key. Callers fall back to classical
+    /// [`RoutingTable::build_route_to`] when hybrid is unavailable, which
+    /// is what keeps mixed-version networks working.
+    pub fn build_hybrid_route_to(
+        &self,
+        destination: NodeId,
+        dest_public_key: [u8; 32],
+        dest_kem_public_key: &[u8],
+        hop_count: usize,
+    ) -> Option<static_sphinx::HybridRoute> {
+        let intermediates = self.random_route(hop_count)?;
+        for n in &intermediates {
+            if n.kem_public_key.is_none() {
+                return None;
+            }
+        }
+
+        let mut hops: Vec<static_sphinx::HybridRouteHop> = intermediates
+            .iter()
+            .map(|n| static_sphinx::HybridRouteHop {
+                node_id: n.node_id,
+                classical_public_key: n.public_key,
+                kem_public_key: n.kem_public_key.clone().unwrap_or_default(),
+            })
+            .collect();
+
+        hops.push(static_sphinx::HybridRouteHop {
+            node_id: destination,
+            classical_public_key: dest_public_key,
+            kem_public_key: dest_kem_public_key.to_vec(),
+        });
+
+        Some(static_sphinx::HybridRoute { hops, destination })
     }
 
     /// Process a received gossip message, adding new peers to our table
@@ -188,6 +240,21 @@ impl RoutingTable {
             node_id: node.node_id,
             public_key: node.public_key,
             address,
+            kem_public_key: None,
+        }
+    }
+
+    /// Create a KnownNode from a MixNode plus a KEM public key
+    pub fn node_from_mix_hybrid(
+        node: &MixNode,
+        kem_public_key: Vec<u8>,
+        address: String,
+    ) -> KnownNode {
+        KnownNode {
+            node_id: node.node_id,
+            public_key: node.public_key,
+            address,
+            kem_public_key: Some(kem_public_key),
         }
     }
 }
@@ -226,6 +293,7 @@ mod tests {
             node_id: random_node_id(),
             public_key: pub_key,
             address: "127.0.0.1:9000".to_string(),
+            kem_public_key: None,
         }
     }
 
@@ -258,6 +326,7 @@ mod tests {
             node_id: our_id,
             public_key: [0u8; 32],
             address: "127.0.0.1:9000".to_string(),
+            kem_public_key: None,
         };
 
         table.add_node(node);
@@ -398,6 +467,7 @@ mod tests {
                 node_id: our_id,
                 public_key: [0u8; 32],
                 address: "127.0.0.1:9000".to_string(),
+                kem_public_key: None,
             }],
         };
 
@@ -446,5 +516,58 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&node1.node_id));
         assert!(ids.contains(&node2.node_id));
+    }
+
+    #[test]
+    fn test_gossip_strips_kem_keys() {
+        let our_id = random_node_id();
+        let mut table = RoutingTable::new(our_id);
+
+        let mut node = random_known_node();
+        node.kem_public_key = Some(vec![0xAAu8; 1184]);
+        table.add_node(node);
+
+        let gossip = table.create_gossip(10);
+        assert_eq!(gossip.peers.len(), 1);
+        assert!(gossip.peers[0].kem_public_key.is_none());
+        // Local table retains the key.
+        assert!(table.nodes.values().next().unwrap().kem_public_key.is_some());
+    }
+
+    #[test]
+    fn test_build_hybrid_route_requires_kem_keys() {
+        use static_crypto::KemKeypair;
+
+        let dest_kem = KemKeypair::random().public_bytes();
+
+        // Table with only a KEM-less peer: hybrid unavailable.
+        let mut classical_only = RoutingTable::new(random_node_id());
+        let mut plain = random_known_node();
+        plain.node_id = [0x01u8; 16];
+        classical_only.add_node(plain);
+        assert!(classical_only
+            .build_hybrid_route_to([0xFFu8; 16], [0xEEu8; 32], &dest_kem, 1)
+            .is_none());
+        // Classical route still works (backward compat).
+        assert!(classical_only
+            .build_route_to([0xFFu8; 16], [0xEEu8; 32], 1)
+            .is_some());
+
+        // Table where every peer has a KEM key: hybrid route builds.
+        let mut hybrid_table = RoutingTable::new(random_node_id());
+        for i in 0..3u8 {
+            let mut keyed = random_known_node();
+            keyed.node_id = [i + 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            keyed.kem_public_key = Some(KemKeypair::random().public_bytes());
+            hybrid_table.add_node(keyed);
+        }
+        let hybrid = hybrid_table
+            .build_hybrid_route_to([0xFFu8; 16], [0xEEu8; 32], &dest_kem, 2)
+            .unwrap();
+        assert_eq!(hybrid.hops.len(), 3); // 2 intermediates + destination
+        assert!(hybrid
+            .hops
+            .iter()
+            .all(|h| h.kem_public_key.len() == 1184));
     }
 }

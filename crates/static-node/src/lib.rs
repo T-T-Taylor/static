@@ -72,9 +72,21 @@ pub struct NodeConfig {
     pub mode: NodeMode,
     /// Sponsor peer address (required for seed-only mode)
     pub sponsor: Option<String>,
+    /// Whether to use post-quantum hybrid Sphinx packets
+    ///
+    /// When true (default for new nodes), cover traffic and retrieval
+    /// forward requests use hybrid v1 packets whenever the peer's KEM
+    /// key is known, falling back to classical v0 otherwise.
+    #[serde(default = "default_hybrid_crypto")]
+    pub use_hybrid_crypto: bool,
     /// Hot storage rotation configuration (Freenet-style migration/caching)
     #[serde(default = "default_rotation_config")]
     pub rotation_config: static_storage::rotation::RotationConfig,
+}
+
+/// Default for `NodeConfig::use_hybrid_crypto`: new nodes opt into hybrid
+fn default_hybrid_crypto() -> bool {
+    true
 }
 
 /// Default for `NodeConfig::rotation_config`
@@ -96,6 +108,7 @@ impl Default for NodeConfig {
             max_storage_bytes: 10 * 1024 * 1024 * 1024, // 10 GB
             mode: NodeMode::Full,
             sponsor: None,
+            use_hybrid_crypto: default_hybrid_crypto(),
             rotation_config: default_rotation_config(),
         }
     }
@@ -157,6 +170,7 @@ impl StaticNode {
             interval_ms: self.config.cover_traffic_interval_ms,
             enabled: self.config.cover_traffic_enabled,
             tier: self.config.tier,
+            use_hybrid: self.config.use_hybrid_crypto,
         };
         self.mesh.cover_traffic.update_config(cover_config);
 

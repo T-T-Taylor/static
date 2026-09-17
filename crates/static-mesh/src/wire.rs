@@ -15,6 +15,7 @@ use static_storage::swap::{SwapProposal, SwapAccept, SwapReject};
 use static_sphinx::{
     SphinxPacket, SphinxHeader, NodeId,
     BODY_SIZE, ROUTING_INFO_SIZE, EPHEMERAL_KEY_SIZE, MAC_SIZE,
+    SPHINX_VERSION_CLASSICAL, HYBRID_KEM_CIPHERTEXT_SIZE, MAX_HOPS,
 };
 use bytes::{BufMut, BytesMut};
 
@@ -50,7 +51,20 @@ pub const MSG_ACCOUNTING_RECONCILIATION: u8 = 0x08;
 pub const MAX_RECONCILIATION_ENTRIES: usize = 50;
 
 /// Maximum message size (header + body + framing overhead)
-pub const MAX_MESSAGE_SIZE: usize = 1 + 4 + EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE;
+///
+/// Sized for a versioned classical Sphinx packet: outer framing plus the
+/// version byte, ephemeral key, kem-length prefix, routing info, MAC, body.
+pub const MAX_MESSAGE_SIZE: usize = 1 + 4 + 1 + 4 + EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE;
+
+/// Maximum hybrid message size
+///
+/// Hybrid v1 Sphinx packets additionally carry up to `MAX_HOPS` ML-KEM
+/// ciphertexts (1088 bytes each): 1-byte version + u32 kem length +
+/// ciphertexts on top of the classical layout.
+pub const HYBRID_MAX_MESSAGE_SIZE: usize = MAX_MESSAGE_SIZE
+    + 1
+    + 4
+    + static_sphinx::MAX_HOPS * static_sphinx::HYBRID_KEM_CIPHERTEXT_SIZE;
 
 /// A handshake message exchanged when peers connect
 #[derive(Debug, Clone)]
@@ -61,6 +75,11 @@ pub struct Handshake {
     pub public_key: [u8; 32],
     /// The sending node's bandwidth tier
     pub tier: crate::BandwidthTier,
+    /// The sending node's ML-KEM-768 public key (for hybrid Sphinx)
+    ///
+    /// `None` for legacy (classical-only) peers. Serialized as trailing
+    /// bytes: absent in 49-byte legacy handshakes, present afterwards.
+    pub kem_public_key: Option<Vec<u8>>,
 }
 
 /// A wire message
@@ -191,10 +210,14 @@ pub enum WireError {
 
 /// Serialize a handshake message into a bytes buffer
 fn serialize_handshake(handshake: &Handshake) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(16 + 32 + 1);
+    let kem_len = handshake.kem_public_key.as_ref().map(|k| k.len()).unwrap_or(0);
+    let mut buf = Vec::with_capacity(16 + 32 + 1 + kem_len);
     buf.extend_from_slice(&handshake.node_id);
     buf.extend_from_slice(&handshake.public_key);
     buf.push(handshake.tier as u8);
+    if let Some(kem) = &handshake.kem_public_key {
+        buf.extend_from_slice(kem);
+    }
     buf
 }
 
@@ -220,17 +243,37 @@ fn deserialize_handshake(data: &[u8]) -> Result<Handshake, WireError> {
         _ => return Err(WireError::InvalidMessageType(data[48])), // Reusing error type for simplicity
     };
 
-    Ok(Handshake { node_id, public_key, tier })
+    // Trailing bytes (if any) are the peer's ML-KEM public key.
+    // Legacy 49-byte handshakes carry no KEM key (classical-only peer).
+    let kem_public_key = if data.len() > 49 {
+        Some(data[49..].to_vec())
+    } else {
+        None
+    };
+
+    Ok(Handshake { node_id, public_key, tier, kem_public_key })
 }
 
 /// Serialize a Sphinx packet into a bytes buffer
+///
+/// Versioned format (v0/v1 emit the same layout; legacy decoders that
+/// expect the unversioned layout are handled on the receive side):
+/// `[1 byte version][32 ephemeral][4 kem_len][kem bytes][routing][16 mac][body]`.
+/// Classical packets carry an empty kem section.
 fn serialize_sphinx(packet: &SphinxPacket) -> Vec<u8> {
     let mut buf = Vec::with_capacity(
-        EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE
+        1 + 4 + EPHEMERAL_KEY_SIZE + packet.kem_ciphertexts.len() + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE
     );
+
+    // Packet version (0 = classical, 1 = hybrid)
+    buf.push(packet.header.version);
 
     // Ephemeral key (32 bytes)
     buf.extend_from_slice(&packet.header.ephemeral_key);
+
+    // ML-KEM ciphertexts (length-prefixed; empty for classical)
+    buf.extend_from_slice(&(packet.kem_ciphertexts.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&packet.kem_ciphertexts);
 
     // Routing info (fixed size)
     buf.extend_from_slice(&packet.header.routing_info);
@@ -245,20 +288,74 @@ fn serialize_sphinx(packet: &SphinxPacket) -> Vec<u8> {
 }
 
 /// Deserialize a Sphinx packet from a bytes buffer
+///
+/// Accepts both the legacy unversioned layout (exact classical length,
+/// no version prefix — emitted by pre-upgrade peers) and the versioned
+/// layout. Hybrid ciphertext length must be a multiple of the KEM
+/// ciphertext size and fit within the hop limit.
 fn deserialize_sphinx(data: &[u8]) -> Result<SphinxPacket, WireError> {
-    let expected_len = EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE;
-    if data.len() < expected_len {
+    let legacy_len = EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE;
+    if data.len() == legacy_len {
+        // Legacy pre-upgrade packet: classical, no version prefix.
+        let mut offset = 0;
+
+        let mut ephemeral_key = [0u8; EPHEMERAL_KEY_SIZE];
+        ephemeral_key.copy_from_slice(&data[offset..offset + EPHEMERAL_KEY_SIZE]);
+        offset += EPHEMERAL_KEY_SIZE;
+
+        let routing_info = data[offset..offset + ROUTING_INFO_SIZE].to_vec();
+        offset += ROUTING_INFO_SIZE;
+
+        let mut mac = [0u8; MAC_SIZE];
+        mac.copy_from_slice(&data[offset..offset + MAC_SIZE]);
+        offset += MAC_SIZE;
+
+        let body = data[offset..offset + BODY_SIZE].to_vec();
+
+        let header = SphinxHeader {
+            version: SPHINX_VERSION_CLASSICAL,
+            ephemeral_key,
+            routing_info,
+            mac,
+        };
+
+        return Ok(SphinxPacket { header, kem_ciphertexts: Vec::new(), body });
+    }
+
+    let min_len = 1 + EPHEMERAL_KEY_SIZE + 4 + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE;
+    if data.len() < min_len {
         return Err(WireError::BufferTooShort {
-            needed: expected_len,
+            needed: min_len,
             have: data.len(),
         });
     }
 
     let mut offset = 0;
+    let version = data[offset];
+    offset += 1;
 
     let mut ephemeral_key = [0u8; EPHEMERAL_KEY_SIZE];
     ephemeral_key.copy_from_slice(&data[offset..offset + EPHEMERAL_KEY_SIZE]);
     offset += EPHEMERAL_KEY_SIZE;
+
+    let kem_len =
+        u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
+            as usize;
+    offset += 4;
+
+    if kem_len % HYBRID_KEM_CIPHERTEXT_SIZE != 0
+        || kem_len / HYBRID_KEM_CIPHERTEXT_SIZE > MAX_HOPS
+    {
+        return Err(WireError::InvalidSphinxPacket);
+    }
+    if data.len() < offset + kem_len + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE {
+        return Err(WireError::BufferTooShort {
+            needed: offset + kem_len + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE,
+            have: data.len(),
+        });
+    }
+    let kem_ciphertexts = data[offset..offset + kem_len].to_vec();
+    offset += kem_len;
 
     let routing_info = data[offset..offset + ROUTING_INFO_SIZE].to_vec();
     offset += ROUTING_INFO_SIZE;
@@ -270,12 +367,13 @@ fn deserialize_sphinx(data: &[u8]) -> Result<SphinxPacket, WireError> {
     let body = data[offset..offset + BODY_SIZE].to_vec();
 
     let header = SphinxHeader {
+        version,
         ephemeral_key,
         routing_info,
         mac,
     };
 
-    Ok(SphinxPacket { header, body })
+    Ok(SphinxPacket { header, kem_ciphertexts, body })
 }
 
 /// Serialize a wire message into a framed byte buffer
@@ -294,10 +392,16 @@ pub fn serialize_message(msg: &WireMessage) -> Result<Vec<u8>, WireError> {
     };
 
     let total_len = 1 + 4 + payload.len();
-    if total_len > MAX_MESSAGE_SIZE {
+    // Sphinx packets have their own (larger, version-aware) cap since
+    // hybrid packets carry ML-KEM ciphertexts.
+    let max = match msg {
+        WireMessage::Sphinx(_) => HYBRID_MAX_MESSAGE_SIZE,
+        _ => MAX_MESSAGE_SIZE,
+    };
+    if total_len > max {
         return Err(WireError::MessageTooLarge {
             size: total_len,
-            max: MAX_MESSAGE_SIZE,
+            max,
         });
     }
 
@@ -437,6 +541,7 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
             node_id: [0x42u8; 16],
             public_key: [0xABu8; 32],
             tier: crate::BandwidthTier::Standard,
+            kem_public_key: None,
         };
 
         let serialized = serialize_handshake(&hs);
@@ -445,6 +550,7 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
         let deserialized = deserialize_handshake(&serialized).unwrap();
         assert_eq!(deserialized.node_id, hs.node_id);
         assert_eq!(deserialized.public_key, hs.public_key);
+        assert!(deserialized.kem_public_key.is_none());
     }
 
     #[test]
@@ -498,6 +604,7 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
             node_id: [0x42u8; 16],
             public_key: [0xABu8; 32],
             tier: crate::BandwidthTier::Standard,
+            kem_public_key: None,
         };
         let msg = WireMessage::Handshake(hs);
 
@@ -549,6 +656,7 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
             node_id: [0x42u8; 16],
             public_key: [0xABu8; 32],
             tier: crate::BandwidthTier::Standard,
+            kem_public_key: None,
         };
         let msg = WireMessage::Handshake(hs);
         let serialized = serialize_message(&msg).unwrap();
@@ -565,6 +673,7 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
             node_id: [0x42u8; 16],
             public_key: [0xABu8; 32],
             tier: crate::BandwidthTier::Standard,
+            kem_public_key: None,
         };
         let msg = WireMessage::Handshake(hs);
         let serialized = serialize_message(&msg).unwrap();
@@ -582,11 +691,13 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
             node_id: [0x01u8; 16],
             public_key: [0x01u8; 32],
             tier: crate::BandwidthTier::Standard,
+            kem_public_key: None,
         };
         let hs2 = Handshake {
             node_id: [0x02u8; 16],
             public_key: [0x02u8; 32],
             tier: crate::BandwidthTier::Standard,
+            kem_public_key: None,
         };
 
         let mut buf = BytesMut::new();
@@ -637,6 +748,74 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
 
         let serialized = serialize_message(&msg).unwrap();
         assert!(serialized.len() <= MAX_MESSAGE_SIZE);
+    }
+
+    #[test]
+    fn test_sphinx_versioned_roundtrip() {
+        let (_nodes, route) = create_test_route(2);
+        let packet = create_packet(&route, b"versioned").unwrap();
+        assert_eq!(packet.header.version, static_sphinx::SPHINX_VERSION_CLASSICAL);
+
+        let serialized = serialize_sphinx(&packet);
+        // Versioned encoding carries the version prefix (not legacy length).
+        assert!(serialized.len() > EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE);
+        let back = deserialize_sphinx(&serialized).unwrap();
+        assert_eq!(back.header.version, packet.header.version);
+        assert!(back.kem_ciphertexts.is_empty());
+        assert_eq!(back.body, packet.body);
+    }
+
+    #[test]
+    fn test_sphinx_legacy_decode() {
+        // Pre-upgrade peers emit the unversioned layout; it must still parse
+        // as a classical packet.
+        let mut legacy = vec![0x11u8; EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE];
+        let packet = deserialize_sphinx(&legacy).unwrap();
+        assert_eq!(packet.header.version, static_sphinx::SPHINX_VERSION_CLASSICAL);
+        assert!(packet.kem_ciphertexts.is_empty());
+        legacy.push(0x00);
+        // One byte too many matches neither layout.
+        assert!(deserialize_sphinx(&legacy).is_err());
+    }
+
+    #[test]
+    fn test_hybrid_sphinx_wire_roundtrip() {
+        use static_sphinx::{HybridMixNode, HybridRoute, create_packet_hybrid};
+        let mut nodes = vec![HybridMixNode::new(), HybridMixNode::new()];
+        let route = HybridRoute {
+            hops: vec![nodes[0].as_hop(), nodes[1].as_hop()],
+            destination: [0x77u8; 16],
+        };
+        let packet = create_packet_hybrid(&route, b"hybrid wire").unwrap();
+        let msg = WireMessage::Sphinx(packet.clone());
+        let serialized = serialize_message(&msg).unwrap();
+        assert!(serialized.len() <= HYBRID_MAX_MESSAGE_SIZE);
+        let (back, consumed) = deserialize_message(&serialized).unwrap();
+        assert_eq!(consumed, serialized.len());
+        match back {
+            WireMessage::Sphinx(p) => {
+                assert_eq!(p.header.version, static_sphinx::SPHINX_VERSION_HYBRID);
+                assert_eq!(p.kem_ciphertexts, packet.kem_ciphertexts);
+                assert_eq!(p.body, packet.body);
+            }
+            _ => panic!("expected sphinx"),
+        }
+        let _ = &mut nodes;
+    }
+
+    #[test]
+    fn test_handshake_kem_roundtrip() {
+        let kem = vec![0x55u8; static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE];
+        let hs = Handshake {
+            node_id: [0x42u8; 16],
+            public_key: [0xABu8; 32],
+            tier: crate::BandwidthTier::Standard,
+            kem_public_key: Some(kem.clone()),
+        };
+        let serialized = serialize_handshake(&hs);
+        assert_eq!(serialized.len(), 49 + kem.len());
+        let back = deserialize_handshake(&serialized).unwrap();
+        assert_eq!(back.kem_public_key, Some(kem));
     }
 
     #[test]

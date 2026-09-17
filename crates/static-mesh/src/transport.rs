@@ -18,7 +18,7 @@ use static_storage::swap::{SwapState, StorageCapacity, decide_on_swap, create_sw
 use static_storage::retrieval::ChunkHolder;
 use crate::wire::{
     self, WireMessage, Handshake,
-    try_read_message, write_message, MAX_MESSAGE_SIZE,
+    try_read_message, write_message, HYBRID_MAX_MESSAGE_SIZE,
 };
 use static_sphinx::{
     SphinxPacket, MixNode, process_packet, RoutingFlag,
@@ -40,8 +40,8 @@ pub const NODE_ID_SIZE: usize = 16;
 /// Channel buffer size for messages
 pub const CHANNEL_BUFFER: usize = 256;
 
-/// Read buffer size
-pub const READ_BUFFER_SIZE: usize = MAX_MESSAGE_SIZE + 1024;
+/// Read buffer size (fits the largest hybrid message plus framing slack)
+pub const READ_BUFFER_SIZE: usize = HYBRID_MAX_MESSAGE_SIZE + 1024;
 
 /// A connection to a peer
 pub struct PeerConnection {
@@ -87,6 +87,8 @@ pub struct TransportState {
     pub storage_key: Arc<Mutex<static_crypto::SymmetricKey>>,
     /// Chunks this node is holding
     pub chunk_holder: Arc<Mutex<ChunkHolder>>,
+    /// This node's ML-KEM-768 keypair (advertised in handshakes)
+    pub kem: Arc<Mutex<static_crypto::KemKeypair>>,
     /// Node IDs previously connected but since disconnected
     ///
     /// Used to distinguish partition heals (reconnections) from
@@ -182,6 +184,7 @@ pub async fn handle_incoming_connection(
                         node_id: state.node_id,
                         public_key: state.mix_node.lock().await.public_key,
                         tier: state.cover_config.read().await.tier,
+                        kem_public_key: Some(state.kem.lock().await.public_bytes()),
                     });
                     
                     let mut write_buf = bytes::BytesMut::new();
@@ -200,6 +203,7 @@ pub async fn handle_incoming_connection(
                         node_id: hs.node_id,
                         public_key: hs.public_key,
                         address: addr.to_string(),
+                        kem_public_key: hs.kem_public_key.clone(),
                     });
 
                     // Set up connection
@@ -283,6 +287,7 @@ pub async fn connect_to_peer(
         node_id: state.node_id,
         public_key: state.mix_node.lock().await.public_key,
         tier: state.cover_config.read().await.tier,
+        kem_public_key: Some(state.kem.lock().await.public_bytes()),
     });
 
     let mut write_buf = bytes::BytesMut::new();
@@ -311,6 +316,7 @@ pub async fn connect_to_peer(
                         node_id: hs.node_id,
                         public_key: hs.public_key,
                         address: addr.to_string(),
+                        kem_public_key: hs.kem_public_key.clone(),
                     });
 
                     let (tx, rx) = mpsc::channel::<WireMessage>(CHANNEL_BUFFER);
@@ -416,6 +422,22 @@ async fn read_loop(
     // not a first-time connection.
     state.previously_connected.write().await.insert(peer_id);
     state.connections.write().await.remove(&peer_id);
+}
+
+/// Normalized result of one Sphinx hop (classical or hybrid)
+///
+/// Both [`process_packet`] and `process_packet_hybrid_with_keys` produce
+/// the same routing outcome; this lets the delivery logic below stay
+/// version-agnostic.
+struct HopOutcome {
+    /// The routing flag
+    flag: RoutingFlag,
+    /// The next hop's node ID
+    next_hop: NodeId,
+    /// The packet to forward (None if destination)
+    forward_packet: Option<SphinxPacket>,
+    /// The decrypted body (Some only at destination)
+    body: Option<Vec<u8>>,
 }
 
 /// Handle an incoming message from a peer
@@ -565,15 +587,40 @@ async fn handle_message(
                 .await;
         }
         WireMessage::Sphinx(packet) => {
-            // Process the Sphinx packet through our mix node
-            let mut mix_node = state.mix_node.lock().await;
-            let result = process_packet(&mut mix_node, packet)?;
-            drop(mix_node);
+            // Version dispatch: v0 → classical X25519, v1 → hybrid
+            // X25519 + ML-KEM (both required to recover hop keys).
+            let outcome = if packet.header.version == static_sphinx::SPHINX_VERSION_HYBRID {
+                let kem_secret = state.kem.lock().await.secret_bytes();
+                let mut mix_node = state.mix_node.lock().await;
+                let result = static_sphinx::process_packet_hybrid_with_keys(
+                    &mut mix_node,
+                    &kem_secret,
+                    packet,
+                )?;
+                drop(mix_node);
+                HopOutcome {
+                    flag: result.flag,
+                    next_hop: result.next_hop,
+                    forward_packet: result.forward_packet,
+                    body: result.body,
+                }
+            } else {
+                // Process the Sphinx packet through our mix node
+                let mut mix_node = state.mix_node.lock().await;
+                let result = process_packet(&mut mix_node, packet)?;
+                drop(mix_node);
+                HopOutcome {
+                    flag: result.flag,
+                    next_hop: result.next_hop,
+                    forward_packet: result.forward_packet,
+                    body: result.body,
+                }
+            };
 
-            match result.flag {
+            match outcome.flag {
                 RoutingFlag::Destination => {
                     // We are the destination - try to handle as chunk request
-                    if let Some(body) = result.body {
+                    if let Some(body) = outcome.body {
                         println!("[HANDLE_MSG] Destination reached, body len: {}", body.len());
                         
                         // Try to parse as a chunk request
@@ -617,10 +664,12 @@ async fn handle_message(
                                     from,
                                     message: WireMessage::Sphinx(SphinxPacket {
                                         header: static_sphinx::SphinxHeader {
+                                            version: static_sphinx::SPHINX_VERSION_CLASSICAL,
                                             ephemeral_key: [0u8; 32],
                                             routing_info: vec![],
                                             mac: [0u8; 16],
                                         },
+                                        kem_ciphertexts: Vec::new(),
                                         body,
                                     }),
                                     is_reconnection: false,
@@ -631,8 +680,8 @@ async fn handle_message(
                 }
                 RoutingFlag::Forward => {
                     // Forward to the next hop
-                    if let Some(forward_packet) = result.forward_packet {
-                        let next_hop = result.next_hop;
+                    if let Some(forward_packet) = outcome.forward_packet {
+                        let next_hop = outcome.next_hop;
                         let connections = state.connections.read().await;
                         
                         if let Some(sender) = connections.get(&next_hop) {
@@ -697,20 +746,12 @@ async fn write_loop(
                 let remaining = target_bytes_per_interval.saturating_sub(bytes_this_interval);
                 
                 if remaining > 0 && cover_config.enabled {
-                    // Generate cover traffic
-                    let dummy = generate_cover_packet(remaining as usize);
+                    // Generate cover traffic matching the configured packet
+                    // version: hybrid nodes emit v1-sized dummies (with
+                    // placeholder KEM ciphertexts) so cover is
+                    // indistinguishable from real traffic of that version.
+                    let dummy_msg = dummy_sphinx_message(cover_config.use_hybrid, remaining as usize);
                     let mut buf = bytes::BytesMut::new();
-                    
-                    // Create a dummy Sphinx-like message
-                    let dummy_msg = WireMessage::Sphinx(SphinxPacket {
-                        header: static_sphinx::SphinxHeader {
-                            ephemeral_key: dummy[..32].try_into().unwrap_or([0u8; 32]),
-                            routing_info: dummy[32..32 + static_sphinx::ROUTING_INFO_SIZE].to_vec(),
-                            mac: dummy[32 + static_sphinx::ROUTING_INFO_SIZE..32 + static_sphinx::ROUTING_INFO_SIZE + 16]
-                                .try_into().unwrap_or([0u8; 16]),
-                        },
-                        body: dummy[32 + static_sphinx::ROUTING_INFO_SIZE + 16..].to_vec(),
-                    });
 
                     if write_message(&mut buf, &dummy_msg).is_err() {
                         continue;
@@ -740,6 +781,60 @@ fn generate_cover_packet(size: usize) -> Vec<u8> {
     let mut packet = vec![0u8; size];
     rand::rngs::OsRng.fill_bytes(&mut packet);
     packet
+}
+
+/// Build a dummy Sphinx message for cover traffic
+///
+/// The dummy matches the configured packet version's wire size: classical
+/// dummies are fixed-size v0 packets, hybrid dummies are v1 packets sized
+/// to `budget` (up to the 5-hop hybrid maximum) with random KEM bytes.
+/// Field slicing is bounds-checked so small budgets cannot panic.
+fn dummy_sphinx_message(use_hybrid: bool, budget: usize) -> WireMessage {
+    use rand::RngCore;
+
+    if !use_hybrid {
+        let dummy = generate_cover_packet(
+            32 + static_sphinx::ROUTING_INFO_SIZE + 16 + static_sphinx::BODY_SIZE,
+        );
+        let routing_end = 32 + static_sphinx::ROUTING_INFO_SIZE;
+        let mac_end = routing_end + 16;
+        return WireMessage::Sphinx(SphinxPacket {
+            header: static_sphinx::SphinxHeader {
+                version: static_sphinx::SPHINX_VERSION_CLASSICAL,
+                ephemeral_key: dummy[..32].try_into().unwrap_or([0u8; 32]),
+                routing_info: dummy[32..routing_end].to_vec(),
+                mac: dummy[routing_end..mac_end].try_into().unwrap_or([0u8; 16]),
+            },
+            kem_ciphertexts: Vec::new(),
+            body: dummy[mac_end..].to_vec(),
+        });
+    }
+
+    // Hybrid dummy: fill the budget with version + ephemeral + as many
+    // whole KEM ciphertexts as fit (capped at MAX_HOPS), random bytes
+    // throughout. Validity is not required — only wire-size realism.
+    let max_kem = static_sphinx::MAX_HOPS * static_sphinx::HYBRID_KEM_CIPHERTEXT_SIZE;
+    let fixed = 32 + static_sphinx::ROUTING_INFO_SIZE + 16 + static_sphinx::BODY_SIZE;
+    let kem_budget = budget.saturating_sub(fixed + 1 + 4);
+    let kem_len = (kem_budget / static_sphinx::HYBRID_KEM_CIPHERTEXT_SIZE
+        * static_sphinx::HYBRID_KEM_CIPHERTEXT_SIZE)
+        .min(max_kem);
+    let total = fixed + kem_len;
+    let mut dummy = vec![0u8; total.max(32)];
+    rand::rngs::OsRng.fill_bytes(&mut dummy);
+    let routing_end = 32 + static_sphinx::ROUTING_INFO_SIZE;
+    let mac_end = routing_end + 16;
+
+    WireMessage::Sphinx(SphinxPacket {
+        header: static_sphinx::SphinxHeader {
+            version: static_sphinx::SPHINX_VERSION_HYBRID,
+            ephemeral_key: dummy[..32].try_into().unwrap_or([0u8; 32]),
+            routing_info: dummy.get(32..routing_end).unwrap_or(&[]).to_vec(),
+            mac: dummy.get(routing_end..mac_end).unwrap_or(&[]).try_into().unwrap_or([0u8; 16]),
+        },
+        kem_ciphertexts: dummy.get(mac_end..mac_end + kem_len).unwrap_or(&[]).to_vec(),
+        body: dummy.get(mac_end + kem_len..).unwrap_or(&[]).to_vec(),
+    })
 }
 
 /// Background loop to periodically gossip known peers to connected peers
@@ -822,6 +917,7 @@ pub fn create_transport_state(
         storage_capacity,
         storage_key: Arc::new(Mutex::new(storage_key)),
         chunk_holder: Arc::new(Mutex::new(chunk_holder)),
+        kem: Arc::new(Mutex::new(static_crypto::KemKeypair::random())),
         previously_connected: Arc::new(RwLock::new(HashSet::new())),
     });
 

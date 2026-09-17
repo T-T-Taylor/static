@@ -23,6 +23,7 @@ use static_sphinx::{
     Route, SphinxPacket, create_packet, process_packet, RoutingFlag,
     BODY_SIZE, MixNode,
 };
+use static_sphinx::{HybridRoute, create_packet_hybrid};
 use static_storage::ChunkId;
 use static_storage::retrieval::{
     ChunkRequest, ChunkResponse, ReturnRoute,
@@ -151,6 +152,42 @@ pub fn create_anonymous_request(
 
     // Wrap in a Sphinx packet using the forward route
     let packet = create_packet(forward_route, &request_bytes)
+        .map_err(|_| RetrievalError::SphinxError)?;
+
+    Ok(packet)
+}
+
+/// Create an anonymous chunk request with a hybrid forward packet
+///
+/// Identical to [`create_anonymous_request`] except the forward packet
+/// uses hybrid (v1) key agreement. The return route stays classical so
+/// the request still fits in one body; the forward and return packets
+/// are independent, so mixing versions is safe. Falls back to the
+/// classical constructor when the forward peer's KEM key is unknown —
+/// callers should only pass routes built from handshake-known keys.
+pub fn create_anonymous_request_hybrid(
+    chunk_id: ChunkId,
+    return_route: &Route,
+    forward_route: &HybridRoute,
+) -> Result<SphinxPacket, RetrievalError> {
+    // Create the return route info
+    let return_info = ReturnRoute::from_sphinx_route(return_route);
+
+    // Create the chunk request
+    let request = ChunkRequest {
+        chunk_id,
+        return_route: return_info,
+    };
+
+    // Serialize the request
+    let request_bytes = serialize_request(&request);
+
+    if request_bytes.len() > BODY_SIZE {
+        return Err(RetrievalError::RequestTooLarge);
+    }
+
+    // Wrap in a hybrid Sphinx packet using the forward route
+    let packet = create_packet_hybrid(forward_route, &request_bytes)
         .map_err(|_| RetrievalError::SphinxError)?;
 
     Ok(packet)

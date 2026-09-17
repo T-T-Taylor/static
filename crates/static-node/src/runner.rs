@@ -93,6 +93,7 @@ impl NodeRunner {
             interval_ms: config.cover_traffic_interval_ms,
             enabled: cover_enabled,
             tier: config.tier,
+            use_hybrid: config.use_hybrid_crypto,
         };
 
         // One shared capacity counter for the whole node: the swap
@@ -869,6 +870,46 @@ impl NodeRunner {
         Ok((content_id, manifest, content_pub_key))
     }
 
+    /// Build a forward anonymous request, preferring hybrid key agreement
+    ///
+    /// When `use_hybrid` is set and the forward peer's ML-KEM key is known
+    /// (learned via handshake), the forward packet uses hybrid v1 key
+    /// agreement. The return route stays classical so the request fits in
+    /// one body; versions are per-packet, so mixing is safe. Falls back
+    /// to classical v0 otherwise (mixed-version networks keep working).
+    fn build_forward_request(
+        chunk_id: ChunkId,
+        peer: &static_mesh::routing::KnownNode,
+        return_route: &Route,
+        forward_route: &Route,
+        use_hybrid: bool,
+    ) -> anyhow::Result<static_sphinx::SphinxPacket> {
+        if use_hybrid {
+            if let Some(kem) = peer.kem_public_key.as_ref().filter(|k| {
+                k.len() == static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE
+            }) {
+                let hybrid_forward = static_sphinx::HybridRoute {
+                    hops: vec![static_sphinx::HybridRouteHop {
+                        node_id: peer.node_id,
+                        classical_public_key: peer.public_key,
+                        kem_public_key: kem.clone(),
+                    }],
+                    destination: peer.node_id,
+                };
+                return Ok(static_mesh::retrieval::create_anonymous_request_hybrid(
+                    chunk_id,
+                    return_route,
+                    &hybrid_forward,
+                )?);
+            }
+        }
+        Ok(static_mesh::retrieval::create_anonymous_request(
+            chunk_id,
+            return_route,
+            forward_route,
+        )?)
+    }
+
     /// Retrieve content from the network using the hidden service model
     pub async fn retrieve_content(
         &self,
@@ -900,10 +941,12 @@ impl NodeRunner {
         };
 
         // We request the content_id itself, as the publisher stored the encrypted manifest there
-        let request_packet = static_mesh::retrieval::create_anonymous_request(
+        let request_packet = Self::build_forward_request(
             content_id,
+            peer,
             &return_route,
             &forward_route,
+            self.config.use_hybrid_crypto,
         )?;
 
         static_mesh::transport::send_sphinx(&self.transport, peer.node_id, request_packet).await?;
@@ -989,7 +1032,13 @@ impl NodeRunner {
         // For missing chunks, send requests to peers
         let pending_ids: Vec<ChunkId> = content_retriever.pending.keys().cloned().collect();
         for chunk_id in &pending_ids {
-            let request_packet = static_mesh::retrieval::create_anonymous_request(*chunk_id, &return_route, &forward_route)?;
+            let request_packet = Self::build_forward_request(
+                *chunk_id,
+                peer,
+                &return_route,
+                &forward_route,
+                self.config.use_hybrid_crypto,
+            )?;
             static_mesh::transport::send_sphinx(&self.transport, peer.node_id, request_packet).await?;
         }
 

@@ -46,7 +46,7 @@
 - Improves deniability (no node holds same chunks long-term)
 - Enables load balancing and self-healing
 
-### 7. Post-Quantum Hybrid Crypto
+### 7. Post-Quantum Hybrid Crypto ✅ DONE
 - Current: X25519 (NOT post-quantum), ChaCha20-Poly1305 (quantum-resistant)
 - Add ML-KEM (Kyber) alongside X25519 for hybrid key agreement
 - Security against both classical and quantum attackers

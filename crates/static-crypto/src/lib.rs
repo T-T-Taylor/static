@@ -85,6 +85,119 @@ impl DhKeypair {
     }
 }
 
+/// Size of an ML-KEM-768 (Kyber768) public key in bytes
+pub const KEM_PUBLIC_KEY_SIZE: usize = pqc_kyber::KYBER_PUBLICKEYBYTES;
+
+/// Size of an ML-KEM-768 ciphertext in bytes
+pub const KEM_CIPHERTEXT_SIZE: usize = pqc_kyber::KYBER_CIPHERTEXTBYTES;
+
+/// Size of an ML-KEM-768 shared secret in bytes
+pub const KEM_SHARED_SECRET_SIZE: usize = pqc_kyber::KYBER_SSBYTES;
+
+/// An ML-KEM-768 keypair for post-quantum key encapsulation.
+///
+/// Combined with X25519 via [`derive_hybrid_shared_secret`] this provides
+/// key agreement that remains secure if *either* algorithm holds.
+#[derive(Clone)]
+pub struct KemKeypair {
+    /// The secret (decapsulation) key. Cloned rarely; prefer references.
+    pub secret: pqc_kyber::SecretKey,
+    /// The public (encapsulation) key, shared with peers.
+    pub public: pqc_kyber::PublicKey,
+}
+
+impl KemKeypair {
+    /// Generate a new random ML-KEM-768 keypair using the OS CSPRNG
+    pub fn random() -> Self {
+        let keys = pqc_kyber::keypair(&mut OsRng).expect("ML-KEM keygen failed");
+        Self {
+            secret: keys.secret,
+            public: keys.public,
+        }
+    }
+
+    /// Encapsulate a fresh shared secret to a peer's public key bytes
+    ///
+    /// Returns `(shared_secret, ciphertext)`. Send the ciphertext to the
+    /// peer; they recover the same secret with [`KemKeypair::decapsulate`].
+    pub fn encapsulate_to(public_key_bytes: &[u8]) -> Result<(SymmetricKey, Vec<u8>), CryptoError> {
+        if public_key_bytes.len() != KEM_PUBLIC_KEY_SIZE {
+            return Err(CryptoError::KemInvalidInput);
+        }
+        let mut pk = [0u8; pqc_kyber::KYBER_PUBLICKEYBYTES];
+        pk.copy_from_slice(public_key_bytes);
+        let (ciphertext, shared) =
+            pqc_kyber::encapsulate(&pk, &mut OsRng).map_err(|_| CryptoError::KemInvalidInput)?;
+        let mut secret_bytes = [0u8; KEY_SIZE];
+        secret_bytes.copy_from_slice(shared.as_ref());
+        Ok((SymmetricKey::from_bytes(secret_bytes), ciphertext.to_vec()))
+    }
+
+    /// Encapsulate to this keypair's own public key (for tests/loopback)
+    pub fn encapsulate(&self) -> Result<(SymmetricKey, Vec<u8>), CryptoError> {
+        Self::encapsulate_to(self.public.as_ref())
+    }
+
+    /// Decapsulate a peer's ciphertext into the shared secret
+    pub fn decapsulate(&self, ciphertext: &[u8]) -> Result<SymmetricKey, CryptoError> {
+        Self::decapsulate_with(self.secret.as_ref(), ciphertext)
+    }
+
+    /// Decapsulate with explicit secret-key bytes
+    ///
+    /// For nodes that store the classical and KEM keys separately
+    /// (e.g. transport holding a plain mix node plus a KEM pair).
+    pub fn decapsulate_with(secret_bytes: &[u8], ciphertext: &[u8]) -> Result<SymmetricKey, CryptoError> {
+        if secret_bytes.len() != pqc_kyber::KYBER_SECRETKEYBYTES {
+            return Err(CryptoError::KemInvalidInput);
+        }
+        if ciphertext.len() != KEM_CIPHERTEXT_SIZE {
+            return Err(CryptoError::KemInvalidInput);
+        }
+        let mut sk = [0u8; pqc_kyber::KYBER_SECRETKEYBYTES];
+        sk.copy_from_slice(secret_bytes);
+        let mut ct = [0u8; pqc_kyber::KYBER_CIPHERTEXTBYTES];
+        ct.copy_from_slice(ciphertext);
+        let shared =
+            pqc_kyber::decapsulate(&ct, &sk).map_err(|_| CryptoError::KemDecapsulationFailed)?;
+        let mut out = [0u8; KEY_SIZE];
+        out.copy_from_slice(shared.as_ref());
+        Ok(SymmetricKey::from_bytes(out))
+    }
+
+    /// This keypair's secret key as bytes (keep private; for split storage)
+    pub fn secret_bytes(&self) -> Vec<u8> {
+        self.secret.as_ref().to_vec()
+    }
+
+    /// This keypair's public key as bytes (to advertise to peers)
+    pub fn public_bytes(&self) -> Vec<u8> {
+        self.public.as_ref().to_vec()
+    }
+}
+
+/// Combine classical (X25519) and post-quantum (ML-KEM) shared secrets
+/// into a single hybrid shared secret.
+///
+/// Construction: `HKDF-SHA256(salt=context, ikm=classical || kem)`.
+/// Security: an attacker must break *both* X25519 and ML-KEM-768 to
+/// recover the hybrid key; breaking either one alone reveals nothing
+/// about the output.
+pub fn derive_hybrid_shared_secret(
+    classical_shared: &SymmetricKey,
+    kem_shared: &SymmetricKey,
+    context: &str,
+) -> SymmetricKey {
+    let mut combined = Vec::with_capacity(2 * KEY_SIZE);
+    combined.extend_from_slice(&classical_shared.bytes);
+    combined.extend_from_slice(&kem_shared.bytes);
+    let hkdf = Hkdf::<Sha256>::new(Some(context.as_bytes()), &combined);
+    let mut out = [0u8; KEY_SIZE];
+    hkdf.expand(b"static-hybrid-v1", &mut out)
+        .expect("HKDF expand failed");
+    SymmetricKey::from_bytes(out)
+}
+
 /// A nonce for ChaCha20-Poly1305 encryption
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NonceBytes {
@@ -184,6 +297,14 @@ pub enum CryptoError {
     /// Invalid nonce size
     #[error("invalid nonce size")]
     InvalidNonceSize,
+
+    /// ML-KEM input had the wrong size (wrong security level or corrupt key)
+    #[error("invalid ML-KEM input size")]
+    KemInvalidInput,
+
+    /// ML-KEM decapsulation failed (ciphertext failed authentication)
+    #[error("ML-KEM decapsulation failed")]
+    KemDecapsulationFailed,
 }
 
 #[cfg(test)]
@@ -293,5 +414,61 @@ mod tests {
         
         assert_ne!(n1.bytes, n2.bytes);
         assert_eq!(n1.bytes, n3.bytes);
+    }
+
+    #[test]
+    fn test_kem_keypair_generation() {
+        let kem = KemKeypair::random();
+        assert_eq!(kem.public.as_ref().len(), KEM_PUBLIC_KEY_SIZE);
+        assert_eq!(kem.secret.as_ref().len(), pqc_kyber::KYBER_SECRETKEYBYTES);
+        assert_eq!(kem.public_bytes().len(), KEM_PUBLIC_KEY_SIZE);
+
+        // Two keypairs differ
+        let other = KemKeypair::random();
+        assert_ne!(kem.public_bytes(), other.public_bytes());
+    }
+
+    #[test]
+    fn test_kem_encapsulate_decapsulate() {
+        let bob = KemKeypair::random();
+        let (shared_alice, ciphertext) = KemKeypair::encapsulate_to(&bob.public_bytes()).unwrap();
+        assert_eq!(ciphertext.len(), KEM_CIPHERTEXT_SIZE);
+
+        let shared_bob = bob.decapsulate(&ciphertext).unwrap();
+        assert_eq!(shared_alice.bytes, shared_bob.bytes);
+    }
+
+    #[test]
+    fn test_hybrid_key_derivation() {
+        let classical = SymmetricKey::random();
+        let kem = SymmetricKey::random();
+
+        let hybrid = derive_hybrid_shared_secret(&classical, &kem, "test");
+        // Deterministic
+        let hybrid_again = derive_hybrid_shared_secret(&classical, &kem, "test");
+        assert_eq!(hybrid.bytes, hybrid_again.bytes);
+        // Context separation
+        let other_ctx = derive_hybrid_shared_secret(&classical, &kem, "other");
+        assert_ne!(hybrid.bytes, other_ctx.bytes);
+        // Differs from either input
+        assert_ne!(hybrid.bytes, classical.bytes);
+        assert_ne!(hybrid.bytes, kem.bytes);
+    }
+
+    #[test]
+    fn test_hybrid_key_independence() {
+        // Breaking one component (knowing it fully) must not reveal the hybrid:
+        // varying the unknown component changes the output.
+        let classical = SymmetricKey::random();
+        let kem_a = SymmetricKey::random();
+        let kem_b = SymmetricKey::random();
+
+        let h1 = derive_hybrid_shared_secret(&classical, &kem_a, "ctx");
+        let h2 = derive_hybrid_shared_secret(&classical, &kem_b, "ctx");
+        assert_ne!(h1.bytes, h2.bytes, "X25519 break must not reveal hybrid");
+
+        let classical_b = SymmetricKey::random();
+        let h3 = derive_hybrid_shared_secret(&classical_b, &kem_a, "ctx");
+        assert_ne!(h1.bytes, h3.bytes, "ML-KEM break must not reveal hybrid");
     }
 }

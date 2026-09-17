@@ -693,6 +693,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pqc_kyber"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b23e1823e8a78ad67990c5cb843d5eba75ab3b8a44d041f3814fde89463dc6f"
+dependencies = [
+ "rand_core",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -919,6 +928,7 @@ dependencies = [
  "chacha20poly1305",
  "curve25519-dalek",
  "hkdf",
+ "pqc_kyber",
  "rand",
  "serde",
  "sha2",

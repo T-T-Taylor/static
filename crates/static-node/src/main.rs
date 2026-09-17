@@ -58,6 +58,21 @@ struct Cli {
     #[arg(long)]
     sponsor: Option<String>,
 
+    /// Use post-quantum hybrid Sphinx packets (default: true)
+    ///
+    /// Bare `--hybrid-crypto` means true; pass `--hybrid-crypto=false`
+    /// to force classical-only (v0) packets.
+    #[arg(
+        long,
+        default_value_t = true,
+        default_missing_value = "true",
+        require_equals = true,
+        num_args = 0..=1,
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    hybrid_crypto: bool,
+
     /// Disable hot storage rotation
     #[arg(long)]
     no_rotation: bool,
@@ -174,6 +189,7 @@ async fn main() -> Result<()> {
         tier,
         mode,
         sponsor: cli.sponsor.clone(),
+        use_hybrid_crypto: cli.hybrid_crypto,
         rotation_config,
     };
 
@@ -191,6 +207,10 @@ async fn main() -> Result<()> {
             if let Some(sponsor) = &config.sponsor {
                 tracing::info!("Sponsor: {}", sponsor);
             }
+            tracing::info!(
+                "Hybrid crypto: {}",
+                if config.use_hybrid_crypto { "enabled (v1 preferred)" } else { "disabled (v0 only)" }
+            );
             tracing::info!("Bandwidth tier: {:?}", config.tier);
             tracing::info!("Cover traffic: {} bps", config.cover_traffic_rate_bps);
             tracing::info!("Storage contribution: {} bytes", config.max_storage_bytes);

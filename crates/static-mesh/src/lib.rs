@@ -157,6 +157,12 @@ pub struct CoverTrafficConfig {
     pub enabled: bool,
     /// Bandwidth tier for this node
     pub tier: BandwidthTier,
+    /// Whether cover packets use the hybrid (v1) Sphinx layout
+    ///
+    /// Hybrid dummies carry placeholder KEM ciphertexts so cover matches
+    /// the configured packet version's wire size. Defaults to false;
+    /// hybrid nodes set it from `NodeConfig::use_hybrid_crypto`.
+    pub use_hybrid: bool,
 }
 
 impl Default for CoverTrafficConfig {
@@ -166,6 +172,7 @@ impl Default for CoverTrafficConfig {
             interval_ms: DEFAULT_COVER_INTERVAL_MS,
             enabled: true,
             tier: BandwidthTier::Standard,
+            use_hybrid: false,
         }
     }
 }
@@ -517,6 +524,7 @@ mod tests {
             interval_ms: 100,      // 100ms
             enabled: true,
             tier: BandwidthTier::Standard,
+            use_hybrid: false,
         };
         let generator = CoverTrafficGenerator::new(config);
 
@@ -530,7 +538,8 @@ mod tests {
             target_rate_bps: 1000,
             interval_ms: 100,
             enabled: true,
-        tier: BandwidthTier::Standard,
+            tier: BandwidthTier::Standard,
+            use_hybrid: false,
         };
         let mut generator = CoverTrafficGenerator::new(config);
 
@@ -547,7 +556,8 @@ mod tests {
             target_rate_bps: 1000,
             interval_ms: 100,
             enabled: true,
-        tier: BandwidthTier::Standard,
+            tier: BandwidthTier::Standard,
+            use_hybrid: false,
         };
         let mut generator = CoverTrafficGenerator::new(config);
 
@@ -568,7 +578,8 @@ mod tests {
             target_rate_bps: 1000,
             interval_ms: 100,
             enabled: true,
-        tier: BandwidthTier::Standard,
+            tier: BandwidthTier::Standard,
+            use_hybrid: false,
         };
         let mut generator = CoverTrafficGenerator::new(config);
 
@@ -588,7 +599,8 @@ mod tests {
             target_rate_bps: 1000,
             interval_ms: 100,
             enabled: true,
-        tier: BandwidthTier::Standard,
+            tier: BandwidthTier::Standard,
+            use_hybrid: false,
         };
         let mut generator = CoverTrafficGenerator::new(config);
 
@@ -609,7 +621,8 @@ mod tests {
             target_rate_bps: 1000,
             interval_ms: 100,
             enabled: true,
-        tier: BandwidthTier::Standard,
+            tier: BandwidthTier::Standard,
+            use_hybrid: false,
         };
         let mut generator = CoverTrafficGenerator::new(config);
 
