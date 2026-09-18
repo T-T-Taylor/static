@@ -20,7 +20,12 @@
 
 use crate::routing::{RoutingTable, KnownNode};
 use crate::retrieval::handle_retrieval_request;
-use static_storage::swap::{SwapState, StorageCapacity, decide_on_swap, create_swap_accept, create_swap_reject};
+use static_storage::swap::{
+    SwapState, StorageCapacity, PendingSwap, decide_on_swap,
+    create_swap_accept, create_swap_reject,
+    MAX_PENDING_SWAPS,
+};
+use static_storage::heartbeat::LeaseManager;
 use static_storage::retrieval::ChunkHolder;
 use crate::wire;
 use crate::wire::{
@@ -343,7 +348,24 @@ pub struct TransportState {
     /// Routing table for known nodes
     pub routing_table: Arc<RwLock<RoutingTable>>,
     /// Swap state for tracking pending and active swaps
+    ///
+    /// Shared with the node runner (a single `Arc` passed into
+    /// [`create_transport_state`]) so the transport-side swap flow and
+    /// runner-side consumers (verification challenges, heartbeat
+    /// propagation) observe one registry.
     pub swap_state: Arc<Mutex<SwapState>>,
+    /// Lease manager for chunks accepted via 2-phase swaps
+    ///
+    /// `Some` in production (the runner's manager): swap commit
+    /// finalization inserts a lease carrying the content owner's public
+    /// key so signed heartbeats verify. `None` in mesh unit tests,
+    /// which do not exercise lease bookkeeping.
+    pub lease_manager: Option<Arc<Mutex<LeaseManager>>>,
+    /// Timeout for pending 2-phase swaps (seconds)
+    ///
+    /// Defaults to [`static_storage::swap::DEFAULT_PENDING_SWAP_TIMEOUT_
+    /// SECS`]; tests shorten it via `Arc::get_mut` before sharing.
+    pub pending_swap_timeout_secs: u64,
     /// Storage capacity for swap decisions
     pub storage_capacity: Arc<Mutex<StorageCapacity>>,
     /// Storage master key for our chunks
@@ -399,6 +421,84 @@ impl TransportState {
             .unwrap_or_default()
             .as_secs();
         self.peer_activity.lock().unwrap().insert(peer, now);
+    }
+
+    /// Expire pending 2-phase swaps that exceeded the timeout
+    ///
+    /// Called periodically by the node runner's lifecycle loop. For each
+    /// expired swap: the reserved capacity is released (nothing was
+    /// stored) and a `SwapAbort` is sent to the peer if a connection
+    /// exists. Returns the number of swaps aborted.
+    pub async fn expire_pending_swaps(&self) -> usize {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let expired = {
+            let mut swaps = self.swap_state.lock().await;
+            swaps.expire_pending_swaps(now, self.pending_swap_timeout_secs)
+        };
+        for swap in &expired {
+            {
+                let mut capacity = self.storage_capacity.lock().await;
+                capacity.release_reserved(swap.reserved_bytes, false);
+            }
+            send_swap_control(
+                self,
+                swap.peer,
+                WireMessage::SwapAbort(crate::wire::SwapAbort {
+                    proposal_id: swap.proposal_id,
+                    from_node: self.node_id,
+                    reason: "pending swap timed out".to_string(),
+                }),
+            )
+            .await;
+        }
+        if !expired.is_empty() {
+            debug!("Expired {} pending swap(s) past timeout", expired.len());
+        }
+        expired.len()
+    }
+
+    /// Begin a 2-phase swap as the proposer
+    ///
+    /// Records a pending swap for the proposal we are about to send so
+    /// the peer's `SwapAccept` can be matched back to it. Call this
+    /// immediately before sending the `SwapProposal`; the returned ID is
+    /// the proposal ID the accept/commit/abort messages will carry.
+    pub async fn begin_swap_proposal(
+        &self,
+        peer: NodeId,
+        proposal: &static_storage::swap::SwapProposal,
+    ) -> [u8; 32] {
+        let pid = static_storage::swap::proposal_id(proposal);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut swaps = self.swap_state.lock().await;
+        swaps.start_pending_swap(PendingSwap {
+            proposal_id: pid,
+            peer,
+            our_chunk_id: proposal.chunk.id,
+            their_chunk_id: [0u8; 32],
+            their_chunk_data: Vec::new(),
+            reserved_bytes: 0,
+            received_their_chunk: false,
+            sent_commit: false,
+            received_commit: false,
+            // The proposal's terms describe OUR offered chunk; the
+            // return chunk's lease terms arrive with the peer's accept
+            // and overwrite these. `content_pub_key` stays zero: the
+            // return chunk carries no content binding in chunk-level
+            // barter (the lease adopts the owner key on the first
+            // signed heartbeat).
+            renewal_token: [0u8; 32],
+            lease_expires_at: 0,
+            content_pub_key: [0u8; 32],
+            started_at: now,
+        });
+        pid
     }
 
     /// Snapshot of per-peer last-activity timestamps
@@ -616,6 +716,14 @@ pub async fn handle_incoming_connection(
                     warn!("Expected handshake, got SwapReject from {}", addr);
                     return;
                 }
+                WireMessage::SwapCommit(_) => {
+                    warn!("Expected handshake, got SwapCommit from {}", addr);
+                    return;
+                }
+                WireMessage::SwapAbort(_) => {
+                    warn!("Expected handshake, got SwapAbort from {}", addr);
+                    return;
+                }
                 WireMessage::Prepayment(_) => {
                     warn!("Expected handshake, got Prepayment from {}", addr);
                     return;
@@ -714,6 +822,12 @@ pub async fn connect_to_peer(
                 }
                 WireMessage::SwapReject(_) => {
                     return Err(TransportError::HandshakeFailed("expected handshake, got swap reject".into()));
+                }
+                WireMessage::SwapCommit(_) => {
+                    return Err(TransportError::HandshakeFailed("expected handshake, got swap commit".into()));
+                }
+                WireMessage::SwapAbort(_) => {
+                    return Err(TransportError::HandshakeFailed("expected handshake, got swap abort".into()));
                 }
                 WireMessage::Prepayment(_) => {
                     return Err(TransportError::HandshakeFailed("expected handshake, got prepayment".into()));
@@ -910,7 +1024,12 @@ struct HopOutcome {
 }
 
 /// Handle an incoming message from a peer
-async fn handle_message(
+/// Dispatch one inbound wire message against a transport state
+///
+/// Public so tests and loopback bridges can drive the protocol state
+/// machine directly (swap proposal payloads exceed the padded wire size
+/// and cannot traverse a real framing link; see `PADDED_MESSAGE_SIZE`).
+pub async fn handle_message(
     msg: WireMessage,
     state: &Arc<TransportState>,
     from: NodeId,
@@ -943,8 +1062,7 @@ async fn handle_message(
             // before deciding: the counter is maintained incrementally and
             // any missed update would otherwise corrupt the decision.
             // (No record_accept here: accepting stores nothing in the
-            // holder — only metadata and a reply — so the holder total,
-            // and hence the counter, is unchanged by this path.)
+            // holder — the 2-phase flow only reserves until commit.)
             let actual_bytes = {
                 let holder = state.chunk_holder.lock().await;
                 holder.total_bytes()
@@ -966,12 +1084,9 @@ async fn handle_message(
                 current_time,
             );
             drop(capacity);
-            
+
             match result {
                 Ok(()) => {
-                    // Strict 1:1 barter (Phase 0): store the offered chunk and
-                    // return a real held chunk. No dummy 100B replies.
-                    let chunk_len = proposal.chunk.data.len() as u64;
                     // Spoof binding: proposal must come from its claimant.
                     if proposal.from_node != from {
                         let proposal_id = static_storage::swap::proposal_id(&proposal);
@@ -1001,29 +1116,57 @@ async fn handle_message(
                         }
                         return Ok(());
                     };
-                    // Store incoming (if new) + account.
+                    // DoS bound: too many pending swaps pin too much
+                    // buffered chunk memory.
                     {
-                        let already = state.chunk_holder.lock().await.has_chunk(&proposal.chunk.id);
-                        if !already {
-                            state.chunk_holder.lock().await.add_chunk(
-                                proposal.chunk.id,
-                                proposal.chunk.data.clone(),
-                                [0u8; 32],
-                            );
-                            state.storage_capacity.lock().await.record_accept(chunk_len);
+                        let swaps = state.swap_state.lock().await;
+                        if swaps.pending_swaps.len() >= MAX_PENDING_SWAPS {
+                            let proposal_id = static_storage::swap::proposal_id(&proposal);
+                            let reject = create_swap_reject(state.node_id, proposal_id, static_storage::swap::SwapRejectReason::NoCapacity);
+                            let connections = state.connections.read().await;
+                            if let Some(sender) = connections.get(&from) {
+                                let _ = sender.send(WireMessage::SwapReject(reject)).await;
+                            }
+                            return Ok(());
                         }
                     }
+                    // Prepare phase: reserve capacity atomically (re-check
+                    // under the same lock that reserves) but store nothing.
+                    let chunk_len = proposal.chunk.data.len() as u64;
                     {
-                        // Track per-peer counts for TooManyFromPeer.
-                        let mut counts = state.peer_chunk_counts.lock().await;
-                        *counts.entry(from).or_insert(0) += 1;
+                        let mut capacity = state.storage_capacity.lock().await;
+                        if !capacity.can_accept(chunk_len, peer_chunks) {
+                            let proposal_id = static_storage::swap::proposal_id(&proposal);
+                            let reject = create_swap_reject(state.node_id, proposal_id, static_storage::swap::SwapRejectReason::NoCapacity);
+                            let connections = state.connections.read().await;
+                            if let Some(sender) = connections.get(&from) {
+                                let _ = sender.send(WireMessage::SwapReject(reject)).await;
+                            }
+                            return Ok(());
+                        }
+                        capacity.reserve(chunk_len);
                     }
-                    // Clean pending (idempotency) + record active.
+                    // Track the pending 2-phase swap: their chunk arrived
+                    // in-band and is buffered here, not in the holder.
+                    let pid = static_storage::swap::proposal_id(&proposal);
                     {
-                        let pid = static_storage::swap::proposal_id(&proposal);
                         let mut swaps = state.swap_state.lock().await;
                         swaps.remove_proposal(&pid);
-                        swaps.record_swap(proposal.chunk.id, from, chunk_len);
+                        swaps.start_pending_swap(PendingSwap {
+                            proposal_id: pid,
+                            peer: from,
+                            our_chunk_id: ret_id,
+                            their_chunk_id: proposal.chunk.id,
+                            their_chunk_data: proposal.chunk.data.clone(),
+                            reserved_bytes: chunk_len,
+                            received_their_chunk: true,
+                            sent_commit: false,
+                            received_commit: false,
+                            renewal_token: proposal.lease.renewal_token,
+                            lease_expires_at: proposal.lease.expires_at,
+                            content_pub_key: proposal.content_public_key,
+                            started_at: current_time,
+                        });
                     }
 
                     let master_key = state.storage_key.lock().await.clone();
@@ -1031,20 +1174,30 @@ async fn handle_message(
                         id: ret_id,
                         data: ret_data,
                     };
-                    let proposal_id = static_storage::swap::proposal_id(&proposal);
                     let accept = create_swap_accept(
                         state.node_id,
                         return_chunk,
                         &master_key,
-                        proposal_id,
+                        pid,
                         86400,
                     );
-                    
-                    // Send the acceptance back
-                    let connections = state.connections.read().await;
-                    if let Some(sender) = connections.get(&from) {
-                        let _ = sender.send(WireMessage::SwapAccept(accept)).await;
+
+                    // Send the acceptance back; our own commit follows it
+                    // (we already hold their chunk, so we are ready).
+                    {
+                        let connections = state.connections.read().await;
+                        if let Some(sender) = connections.get(&from) {
+                            let _ = sender.send(WireMessage::SwapAccept(accept)).await;
+                            let _ = sender
+                                .send(WireMessage::SwapCommit(crate::wire::SwapCommit {
+                                    proposal_id: pid,
+                                    from_node: state.node_id,
+                                }))
+                                .await;
+                        }
                     }
+                    let mut swaps = state.swap_state.lock().await;
+                    swaps.mark_commit_sent(&pid);
                 }
                 Err(reason) => {
                     let proposal_id = static_storage::swap::proposal_id(&proposal);
@@ -1060,39 +1213,170 @@ async fn handle_message(
             }
         }
         WireMessage::SwapAccept(accept) => {
-            // Validate return size + store real chunk (strict barter).
+            // Proposer side of the prepare phase: the accept carries their
+            // return chunk in-band. Validate, reserve capacity, buffer the
+            // chunk in the pending swap — and store nothing.
             if accept.chunk.data.len() != static_storage::CHUNK_SIZE + 16 {
                 return Ok(());
             }
+            let pid = accept.proposal_id;
+            let has_pending = {
+                let swaps = state.swap_state.lock().await;
+                swaps.get_pending_swap(&pid).is_some()
+            };
+            if !has_pending {
+                // Stale or duplicate accept (no proposal in flight).
+                return Ok(());
+            }
+            let chunk_len = accept.chunk.data.len() as u64;
+            // Reserve capacity for their return chunk; abort the swap if
+            // we cannot honor the barter.
+            let fits = {
+                let mut capacity = state.storage_capacity.lock().await;
+                let fits = capacity.can_accept(chunk_len, 0);
+                if fits {
+                    capacity.reserve(chunk_len);
+                }
+                fits
+            };
+            if !fits {
+                let swap = state.swap_state.lock().await.abort_swap(&pid);
+                if let Some(swap) = swap {
+                    state.storage_capacity.lock().await.release_reserved(swap.reserved_bytes, false);
+                }
+                send_swap_control(
+                    state,
+                    from,
+                    WireMessage::SwapAbort(crate::wire::SwapAbort {
+                        proposal_id: pid,
+                        from_node: state.node_id,
+                        reason: "no capacity for return chunk".to_string(),
+                    }),
+                )
+                .await;
+                return Ok(());
+            }
             {
-                let already = state.chunk_holder.lock().await.has_chunk(&accept.chunk.id);
-                if !already {
-                    // Capacity check before storing accept.
-                    let fits = state.storage_capacity.lock().await.can_accept(
-                        accept.chunk.data.len() as u64,
-                        state.peer_chunk_counts.lock().await.get(&from).copied().unwrap_or(0),
-                    );
-                    if fits {
-                        state.chunk_holder.lock().await.add_chunk(
-                            accept.chunk.id,
-                            accept.chunk.data.clone(),
-                            [0u8; 32],
-                        );
-                        state.storage_capacity.lock().await.record_accept(accept.chunk.data.len() as u64);
-                    }
+                let mut swaps = state.swap_state.lock().await;
+                if let Some(swap) = swaps.pending_swaps.get_mut(&pid) {
+                    swap.their_chunk_id = accept.chunk.id;
+                    swap.their_chunk_data = accept.chunk.data.clone();
+                    swap.reserved_bytes = chunk_len;
+                    swap.received_their_chunk = true;
+                    // The return chunk's lease terms come from the
+                    // accepter (it minted the lease). The return chunk
+                    // carries no content binding in chunk-level barter,
+                    // so `content_pub_key` stays all-zero: the lease
+                    // adopts the owner key on the first signed
+                    // heartbeat (see `LeaseManager`).
+                    swap.renewal_token = accept.lease.renewal_token;
+                    swap.lease_expires_at = accept.lease.expires_at;
                 }
             }
-            {
-                let mut counts = state.peer_chunk_counts.lock().await;
-                *counts.entry(from).or_insert(0) += 1;
+            // We hold their chunk: send our commit (unless their commit
+            // already raced in and committed for us).
+            let need_commit = {
+                let mut swaps = state.swap_state.lock().await;
+                let already = swaps
+                    .get_pending_swap(&pid)
+                    .map(|s| s.sent_commit)
+                    .unwrap_or(false);
+                if !already {
+                    swaps.mark_commit_sent(&pid);
+                    true
+                } else {
+                    false
+                }
+            };
+            if need_commit {
+                send_swap_control(
+                    state,
+                    from,
+                    WireMessage::SwapCommit(crate::wire::SwapCommit {
+                        proposal_id: pid,
+                        from_node: state.node_id,
+                    }),
+                )
+                .await;
             }
-            state.swap_state.lock().await.record_swap(
-                accept.chunk.id,
-                from,
-                accept.chunk.data.len() as u64,
-            );
-            // Clear the pending proposal this answers.
-            state.swap_state.lock().await.remove_proposal(&accept.proposal_id);
+            // Their commit may already have arrived (it travels with the
+            // accept): finalize now if both sides have committed.
+            finalize_swap_if_ready(state, &pid).await;
+        }
+        WireMessage::SwapCommit(commit) => {
+            // Commit phase: the peer holds our chunk and is ready to
+            // store. Finalize only when we have both sent and received
+            // a commit for the proposal (and hold their chunk).
+            if commit.from_node != from {
+                return Ok(());
+            }
+            let pid = commit.proposal_id;
+            {
+                // Auth: the commit must belong to a pending swap with
+                // this exact peer.
+                let swaps = state.swap_state.lock().await;
+                if !swaps
+                    .get_pending_swap(&pid)
+                    .is_some_and(|swap| swap.peer == from)
+                {
+                    // Unknown proposal or wrong peer: ignore.
+                    return Ok(());
+                }
+            }
+            // If we had not committed yet (their commit raced ahead of
+            // our send path), send ours now — we hold their chunk from
+            // the prepare phase, so we are ready.
+            let need_commit = {
+                let mut swaps = state.swap_state.lock().await;
+                let already = swaps
+                    .get_pending_swap(&pid)
+                    .map(|s| s.sent_commit)
+                    .unwrap_or(false);
+                if !already {
+                    swaps.mark_commit_sent(&pid);
+                    true
+                } else {
+                    false
+                }
+            };
+            if need_commit {
+                send_swap_control(
+                    state,
+                    from,
+                    WireMessage::SwapCommit(crate::wire::SwapCommit {
+                        proposal_id: pid,
+                        from_node: state.node_id,
+                    }),
+                )
+                .await;
+            }
+            {
+                let mut swaps = state.swap_state.lock().await;
+                swaps.mark_commit_received(&pid);
+            }
+            finalize_swap_if_ready(state, &pid).await;
+        }
+        WireMessage::SwapAbort(abort) => {
+            // One side failed (or the timeout fired): cancel the swap and
+            // release the reserved capacity. Nothing is stored.
+            if abort.from_node != from {
+                return Ok(());
+            }
+            let pid = abort.proposal_id;
+            let swap = state.swap_state.lock().await.abort_swap(&pid);
+            if let Some(swap) = swap {
+                state
+                    .storage_capacity
+                    .lock()
+                    .await
+                    .release_reserved(swap.reserved_bytes, false);
+                debug!(
+                    "Swap {:02x?} aborted by peer {:02x?}: {}",
+                    pid,
+                    from,
+                    abort.reason
+                );
+            }
         }
         WireMessage::SwapReject(reject) => {
             state.swap_state.lock().await.rejected_swaps += 1;
@@ -1253,6 +1537,78 @@ async fn handle_message(
     Ok(())
 }
 
+/// Finalize a pending 2-phase swap when both commits are in
+///
+/// Called from the `SwapAccept` and `SwapCommit` handlers: whichever
+/// message completes the (sent_commit && received_commit &&
+/// received_their_chunk) condition finalizes. Stores the peer's chunk,
+/// converts the reserved capacity into stored bytes, records the barter
+/// and inserts the owner-keyed lease. Locks are taken one at a time
+/// (never nested). Returns `true` if the swap was finalized here.
+async fn finalize_swap_if_ready(state: &Arc<TransportState>, pid: &[u8; 32]) -> bool {
+    let Some(swap) = ({
+        let mut swaps = state.swap_state.lock().await;
+        let ready = swaps
+            .get_pending_swap(pid)
+            .map(|s| s.sent_commit && s.received_commit && s.received_their_chunk)
+            .unwrap_or(false);
+        if ready {
+            swaps.complete_swap(pid)
+        } else {
+            None
+        }
+    }) else {
+        return false;
+    };
+    let peer = swap.peer;
+    // Finalize: store their chunk, convert the reservation into stored
+    // bytes, and record the barter.
+    let stored_new = {
+        let mut holder = state.chunk_holder.lock().await;
+        let already = holder.has_chunk(&swap.their_chunk_id);
+        if !already {
+            holder.add_chunk(
+                swap.their_chunk_id,
+                swap.their_chunk_data.clone(),
+                [0u8; 32],
+            );
+        }
+        !already
+    };
+    {
+        let mut capacity = state.storage_capacity.lock().await;
+        capacity.release_reserved(swap.reserved_bytes, stored_new);
+    }
+    if stored_new {
+        let mut counts = state.peer_chunk_counts.lock().await;
+        *counts.entry(peer).or_insert(0) += 1;
+        // Lease for the held chunk: carries the content owner's public
+        // key from the swap proposal so signed heartbeats verify
+        // (Phase 2). Chunks without a content binding (barter return
+        // chunks) carry an all-zero key that adopts on the first signed
+        // heartbeat.
+        if let Some(leases) = &state.lease_manager {
+            let mut lm = leases.lock().await;
+            lm.add_lease(
+                swap.their_chunk_id,
+                static_storage::ChunkLease {
+                    chunk_id: swap.their_chunk_id,
+                    expires_at: swap.lease_expires_at,
+                    renewal_token: swap.renewal_token,
+                    content_pub_key: swap.content_pub_key,
+                },
+            );
+        }
+    }
+    debug!(
+        "Swap {:02x?} committed: storing chunk {:02x?} for peer {:02x?}",
+        pid,
+        swap.their_chunk_id,
+        peer
+    );
+    true
+}
+
 /// Generate a dummy packet for cover traffic (kept for tests).
 #[cfg(test)]
 fn generate_cover_packet(size: usize) -> Vec<u8> {
@@ -1352,29 +1708,28 @@ pub async fn start_listener(
 /// (a single `Arc`, not a copy) so swap decisions, publish accounting,
 /// and periodic reconciliation all observe one counter. Callers size it
 /// from node configuration; there is no transport-level default.
+///
+/// `swap_state` is likewise shared with the node runner so the
+/// transport-side swap flow and runner-side consumers (verification
+/// challenges, heartbeat propagation) use one registry.
+///
+/// `leases` is the runner's lease manager (`Some` in production, `None`
+/// in mesh unit tests): swap commit finalization inserts leases carrying
+/// the content owner's public key for signed-heartbeat verification.
+///
+/// This is the only way to build a [`TransportState`]: passing the
+/// shared state explicitly prevents accidentally constructing a node
+/// with a disconnected swap/capacity registry.
 pub fn create_transport_state(
     node_id: NodeId,
     mix_node: MixNode,
     cover_config: crate::CoverTrafficConfig,
     storage_capacity: Arc<Mutex<StorageCapacity>>,
-) -> (Arc<TransportState>, mpsc::Receiver<InboundMessage>) {
-    create_transport_state_with_identity(node_id, mix_node, cover_config, storage_capacity, None)
-}
-
-/// Create transport state with an explicit Ed25519 identity key.
-///
-/// Production callers pass the persistent key from `PersistentConfig`;
-/// tests pass `None` for an ephemeral key.
-pub fn create_transport_state_with_identity(
-    node_id: NodeId,
-    mix_node: MixNode,
-    cover_config: crate::CoverTrafficConfig,
-    storage_capacity: Arc<Mutex<StorageCapacity>>,
-    identity_key: Option<ed25519_dalek::SigningKey>,
+    swap_state: Arc<Mutex<SwapState>>,
+    leases: Option<Arc<Mutex<LeaseManager>>>,
 ) -> (Arc<TransportState>, mpsc::Receiver<InboundMessage>) {
     let (inbound_tx, inbound_rx) = mpsc::channel(CHANNEL_BUFFER);
     let routing_table = RoutingTable::new(node_id);
-    let swap_state = SwapState::new();
     let storage_key = static_crypto::SymmetricKey::random();
     let chunk_holder = ChunkHolder::new();
     let transport: Arc<dyn Transport> = Arc::new(TcpTransport::new());
@@ -1389,12 +1744,9 @@ pub fn create_transport_state_with_identity(
         cover_config.target_rate_bps,
         now_secs,
     );
-    let signing_key = identity_key.unwrap_or_else(|| {
-        let mut bytes = [0u8; 32];
-        use rand::RngCore;
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
-        ed25519_dalek::SigningKey::from_bytes(&bytes)
-    });
+    let mut identity_bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut identity_bytes);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&identity_bytes);
     let identity_public_key = signing_key.verifying_key().to_bytes();
 
     let state = Arc::new(TransportState {
@@ -1409,7 +1761,9 @@ pub fn create_transport_state_with_identity(
         total_cover_bytes_sent: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         inbound_tx,
         routing_table: Arc::new(RwLock::new(routing_table)),
-        swap_state: Arc::new(Mutex::new(swap_state)),
+        swap_state,
+        lease_manager: leases,
+        pending_swap_timeout_secs: static_storage::swap::DEFAULT_PENDING_SWAP_TIMEOUT_SECS,
         storage_capacity,
         storage_key: Arc::new(Mutex::new(storage_key)),
         chunk_holder: Arc::new(Mutex::new(chunk_holder)),
@@ -1426,6 +1780,21 @@ pub fn create_transport_state_with_identity(
     });
 
     (state, inbound_rx)
+}
+
+/// Send a `SwapCommit` or `SwapAbort` to a swap peer
+///
+/// Commit/abort are direct wire maintenance traffic (like rejects), not
+/// Sphinx-wrapped.
+async fn send_swap_control(
+    state: &TransportState,
+    peer: NodeId,
+    message: WireMessage,
+) {
+    let connections = state.connections.read().await;
+    if let Some(sender) = connections.get(&peer) {
+        let _ = sender.send(message).await;
+    }
 }
 
 /// Send a Sphinx packet to a specific peer
@@ -1525,13 +1894,30 @@ mod tests {
         Arc::new(Mutex::new(StorageCapacity::new(10 * 1024 * 1024 * 1024)))
     }
 
+    /// Build a test transport state: fresh capacity + swap registry, no
+    /// lease manager (mesh tests do not exercise lease bookkeeping).
+    fn test_state(
+        node_id: NodeId,
+        mix_node: MixNode,
+        cover_config: crate::CoverTrafficConfig,
+    ) -> (Arc<TransportState>, mpsc::Receiver<InboundMessage>) {
+        create_transport_state(
+            node_id,
+            mix_node,
+            cover_config,
+            test_capacity(),
+            Arc::new(Mutex::new(SwapState::new())),
+            None,
+        )
+    }
+
     #[tokio::test]
     async fn test_transport_state_creation() {
         let node_id = random_node_id();
         let mix_node = MixNode::new();
         let cover_config = crate::CoverTrafficConfig::default();
 
-        let (state, _rx) = create_transport_state(node_id, mix_node, cover_config, test_capacity());
+        let (state, _rx) = test_state(node_id, mix_node, cover_config);
 
         assert_eq!(state.node_id, node_id);
         assert_eq!(state.connections.read().await.len(), 0);
@@ -1552,7 +1938,7 @@ mod tests {
         let mix_node = MixNode::new();
         let cover_config = crate::CoverTrafficConfig::default();
 
-        let (state, _rx) = create_transport_state(node_id, mix_node, cover_config, test_capacity());
+        let (state, _rx) = test_state(node_id, mix_node, cover_config, );
 
         let route = Route {
             hops: vec![RouteHop {
@@ -1573,7 +1959,7 @@ mod tests {
         let mix_node = MixNode::new();
         let cover_config = crate::CoverTrafficConfig::default();
 
-        let (state, _rx) = create_transport_state(node_id, mix_node, cover_config, test_capacity());
+        let (state, _rx) = test_state(node_id, mix_node, cover_config, );
 
         let stats = get_stats(&state).await;
         assert_eq!(stats.total_bytes_sent, 0);
@@ -1590,7 +1976,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (state1, _rx1) = create_transport_state(node1_id, node1_mix, cover_config.clone(), test_capacity());
+        let (state1, _rx1) = test_state(node1_id, node1_mix, cover_config.clone(), );
 
         // Start listener for node1
         let listener_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1617,7 +2003,7 @@ mod tests {
         // Node2 connects to node1
         let node2_id = random_node_id();
         let node2_mix = MixNode::new();
-        let (state2, _rx2) = create_transport_state(node2_id, node2_mix, cover_config, test_capacity());
+        let (state2, _rx2) = test_state(node2_id, node2_mix, cover_config, );
 
         // Give listener a moment to start
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1653,9 +2039,9 @@ mod tests {
             ..Default::default()
         };
 
-        let (state_a, _rx_a) = create_transport_state(node_a_id, mix_a, cover_config.clone(), test_capacity());
-        let (state_b, _rx_b) = create_transport_state(node_b_id, mix_b, cover_config.clone(), test_capacity());
-        let (state_c, mut rx_c) = create_transport_state(node_c_id, mix_c, cover_config, test_capacity());
+        let (state_a, _rx_a) = test_state(node_a_id, mix_a, cover_config.clone(), );
+        let (state_b, _rx_b) = test_state(node_b_id, mix_b, cover_config.clone(), );
+        let (state_c, mut rx_c) = test_state(node_c_id, mix_c, cover_config, );
 
         // Start listeners for B and C
         let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1821,6 +2207,7 @@ mod tests {
                 chunk_id,
                 expires_at: now + 86400,
                 renewal_token: [0u8; 32],
+                content_pub_key: content_pub,
             },
             encrypted_master_key: Vec::new(),
             content_root,
@@ -1838,18 +2225,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dormant_swap_accept_stores_chunk() {
+    async fn test_swap_proposal_prepares_without_storing_then_commit_stores() {
+        // 2-phase accepter side: the proposal reserves capacity and
+        // buffers the offered chunk, but nothing is stored until the
+        // peer's SwapCommit arrives. The commit finalizes storage,
+        // converts the reservation, and inserts the owner-keyed lease.
+        let leases: Arc<Mutex<LeaseManager>> = Arc::new(Mutex::new(LeaseManager::new()));
         let (state, _rx) = create_transport_state(
             random_node_id(),
             MixNode::new(),
             crate::CoverTrafficConfig::default(),
             test_capacity(),
+            Arc::new(Mutex::new(SwapState::new())),
+            Some(leases.clone()),
         );
-        // Dormant backup: serving disabled
-        state
-            .serve_enabled
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-
         // Strict barter needs a real return chunk: pre-populate holder.
         let existing_id = [0xB0u8; 32];
         state
@@ -1863,30 +2252,135 @@ mod tests {
         let chunk_id = [0xB1u8; 32];
         let data = vec![0x5Cu8; static_storage::CHUNK_SIZE + 16];
         let proposal = test_swap_proposal(from, chunk_id, data.clone());
+        let pid = static_storage::swap::proposal_id(&proposal);
 
-        handle_message(WireMessage::SwapProposal(proposal), &state, from)
+        // Prepare phase: reserve + buffer, store nothing.
+        handle_message(WireMessage::SwapProposal(proposal.clone()), &state, from)
             .await
             .unwrap();
 
+        assert!(state.chunk_holder.lock().await.get_chunk(&chunk_id).is_none());
+        {
+            let capacity = state.storage_capacity.lock().await;
+            assert_eq!(capacity.current_bytes, (static_storage::CHUNK_SIZE + 16) as u64);
+            assert_eq!(capacity.reserved_bytes, (static_storage::CHUNK_SIZE + 16) as u64);
+        }
+        {
+            let swaps = state.swap_state.lock().await;
+            let pending = swaps.get_pending_swap(&pid).expect("pending swap recorded");
+            assert_eq!(pending.their_chunk_data, data);
+            assert_eq!(pending.peer, from);
+            assert!(pending.sent_commit, "accepter commits alongside the accept");
+            assert!(!pending.received_commit);
+        }
+
+        // Commit phase: the peer's commit finalizes the swap.
+        handle_message(
+            WireMessage::SwapCommit(crate::wire::SwapCommit { proposal_id: pid, from_node: from }),
+            &state,
+            from,
+        )
+        .await
+        .unwrap();
+
         let expected_len = (static_storage::CHUNK_SIZE + 16) as u64 * 2;
-        let holder = state.chunk_holder.lock().await;
-        assert_eq!(holder.get_chunk(&chunk_id), Some(&data));
-        assert_eq!(holder.total_bytes(), expected_len);
-        drop(holder);
-        assert_eq!(state.storage_capacity.lock().await.current_bytes, expected_len);
+        assert_eq!(state.chunk_holder.lock().await.get_chunk(&chunk_id), Some(&data));
+        {
+            let capacity = state.storage_capacity.lock().await;
+            assert_eq!(capacity.current_bytes, expected_len);
+            assert_eq!(capacity.reserved_bytes, 0);
+        }
+        {
+            let swaps = state.swap_state.lock().await;
+            assert_eq!(swaps.get_swap_partner(&chunk_id), Some(&from));
+            assert_eq!(swaps.completed_swaps, vec![pid]);
+        }
+        assert_eq!(
+            state.peer_chunk_counts.lock().await.get(&from).copied(),
+            Some(1)
+        );
+        // The lease carries the content owner's key from the proposal.
+        let lease = leases.lock().await.leases.get(&chunk_id).cloned();
+        assert_eq!(lease.expect("lease inserted").content_pub_key, proposal.content_public_key);
     }
 
     #[tokio::test]
-    async fn test_active_swap_accept_stores_chunk_strict() {
-        let (state, _rx) = create_transport_state(
+    async fn test_swap_proposer_commits_after_accept() {
+        // 2-phase proposer side: begin_swap_proposal tracks the pending
+        // swap; the accept reserves + buffers the return chunk (no
+        // storage); our commit + their commit finalize it.
+        let (state, _rx) = test_state(
             random_node_id(),
             MixNode::new(),
             crate::CoverTrafficConfig::default(),
-            test_capacity(),
         );
-        // Active node (default): strict 1:1 stores incoming + returns real.
-        assert!(state.serve_enabled.load(std::sync::atomic::Ordering::Relaxed));
+        let peer = random_node_id();
+        let our_chunk_id = [0xC1u8; 32];
+        let proposal = test_swap_proposal(
+            state.node_id,
+            our_chunk_id,
+            vec![0x6Au8; static_storage::CHUNK_SIZE + 16],
+        );
+        let pid = state.begin_swap_proposal(peer, &proposal).await;
 
+        // The accept carries their return chunk in-band.
+        let their_id = [0xC2u8; 32];
+        let their_data = vec![0x6Bu8; static_storage::CHUNK_SIZE + 16];
+        let accept = create_swap_accept(
+            peer,
+            static_storage::EncryptedChunk { id: their_id, data: their_data.clone() },
+            &static_crypto::SymmetricKey::random(),
+            pid,
+            86400,
+        );
+        handle_message(WireMessage::SwapAccept(accept), &state, peer)
+            .await
+            .unwrap();
+
+        // Prepare phase on the proposer side: reserved, buffered, not stored.
+        assert!(state.chunk_holder.lock().await.get_chunk(&their_id).is_none());
+        {
+            let capacity = state.storage_capacity.lock().await;
+            assert_eq!(capacity.reserved_bytes, (static_storage::CHUNK_SIZE + 16) as u64);
+            assert_eq!(capacity.current_bytes, 0);
+        }
+        {
+            let swaps = state.swap_state.lock().await;
+            let pending = swaps.get_pending_swap(&pid).expect("pending swap tracked");
+            assert_eq!(pending.their_chunk_id, their_id);
+            assert_eq!(pending.their_chunk_data, their_data);
+            assert!(pending.sent_commit);
+        }
+
+        // Their commit arrives: finalize.
+        handle_message(
+            WireMessage::SwapCommit(crate::wire::SwapCommit { proposal_id: pid, from_node: peer }),
+            &state,
+            peer,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state.chunk_holder.lock().await.get_chunk(&their_id), Some(&their_data));
+        let capacity = state.storage_capacity.lock().await;
+        assert_eq!(capacity.current_bytes, (static_storage::CHUNK_SIZE + 16) as u64);
+        assert_eq!(capacity.reserved_bytes, 0);
+        drop(capacity);
+        assert_eq!(
+            state.swap_state.lock().await.get_swap_partner(&their_id),
+            Some(&peer)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_swap_abort_releases_reservation() {
+        // The peer aborts mid-swap: the pending swap is dropped and the
+        // reserved capacity is released. Nothing is stored.
+        let (state, _rx) = test_state(
+            random_node_id(),
+            MixNode::new(),
+            crate::CoverTrafficConfig::default(),
+        );
         let existing_id = [0xB0u8; 32];
         state
             .chunk_holder
@@ -1896,26 +2390,96 @@ mod tests {
         state.storage_capacity.lock().await.record_accept((static_storage::CHUNK_SIZE + 16) as u64);
 
         let from = random_node_id();
-        let chunk_id = [0xB2u8; 32];
-        let data = vec![0x5Du8; static_storage::CHUNK_SIZE + 16];
-        let proposal = test_swap_proposal(from, chunk_id, data.clone());
+        let chunk_id = [0xB4u8; 32];
+        let proposal = test_swap_proposal(from, chunk_id, vec![0x5Fu8; static_storage::CHUNK_SIZE + 16]);
+        let pid = static_storage::swap::proposal_id(&proposal);
+
+        handle_message(WireMessage::SwapProposal(proposal), &state, from)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.storage_capacity.lock().await.reserved_bytes,
+            (static_storage::CHUNK_SIZE + 16) as u64
+        );
+
+        handle_message(
+            WireMessage::SwapAbort(crate::wire::SwapAbort {
+                proposal_id: pid,
+                from_node: from,
+                reason: "cannot honor barter".to_string(),
+            }),
+            &state,
+            from,
+        )
+        .await
+        .unwrap();
+
+        assert!(state.chunk_holder.lock().await.get_chunk(&chunk_id).is_none());
+        let capacity = state.storage_capacity.lock().await;
+        assert_eq!(capacity.reserved_bytes, 0);
+        assert_eq!(capacity.current_bytes, (static_storage::CHUNK_SIZE + 16) as u64);
+        drop(capacity);
+        let swaps = state.swap_state.lock().await;
+        assert!(swaps.get_pending_swap(&pid).is_none());
+        assert_eq!(swaps.aborted_swaps, vec![pid]);
+    }
+
+    #[tokio::test]
+    async fn test_swap_timeout_expires_and_releases_reservation() {
+        // A pending swap older than the timeout is expired by
+        // expire_pending_swaps: reservation released, nothing stored.
+        let (state, _rx) = test_state(
+            random_node_id(),
+            MixNode::new(),
+            crate::CoverTrafficConfig::default(),
+        );
+        let existing_id = [0xB0u8; 32];
+        state
+            .chunk_holder
+            .lock()
+            .await
+            .add_chunk(existing_id, vec![0xAAu8; static_storage::CHUNK_SIZE + 16], [0u8; 32]);
+        state.storage_capacity.lock().await.record_accept((static_storage::CHUNK_SIZE + 16) as u64);
+
+        let from = random_node_id();
+        let chunk_id = [0xB5u8; 32];
+        let proposal = test_swap_proposal(from, chunk_id, vec![0x60u8; static_storage::CHUNK_SIZE + 16]);
+        let pid = static_storage::swap::proposal_id(&proposal);
 
         handle_message(WireMessage::SwapProposal(proposal), &state, from)
             .await
             .unwrap();
 
-        assert_eq!(state.chunk_holder.lock().await.get_chunk(&chunk_id), Some(&data));
+        // Age the pending swap past the timeout without sleeping.
+        {
+            let mut swaps = state.swap_state.lock().await;
+            let started = swaps.get_pending_swap(&pid).unwrap().started_at;
+            swaps.pending_swaps.get_mut(&pid).unwrap().started_at =
+                started.saturating_sub(state.pending_swap_timeout_secs + 1);
+        }
+
+        let aborted = state.expire_pending_swaps().await;
+        assert_eq!(aborted, 1);
+
+        assert!(state.chunk_holder.lock().await.get_chunk(&chunk_id).is_none());
+        let capacity = state.storage_capacity.lock().await;
+        assert_eq!(capacity.reserved_bytes, 0);
+        drop(capacity);
+        let swaps = state.swap_state.lock().await;
+        assert!(swaps.get_pending_swap(&pid).is_none());
+        assert_eq!(swaps.aborted_swaps, vec![pid]);
     }
 
     #[tokio::test]
     async fn test_active_swap_accept_stores_nothing() {
-        let (state, _rx) = create_transport_state(
+        // Spoofed proposal (sender != claimant) is rejected: nothing
+        // stored, nothing reserved.
+        let (state, _rx) = test_state(
             random_node_id(),
             MixNode::new(),
             crate::CoverTrafficConfig::default(),
-            test_capacity(),
         );
-        // Active node (default): serving enabled, metadata-only swaps
+        // Active node (default): serving enabled
         assert!(state.serve_enabled.load(std::sync::atomic::Ordering::Relaxed));
 
         let chunk_id = [0xB2u8; 32];
@@ -1930,19 +2494,20 @@ mod tests {
             .unwrap();
 
         assert!(state.chunk_holder.lock().await.get_chunk(&chunk_id).is_none());
-        assert_eq!(state.storage_capacity.lock().await.current_bytes, 0);
+        let capacity = state.storage_capacity.lock().await;
+        assert_eq!(capacity.current_bytes, 0);
+        assert_eq!(capacity.reserved_bytes, 0);
     }
 
     #[tokio::test]
     async fn test_dormant_swap_rejects_tampered_chunk() {
         // Garbage-flooding protection end-to-end: a chunk tampered after
         // proof generation must not be materialized by a dormant backup.
-        let (state, _rx) = create_transport_state(
+        let (state, _rx) = test_state(
             random_node_id(),
             MixNode::new(),
             crate::CoverTrafficConfig::default(),
-            test_capacity(),
-        );
+            );
         state
             .serve_enabled
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1976,12 +2541,11 @@ mod tests {
     #[tokio::test]
     async fn test_dormant_backup_ignores_chunk_request() {
         // A dormant backup must not serve chunks it holds, even valid ones.
-        let (state, _rx) = create_transport_state(
+        let (state, _rx) = test_state(
             random_node_id(),
             MixNode::new(),
             crate::CoverTrafficConfig::default(),
-            test_capacity(),
-        );
+            );
         state
             .serve_enabled
             .store(false, std::sync::atomic::Ordering::Relaxed);

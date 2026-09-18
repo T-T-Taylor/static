@@ -12,6 +12,9 @@
 
 use crate::routing::PeerGossip;
 use static_storage::swap::{SwapProposal, SwapAccept, SwapReject};
+// Re-exported so callers can construct `WireMessage::SwapCommit` /
+// `WireMessage::SwapAbort` payloads as `crate::wire::SwapCommit { .. }`.
+pub use static_storage::swap::{SwapAbort, SwapCommit};
 use static_sphinx::{
     SphinxPacket, SphinxHeader, NodeId,
     BODY_SIZE, ROUTING_INFO_SIZE, EPHEMERAL_KEY_SIZE, MAC_SIZE,
@@ -42,6 +45,12 @@ pub const MSG_PREPAYMENT: u8 = 0x07;
 
 /// Accounting reconciliation message type
 pub const MSG_ACCOUNTING_RECONCILIATION: u8 = 0x08;
+
+/// Swap commit message type (2-phase commit finalize)
+pub const MSG_SWAP_COMMIT: u8 = 0x0B;
+
+/// Swap abort message type (2-phase commit cancel)
+pub const MSG_SWAP_ABORT: u8 = 0x0C;
 
 /// Maximum peer credit entries per reconciliation message (batching cap)
 ///
@@ -164,6 +173,10 @@ pub enum WireMessage {
     SwapAccept(SwapAccept),
     /// Swap rejection (storage barter negotiation)
     SwapReject(SwapReject),
+    /// Swap commit (2-phase: both sides retrieved, finalize the swap)
+    SwapCommit(SwapCommit),
+    /// Swap abort (2-phase: one side failed, cancel the swap)
+    SwapAbort(SwapAbort),
     /// Prepayment from a seed-only node to a sponsor
     Prepayment(Prepayment),
     /// Accounting state reconciliation (exchange peer credits after partition heal)
@@ -592,6 +605,8 @@ pub fn serialize_message(msg: &WireMessage) -> Result<Vec<u8>, WireError> {
         WireMessage::SwapProposal(s) => (MSG_SWAP_PROPOSAL, serde_json::to_vec(s).map_err(|_| WireError::InvalidMessageType(0))?),
         WireMessage::SwapAccept(s) => (MSG_SWAP_ACCEPT, serde_json::to_vec(s).map_err(|_| WireError::InvalidMessageType(0))?),
         WireMessage::SwapReject(s) => (MSG_SWAP_REJECT, serde_json::to_vec(s).map_err(|_| WireError::InvalidMessageType(0))?),
+        WireMessage::SwapCommit(s) => (MSG_SWAP_COMMIT, serde_json::to_vec(s).map_err(|_| WireError::InvalidMessageType(0))?),
+        WireMessage::SwapAbort(s) => (MSG_SWAP_ABORT, serde_json::to_vec(s).map_err(|_| WireError::InvalidMessageType(0))?),
         WireMessage::Prepayment(p) => (MSG_PREPAYMENT, serde_json::to_vec(p).map_err(|_| WireError::InvalidMessageType(0))?),
         WireMessage::AccountingReconciliation(r) => (MSG_ACCOUNTING_RECONCILIATION, serde_json::to_vec(r).map_err(|_| WireError::InvalidMessageType(0))?),
     };
@@ -689,6 +704,12 @@ pub fn deserialize_message(data: &[u8]) -> Result<(WireMessage, usize), WireErro
         }
         MSG_SWAP_REJECT => {
             WireMessage::SwapReject(serde_json::from_slice(trim_padded(payload)).map_err(|_| WireError::InvalidMessageType(msg_type))?)
+        }
+        MSG_SWAP_COMMIT => {
+            WireMessage::SwapCommit(serde_json::from_slice(trim_padded(payload)).map_err(|_| WireError::InvalidMessageType(msg_type))?)
+        }
+        MSG_SWAP_ABORT => {
+            WireMessage::SwapAbort(serde_json::from_slice(trim_padded(payload)).map_err(|_| WireError::InvalidMessageType(msg_type))?)
         }
         MSG_PREPAYMENT => {
             WireMessage::Prepayment(serde_json::from_slice(trim_padded(payload)).map_err(|_| WireError::InvalidMessageType(msg_type))?)
@@ -1085,6 +1106,51 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
 
         // Truncated buffer fails.
         assert!(deserialize_handshake(&serialized[..20]).is_err());
+    }
+
+    #[test]
+    fn test_swap_commit_serialization() {
+        let commit = static_storage::swap::SwapCommit {
+            proposal_id: [0x77u8; 32],
+            from_node: [0x42u8; 16],
+        };
+        let msg = WireMessage::SwapCommit(commit.clone());
+        let serialized = serialize_message(&msg).unwrap();
+        assert_eq!(serialized[0], MSG_SWAP_COMMIT);
+        // Padded to the uniform maintenance size like other swap messages.
+        assert_eq!(serialized.len(), 1 + 4 + PADDED_MESSAGE_SIZE);
+        let (deserialized, consumed) = deserialize_message(&serialized).unwrap();
+        assert_eq!(consumed, serialized.len());
+        match deserialized {
+            WireMessage::SwapCommit(c) => {
+                assert_eq!(c.proposal_id, commit.proposal_id);
+                assert_eq!(c.from_node, commit.from_node);
+            }
+            _ => panic!("expected swap commit"),
+        }
+    }
+
+    #[test]
+    fn test_swap_abort_serialization() {
+        let abort = static_storage::swap::SwapAbort {
+            proposal_id: [0x88u8; 32],
+            from_node: [0x43u8; 16],
+            reason: "peer timed out".to_string(),
+        };
+        let msg = WireMessage::SwapAbort(abort.clone());
+        let serialized = serialize_message(&msg).unwrap();
+        assert_eq!(serialized[0], MSG_SWAP_ABORT);
+        assert_eq!(serialized.len(), 1 + 4 + PADDED_MESSAGE_SIZE);
+        let (deserialized, consumed) = deserialize_message(&serialized).unwrap();
+        assert_eq!(consumed, serialized.len());
+        match deserialized {
+            WireMessage::SwapAbort(a) => {
+                assert_eq!(a.proposal_id, abort.proposal_id);
+                assert_eq!(a.from_node, abort.from_node);
+                assert_eq!(a.reason, abort.reason);
+            }
+            _ => panic!("expected swap abort"),
+        }
     }
 
     #[test]

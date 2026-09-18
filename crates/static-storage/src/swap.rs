@@ -38,6 +38,19 @@ pub const SWAP_REJECT: u8 = 0x03;
 /// Default lease duration for swapped chunks (24 hours)
 pub const DEFAULT_LEASE_DURATION_SECS: u64 = 86400;
 
+/// Default timeout for pending 2-phase swaps (5 minutes)
+///
+/// A pending swap that has not committed within this window is aborted:
+/// reserved capacity is released and no chunks are stored, preserving
+/// the 1:1 barter ratio when a peer crashes mid-swap.
+pub const DEFAULT_PENDING_SWAP_TIMEOUT_SECS: u64 = 300;
+
+/// Maximum concurrent pending 2-phase swaps (DoS bound)
+///
+/// Each pending swap buffers two ~1 MiB chunk payloads until commit;
+/// the cap bounds the memory a flood of proposals can pin.
+pub const MAX_PENDING_SWAPS: usize = 32;
+
 /// Get current unix timestamp
 fn current_timestamp() -> u64 {
     SystemTime::now()
@@ -163,6 +176,35 @@ pub struct SwapReject {
     pub reason: SwapRejectReason,
 }
 
+/// A swap commit (2-phase commit finalize)
+///
+/// Sent after the sender holds the peer's chunk: committing means
+/// "I have your chunk and am ready to store it". The receiver finalizes
+/// the swap (stores chunks, converts the reservation) once it has both
+/// sent and received a commit for the proposal.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SwapCommit {
+    /// The proposal ID this commit is for
+    pub proposal_id: [u8; 32],
+    /// The sending node's ID
+    pub from_node: NodeId,
+}
+
+/// A swap abort (2-phase commit cancel)
+///
+/// Sent when a side cannot proceed (capacity missing, retrieval failed)
+/// or by the timeout sweep after [`DEFAULT_PENDING_SWAP_TIMEOUT_SECS`].
+/// Both sides release reserved capacity and store nothing.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SwapAbort {
+    /// The proposal ID this abort is for
+    pub proposal_id: [u8; 32],
+    /// The sending node's ID
+    pub from_node: NodeId,
+    /// Reason for abort
+    pub reason: String,
+}
+
 /// Reasons for rejecting a swap
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SwapRejectReason {
@@ -203,13 +245,62 @@ impl TryFrom<u8> for SwapRejectReason {
     }
 }
 
+/// State of a pending 2-phase swap
+///
+/// Created in the prepare phase (proposal sent / accept sent): capacity
+/// is reserved and chunk payloads are buffered, but nothing is stored in
+/// the chunk holder. Storage happens only when both sides have sent and
+/// received their [`SwapCommit`]-equivalent (see `SwapState::mark_commit_
+/// received` callers); any failure or timeout aborts and releases the
+/// reservation.
+#[derive(Debug, Clone)]
+pub struct PendingSwap {
+    /// The proposal ID
+    pub proposal_id: [u8; 32],
+    /// The peer we're swapping with
+    pub peer: NodeId,
+    /// The chunk we offered (stays in our holder; tracked for the swap)
+    pub our_chunk_id: ChunkId,
+    /// The chunk they offered
+    pub their_chunk_id: ChunkId,
+    /// The chunk data they offered (held in reserve until commit)
+    ///
+    /// Swaps carry chunks in-band (inside [`SwapProposal`] /
+    /// [`SwapAccept`]), so this is populated as soon as the peer's
+    /// message arrives; it is held here — not in the chunk holder —
+    /// until the commit phase.
+    pub their_chunk_data: Vec<u8>,
+    /// Size of the reserved capacity (bytes of `their_chunk_data`)
+    pub reserved_bytes: u64,
+    /// Whether we've received their chunk (always true for in-band swaps)
+    pub received_their_chunk: bool,
+    /// Whether we've sent our commit
+    pub sent_commit: bool,
+    /// Whether we've received their commit
+    pub received_commit: bool,
+    /// The renewal token for the held chunk (from the proposal's lease)
+    pub renewal_token: [u8; 32],
+    /// The lease expiry for the held chunk (from the proposal's lease)
+    pub lease_expires_at: u64,
+    /// The content owner's Ed25519 public key (for heartbeat verification)
+    pub content_pub_key: [u8; 32],
+    /// When the swap was initiated (for timeout)
+    pub started_at: u64,
+}
+
 /// Local state for tracking pending and active swaps
 #[derive(Debug, Clone, Default)]
 pub struct SwapState {
     /// Pending proposals (proposal_id -> proposal)
     pub pending_proposals: HashMap<[u8; 32], SwapProposal>,
+    /// Pending 2-phase swaps (proposal_id -> pending swap)
+    pub pending_swaps: HashMap<[u8; 32], PendingSwap>,
     /// Active swaps (chunk_id -> swap partner node ID)
     pub active_swaps: HashMap<ChunkId, NodeId>,
+    /// Completed 2-phase swaps (proposal IDs, for cleanup/inspection)
+    pub completed_swaps: Vec<[u8; 32]>,
+    /// Aborted 2-phase swaps (proposal IDs, for cleanup/inspection)
+    pub aborted_swaps: Vec<[u8; 32]>,
     /// Total bytes currently swapped
     pub total_swapped_bytes: u64,
     /// Number of successful swaps
@@ -254,6 +345,92 @@ impl SwapState {
     /// Get the swap partner for a chunk
     pub fn get_swap_partner(&self, chunk_id: &ChunkId) -> Option<&NodeId> {
         self.active_swaps.get(chunk_id)
+    }
+
+    /// Track a pending 2-phase swap (prepare phase)
+    pub fn start_pending_swap(&mut self, swap: PendingSwap) {
+        self.pending_swaps.insert(swap.proposal_id, swap);
+    }
+
+    /// Mark their chunk as received in a pending swap
+    pub fn mark_chunk_received(&mut self, proposal_id: &[u8; 32]) {
+        if let Some(swap) = self.pending_swaps.get_mut(proposal_id) {
+            swap.received_their_chunk = true;
+        }
+    }
+
+    /// Mark our commit as sent in a pending swap
+    pub fn mark_commit_sent(&mut self, proposal_id: &[u8; 32]) {
+        if let Some(swap) = self.pending_swaps.get_mut(proposal_id) {
+            swap.sent_commit = true;
+        }
+    }
+
+    /// Mark their commit as received in a pending swap
+    ///
+    /// Returns `true` when the swap is ready to finalize (we have both
+    /// sent and received our commit, and hold their chunk).
+    pub fn mark_commit_received(&mut self, proposal_id: &[u8; 32]) -> bool {
+        match self.pending_swaps.get_mut(proposal_id) {
+            Some(swap) => {
+                swap.received_commit = true;
+                swap.sent_commit && swap.received_their_chunk
+            }
+            None => false,
+        }
+    }
+
+    /// Finalize a pending swap: record it as active and completed
+    ///
+    /// Removes the pending entry, records the held chunk under the
+    /// partner in `active_swaps`, and appends the proposal ID to
+    /// `completed_swaps`. Returns the removed pending swap so the caller
+    /// can release the reservation and store the chunk.
+    pub fn complete_swap(&mut self, proposal_id: &[u8; 32]) -> Option<PendingSwap> {
+        let swap = self.pending_swaps.remove(proposal_id)?;
+        self.active_swaps.insert(swap.their_chunk_id, swap.peer);
+        self.successful_swaps += 1;
+        self.total_swapped_bytes += swap.reserved_bytes;
+        self.completed_swaps.push(*proposal_id);
+        Some(swap)
+    }
+
+    /// Abort a pending swap
+    ///
+    /// Removes the pending entry and appends the proposal ID to
+    /// `aborted_swaps`. Returns the removed pending swap so the caller
+    /// can release the reserved capacity.
+    pub fn abort_swap(&mut self, proposal_id: &[u8; 32]) -> Option<PendingSwap> {
+        let swap = self.pending_swaps.remove(proposal_id)?;
+        self.aborted_swaps.push(*proposal_id);
+        Some(swap)
+    }
+
+    /// Get a pending swap
+    pub fn get_pending_swap(&self, proposal_id: &[u8; 32]) -> Option<&PendingSwap> {
+        self.pending_swaps.get(proposal_id)
+    }
+
+    /// Expire pending swaps that exceeded the timeout
+    ///
+    /// Removes and returns every pending swap older than
+    /// `timeout_secs` so the caller can notify the peer and release its
+    /// reserved capacity. Expired proposal IDs are recorded in
+    /// `aborted_swaps`.
+    pub fn expire_pending_swaps(&mut self, current_time: u64, timeout_secs: u64) -> Vec<PendingSwap> {
+        let expired: Vec<[u8; 32]> = self
+            .pending_swaps
+            .iter()
+            .filter(|(_, swap)| current_time.saturating_sub(swap.started_at) > timeout_secs)
+            .map(|(id, _)| *id)
+            .collect();
+        expired
+            .into_iter()
+            .filter_map(|id| {
+                self.aborted_swaps.push(id);
+                self.pending_swaps.remove(&id)
+            })
+            .collect()
     }
 
     /// Get statistics
@@ -454,6 +631,13 @@ pub struct StorageCapacity {
     pub max_bytes: u64,
     /// Current bytes stored for others
     pub current_bytes: u64,
+    /// Bytes reserved by pending 2-phase swaps
+    ///
+    /// Reserved capacity is not yet stored (the chunk waits in the
+    /// pending swap), so it lives outside `current_bytes` — the periodic
+    /// `reconcile()` snap to holder reality would otherwise erase it.
+    /// `can_accept` counts it so concurrent swaps cannot overcommit.
+    pub reserved_bytes: u64,
     /// Maximum chunks from a single peer
     pub max_chunks_per_peer: usize,
 }
@@ -464,13 +648,16 @@ impl StorageCapacity {
         Self {
             max_bytes,
             current_bytes: 0,
+            reserved_bytes: 0,
             max_chunks_per_peer: 100,
         }
     }
 
     /// Check if we can accept a chunk
+    ///
+    /// Counts stored bytes plus bytes reserved by pending swaps.
     pub fn can_accept(&self, chunk_size: u64, peer_chunks: usize) -> bool {
-        if self.current_bytes + chunk_size > self.max_bytes {
+        if self.current_bytes + self.reserved_bytes + chunk_size > self.max_bytes {
             return false;
         }
         if peer_chunks >= self.max_chunks_per_peer {
@@ -487,6 +674,23 @@ impl StorageCapacity {
     /// Record removing a chunk
     pub fn record_remove(&mut self, chunk_size: u64) {
         self.current_bytes = self.current_bytes.saturating_sub(chunk_size);
+    }
+
+    /// Reserve capacity for a pending 2-phase swap
+    pub fn reserve(&mut self, chunk_size: u64) {
+        self.reserved_bytes += chunk_size;
+    }
+
+    /// Release reserved capacity (abort or commit finalization)
+    ///
+    /// `store` selects the destination: on abort the bytes simply
+    /// disappear; on commit they move into `current_bytes` because the
+    /// chunk is now actually stored.
+    pub fn release_reserved(&mut self, chunk_size: u64, store: bool) {
+        self.reserved_bytes = self.reserved_bytes.saturating_sub(chunk_size);
+        if store {
+            self.current_bytes += chunk_size;
+        }
     }
 
     /// Reconcile current_bytes with the actual bytes held
@@ -537,6 +741,12 @@ mod tests {
 
     fn random_node_id() -> NodeId {
         let mut id = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut id);
+        id
+    }
+
+    fn random_chunk_id() -> ChunkId {
+        let mut id = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut id);
         id
     }
@@ -999,5 +1209,166 @@ mod tests {
         assert_eq!(stats.pending_count, 1);
         assert_eq!(stats.active_count, 0);
         assert_eq!(stats.successful_swaps, 0);
+    }
+
+    fn test_pending_swap(peer: NodeId, proposal_id: [u8; 32], chunk_id: ChunkId) -> PendingSwap {
+        PendingSwap {
+            proposal_id,
+            peer,
+            our_chunk_id: random_chunk_id(),
+            their_chunk_id: chunk_id,
+            their_chunk_data: vec![0xEEu8; 64],
+            reserved_bytes: 64,
+            received_their_chunk: true,
+            sent_commit: false,
+            received_commit: false,
+            renewal_token: [0u8; 32],
+            lease_expires_at: current_timestamp() + 3600,
+            content_pub_key: [0x11u8; 32],
+            started_at: current_timestamp(),
+        }
+    }
+
+    #[test]
+    fn test_pending_swap_creation() {
+        // PendingSwap is tracked and retrievable by proposal ID.
+        let peer = random_node_id();
+        let chunk_id = random_chunk_id();
+        let pid = [0x01u8; 32];
+        let mut state = SwapState::new();
+
+        state.start_pending_swap(test_pending_swap(peer, pid, chunk_id));
+        assert_eq!(state.pending_swaps.len(), 1);
+
+        let swap = state.get_pending_swap(&pid).unwrap();
+        assert_eq!(swap.peer, peer);
+        assert_eq!(swap.their_chunk_id, chunk_id);
+        assert!(swap.received_their_chunk);
+        assert!(!swap.sent_commit);
+        assert!(!swap.received_commit);
+    }
+
+    #[test]
+    fn test_pending_swap_both_commit() {
+        // Both commits -> swap completes: chunk becomes active, pending
+        // entry removed, completion recorded.
+        let peer = random_node_id();
+        let chunk_id = random_chunk_id();
+        let pid = [0x02u8; 32];
+        let mut state = SwapState::new();
+        state.start_pending_swap(test_pending_swap(peer, pid, chunk_id));
+
+        state.mark_commit_sent(&pid);
+        // Their chunk arrived in-band with the proposal, so receiving
+        // their commit completes the swap on our side immediately.
+        assert!(state.mark_commit_received(&pid));
+        let swap = state.complete_swap(&pid).unwrap();
+
+        assert!(state.get_pending_swap(&pid).is_none());
+        assert_eq!(state.get_swap_partner(&chunk_id), Some(&peer));
+        assert_eq!(state.successful_swaps, 1);
+        assert_eq!(state.total_swapped_bytes, 64);
+        assert_eq!(state.completed_swaps, vec![pid]);
+        assert_eq!(swap.their_chunk_data, vec![0xEEu8; 64]);
+    }
+
+    #[test]
+    fn test_pending_swap_one_aborts() {
+        // Abort -> swap cancelled; the caller releases reserved capacity.
+        let peer = random_node_id();
+        let chunk_id = random_chunk_id();
+        let pid = [0x03u8; 32];
+        let mut state = SwapState::new();
+        state.start_pending_swap(test_pending_swap(peer, pid, chunk_id));
+
+        state.mark_commit_sent(&pid);
+        let mut capacity = StorageCapacity::new(1024);
+        capacity.reserve(64);
+        assert_eq!(capacity.reserved_bytes, 64);
+
+        state.abort_swap(&pid);
+        capacity.release_reserved(64, false);
+
+        assert!(state.get_pending_swap(&pid).is_none());
+        assert!(state.get_swap_partner(&chunk_id).is_none());
+        assert_eq!(state.aborted_swaps, vec![pid]);
+        assert_eq!(capacity.reserved_bytes, 0);
+        assert_eq!(capacity.current_bytes, 0);
+    }
+
+    #[test]
+    fn test_pending_swap_timeout() {
+        // Timeout -> swap cancelled and returned for abort handling.
+        let peer = random_node_id();
+        let chunk_id = random_chunk_id();
+        let pid = [0x04u8; 32];
+        let mut state = SwapState::new();
+        state.start_pending_swap(test_pending_swap(peer, pid, chunk_id));
+
+        // Not yet timed out.
+        assert!(state.expire_pending_swaps(current_timestamp(), 300).is_empty());
+        assert!(state.get_pending_swap(&pid).is_some());
+
+        // Past the timeout: expired and moved to aborted.
+        let expired = state.expire_pending_swaps(current_timestamp() + 301, 300);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].proposal_id, pid);
+        assert!(state.get_pending_swap(&pid).is_none());
+        assert_eq!(state.aborted_swaps, vec![pid]);
+    }
+
+    #[test]
+    fn test_pending_swap_partial_commit() {
+        // Commit sent but never received (peer crashed): swap stays
+        // pending until it expires.
+        let peer = random_node_id();
+        let chunk_id = random_chunk_id();
+        let pid = [0x05u8; 32];
+        let mut state = SwapState::new();
+        state.start_pending_swap(test_pending_swap(peer, pid, chunk_id));
+
+        state.mark_commit_sent(&pid);
+        assert!(state.get_pending_swap(&pid).unwrap().sent_commit);
+        assert!(!state.get_pending_swap(&pid).unwrap().received_commit);
+        assert!(state.get_pending_swap(&pid).is_some());
+        // Nothing finalized: no active swap, no completion record.
+        assert!(state.get_swap_partner(&chunk_id).is_none());
+        assert!(state.completed_swaps.is_empty());
+    }
+
+    #[test]
+    fn test_capacity_reservation_gates_accept() {
+        // Reserved bytes count against can_accept but not current_bytes;
+        // commit moves them into current_bytes, abort discards them.
+        let mut capacity = StorageCapacity::new(1024);
+        capacity.record_accept(512);
+        capacity.reserve(384);
+
+        // current+reserved+chunk must fit: 512+384+128 = 1024 fits,
+        // 512+384+256 = 1152 does not.
+        assert!(capacity.can_accept(128, 0));
+        assert!(!capacity.can_accept(256, 0));
+        assert_eq!(capacity.current_bytes, 512);
+
+        // reconcile snaps stored bytes without touching reservations.
+        capacity.reconcile(600);
+        assert_eq!(capacity.current_bytes, 600);
+        assert_eq!(capacity.reserved_bytes, 384);
+        assert!(!capacity.can_accept(64, 0));
+
+        // Commit: reservation converts to stored bytes.
+        capacity.release_reserved(384, true);
+        assert_eq!(capacity.reserved_bytes, 0);
+        assert_eq!(capacity.current_bytes, 984);
+
+        // Abort: reservation simply disappears.
+        capacity.reserve(128);
+        capacity.release_reserved(128, false);
+        assert_eq!(capacity.reserved_bytes, 0);
+        assert_eq!(capacity.current_bytes, 984);
+
+        // Release is saturating (no underflow).
+        capacity.release_reserved(9999, false);
+        assert_eq!(capacity.reserved_bytes, 0);
     }
 }

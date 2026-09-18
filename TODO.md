@@ -263,12 +263,60 @@ Implemented (all Sphinx-wrapped, no clear JSON, no new dependencies):
   retrieval is in flight (shared ContentRetriever).
 
 Phase 2 (deferred, per plan):
-- True atomic 2-phase swap commit
 - Withdrawal/exit + sponsor hand-off protocol (Item 13)
 - Darkfi/Navio watchers (external blockers unchanged)
-- Signed heartbeats (Ed25519 content-owner signature closing the upsert
-  trade-off)
 - Network-wide health quorum queries (current copy counts are local estimates)
+
+## Phase 3 Notes (2026-09-18) — Signed Heartbeats & True Atomic Swaps
+
+Both remaining Phase 2 security items implemented (391 tests, release build
+zero warnings):
+
+**Signed heartbeats** (closes the Phase 1 upsert trust trade-off):
+- `Heartbeat` carries `signature` + `content_pub_key`; Ed25519 signature
+  over `content_id || chunk_ids || new_expires_at || nonce` from the
+  content owner key (`content_id = blake3(pub)`, same keypair the content
+  identity is derived from). Binary ser/de extended (sig length-prefixed,
+  bounded at 64).
+- Holders verify before consuming the nonce or touching leases
+  (`process_heartbeat` + `process_heartbeat_upsert`): binding
+  (`blake3(pub) == content_id`), signature, and lease-key match. Leases
+  minted pre-signatures (all-zero key) adopt the verified key once; the
+  renewal-token check remains the guard there.
+- Commit-time leases: swap finalization inserts the lease with the
+  owner key from the `SwapProposal` content binding, so the first
+  heartbeat is already verified against the true owner.
+- Publisher side: `NodeRunner.content_keypairs` stores each published
+  content's `SigningKey` (both full-node and seed-only paths);
+  `propagate_heartbeats_once` signs, skipping content without a key.
+
+**True atomic swaps (2-phase commit)**:
+- New wire messages `SwapCommit` (0x0B) / `SwapAbort` (0x0C) (JSON,
+  padded like other maintenance traffic). Chunks travel in-band inside
+  proposal/accept as before (the spec's ChunkRequest retrieval phase is
+  unnecessary — validated the design against the existing in-band barter).
+- Prepare: capacity is RESERVED (`StorageCapacity.reserved_bytes`, a
+  separate counter that survives `reconcile()`; `can_accept` counts it)
+  and the peer's chunk is buffered in `PendingSwap` — nothing stored.
+  Commit: chunks stored + reservation converted only after both sides
+  sent and received commits (race-safe via `finalize_swap_if_ready`).
+  Abort/timeout (5 min, 32-pending DoS cap): reservation released,
+  nothing stored. 1:1 ratio preserved under node failure.
+- Timeout sweep runs in the lifecycle loop (`expire_pending_swaps` on
+  `TransportState`, notifies the peer).
+- Constructor unification: `create_transport_state` now takes the shared
+  `swap_state` Arc + optional `leases` Arc (single constructor, no
+  delegates). Fixes the pre-existing split where `NodeRunner.swaps` and
+  `TransportState.swap_state` were different registries — the
+  verification-challenge tick now sees real swaps.
+- Bounded memory: pending swaps buffer two ~1 MiB payloads each.
+
+Known constraint (pre-existing, out of scope): swap proposal/accept
+payloads (1 MiB chunks JSON-encoded) exceed `PADDED_MESSAGE_SIZE`, so
+swap barter cannot traverse real TCP framing — it was always exercised
+via direct `handle_message` (mesh tests + the new runner-level
+`bridge_runners` loopback). Fixing wire transport for large swap
+payloads (binary framing or chunked transfer) is future work.
 
 ## Phase 2 Hotfix Notes (2026-09-18) — Hybrid Packet Migration
 

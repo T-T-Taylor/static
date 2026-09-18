@@ -6,7 +6,7 @@ use static_mesh::transport::{
     TransportState, InboundMessage, create_transport_state,
     start_listener, connect_to_peer, send_sphinx,
 };
-use static_storage::swap::StorageCapacity;
+use static_storage::swap::{StorageCapacity, SwapState};
 use static_mesh::retrieval::{create_anonymous_request_hybrid, RetrievalManager};
 use static_mesh::wire::WireMessage;
 use static_mesh::CoverTrafficConfig;
@@ -22,7 +22,14 @@ async fn setup_node(port: u16) -> (Arc<TransportState>, mpsc::Receiver<InboundMe
     let capacity = Arc::new(tokio::sync::Mutex::new(StorageCapacity::new(
         10 * 1024 * 1024 * 1024,
     )));
-    let (state, rx) = create_transport_state(node_id, mix_node, cover_config, capacity);
+    let (state, rx) = create_transport_state(
+        node_id,
+        mix_node,
+        cover_config,
+        capacity,
+        Arc::new(tokio::sync::Mutex::new(SwapState::new())),
+        None,
+    );
 
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
     let state_clone = state.clone();

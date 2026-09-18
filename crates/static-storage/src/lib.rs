@@ -103,6 +103,15 @@ pub struct ChunkLease {
     pub expires_at: u64,
     /// Renewal token (proves the owner is authorized to refresh)
     pub renewal_token: [u8; 32],
+    /// Content owner's Ed25519 public key (for heartbeat verification)
+    ///
+    /// Set when the chunk is accepted via swap (from the
+    /// [`crate::swap::SwapProposal`] content binding) or on the first
+    /// signed heartbeat against a legacy lease. All-zero means unknown
+    /// (leases minted before signed heartbeats); the first valid signed
+    /// heartbeat adopts its key.
+    #[serde(default)]
+    pub content_pub_key: [u8; 32],
 }
 
 /// Content manifest describing how to reconstruct a file
@@ -520,6 +529,7 @@ pub fn create_lease(
         chunk_id: *_chunk_id,
         expires_at: current_time + duration_secs,
         renewal_token,
+        content_pub_key: [0u8; 32],
     }
 }
 
@@ -560,6 +570,7 @@ pub fn refresh_lease(
         chunk_id: lease.chunk_id,
         expires_at: current_time + new_duration_secs,
         renewal_token: lease.renewal_token,
+        content_pub_key: lease.content_pub_key,
     })
 }
 

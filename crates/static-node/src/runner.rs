@@ -350,6 +350,13 @@ pub struct NodeRunner {
     pub accounting: Arc<Mutex<AccountingState>>,
     /// Storage master key for this node's published content
     pub storage_keys: Arc<Mutex<HashMap<ContentId, SymmetricKey>>>,
+    /// Content owner signing keys for published content
+    ///
+    /// The Ed25519 key each content identity is derived from
+    /// (`content_id = blake3(pub)`), used to sign heartbeats so holders
+    /// can verify lease renewals (Phase 2). Populated in
+    /// `publish_content` for both the full-node and seed-only paths.
+    pub content_keypairs: Arc<Mutex<HashMap<ContentId, ed25519_dalek::SigningKey>>>,
     /// Content retriever for assembling files from chunks
     /// Content retriever for assembling files from chunks
     pub content_retriever: Arc<Mutex<ContentRetriever>>,
@@ -435,8 +442,19 @@ impl NodeRunner {
         // periodic reconciler all observe the same object, so the
         // counter cannot drift between layers.
         let capacity = Arc::new(Mutex::new(StorageCapacity::new(config.max_storage_bytes)));
-        let (mut transport, inbound_rx) =
-            create_transport_state(node_id, mix_node, cover_config, capacity.clone());
+        // One shared swap registry: the transport-side 2-phase swap flow
+        // and runner-side consumers (verification challenges, heartbeat
+        // propagation) observe the same object.
+        let swaps = Arc::new(Mutex::new(SwapState::new()));
+        let leases = Arc::new(Mutex::new(LeaseManager::new()));
+        let (mut transport, inbound_rx) = create_transport_state(
+            node_id,
+            mix_node,
+            cover_config,
+            capacity.clone(),
+            swaps.clone(),
+            Some(leases.clone()),
+        );
 
         // Backup-only nodes start dormant: they hold chunks but do not
         // serve them until the primary fails (see backup_health_loop).
@@ -464,11 +482,12 @@ impl NodeRunner {
 
         Self {
             transport,
-            leases: Arc::new(Mutex::new(LeaseManager::new())),
-            swaps: Arc::new(Mutex::new(SwapState::new())),
+            leases,
+            swaps,
             capacity,
             accounting: Arc::new(Mutex::new(AccountingState::default())),
             storage_keys: Arc::new(Mutex::new(HashMap::new())),
+            content_keypairs: Arc::new(Mutex::new(HashMap::new())),
             retriever: Arc::new(Mutex::new(static_mesh::retrieval::RetrievalManager::new())),
             content_retriever: Arc::new(Mutex::new(ContentRetriever::new())),
             repair_state: Arc::new(Mutex::new(RepairState::new())),
@@ -2485,6 +2504,15 @@ impl NodeRunner {
         let content_pub_key = content_sk.verifying_key().to_bytes();
         let content_id = static_storage::hidden_service::content_id_from_public(&content_pub_key);
 
+        // Keep the owner key so heartbeat_sender_loop can sign lease
+        // renewals (holders verify the signature against the key stored
+        // from the swap proposal). Registered before the mode split so
+        // seed-only publishers sign their sponsor heartbeats too.
+        self.content_keypairs
+            .lock()
+            .await
+            .insert(content_id, content_sk.clone());
+
         // 2. Encrypt the file into chunks
         let master_key = SymmetricKey::random();
         let nonce = static_crypto::NonceBytes::random();
@@ -3382,6 +3410,9 @@ async fn lease_expiration_and_repair_loop(runner: Arc<NodeRunner>) {
         run_repair_tick(&runner).await;
         // 2. Then expiry.
         expire_chunks_once(&runner.leases, &runner.transport.chunk_holder, &runner.capacity).await;
+        // 3. Then pending 2-phase swap timeouts: abort + release the
+        // reserved capacity so a crashed peer cannot strand barter.
+        runner.transport.expire_pending_swaps().await;
     }
 }
 
@@ -3650,12 +3681,23 @@ async fn propagate_heartbeats_once(runner: &Arc<NodeRunner>) -> usize {
 
     let mut notified = 0usize;
     for (content_id, chunk_ids) in &owned {
+        // The content owner's signing key (same key the content_id is
+        // derived from); heartbeats are rejected by holders without it.
+        let Some(signing_key) = runner.content_keypairs.lock().await.get(content_id).cloned()
+        else {
+            debug!(
+                "No content signing key for {:02x?}; skipping heartbeat",
+                content_id
+            );
+            continue;
+        };
         // Create the heartbeat (requires the owned master key).
         let heartbeat = {
             let leases = runner.leases.lock().await;
             match leases.create_heartbeat(
                 content_id,
                 static_storage::heartbeat::DEFAULT_LEASE_DURATION_SECS,
+                &signing_key,
             ) {
                 Ok(hb) => hb,
                 Err(_) => continue,
@@ -5133,11 +5175,22 @@ mod tests {
             [0x42u8; 16],
             MixNode::new(),
         ));
-        let content_id: ContentId = [0x15u8; 32];
+        // The content identity derives from the owner signing key:
+        // content_id = blake3(pub).
+        let mut sk_bytes = [0x42u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut sk_bytes);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
+        let content_id: ContentId =
+            *blake3::hash(&signing_key.verifying_key().to_bytes()).as_bytes();
         let chunk_id: ChunkId = [0x16u8; 32];
         let peer: NodeId = [0x17u8; 16];
         let master = SymmetricKey::random();
 
+        runner
+            .content_keypairs
+            .lock()
+            .await
+            .insert(content_id, signing_key);
         runner
             .leases
             .lock()
@@ -5179,7 +5232,11 @@ mod tests {
             [0x42u8; 16],
             MixNode::new(),
         ));
-        let content_id: ContentId = [0x18u8; 32];
+        let mut sk_bytes = [0x43u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut sk_bytes);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
+        let content_id: ContentId =
+            *blake3::hash(&signing_key.verifying_key().to_bytes()).as_bytes();
         let chunk_id: ChunkId = [0x19u8; 32];
         let token = [0x33u8; 32];
 
@@ -5191,15 +5248,17 @@ mod tests {
             .await
             .add_chunk(chunk_id, vec![0xDDu8; 256], content_id);
 
-        // A holder-role heartbeat arrives from the owner.
-        let heartbeat = Heartbeat::new(content_id, token, vec![chunk_id], 3600);
+        // A holder-role heartbeat arrives from the owner (signed).
+        let mut heartbeat = Heartbeat::new(content_id, token, vec![chunk_id], 3600);
+        heartbeat.sign(&signing_key);
         let payload = heartbeat.wire_serialize();
         for fragment in static_mesh::fragment::fragment_payload(&payload) {
             let body = static_mesh::fragment::serialize_fragment(&fragment);
             runner.handle_lifecycle_fragment(&body, [0x77u8; 16]).await;
         }
 
-        // Upsert created a bounded lease for the held chunk.
+        // Upsert created a bounded lease for the held chunk, recording
+        // the verified owner key.
         let now = current_timestamp();
         let lease = runner
             .leases
@@ -5210,6 +5269,7 @@ mod tests {
             .cloned()
             .expect("lease upserted");
         assert_eq!(lease.renewal_token, token);
+        assert_eq!(lease.content_pub_key, signing_key.verifying_key().to_bytes());
         assert!(lease.expires_at > now);
         assert!(lease.expires_at <= now + static_storage::heartbeat::DEFAULT_LEASE_DURATION_SECS);
     }
@@ -5369,6 +5429,65 @@ mod tests {
         panic!("timed out waiting for condition");
     }
 
+    /// Wire two runners' swap-control channels together in-process.
+    ///
+    /// Swap proposal payloads (1 MiB chunks JSON-encoded) exceed the
+    /// padded wire size, so a full 2-phase swap cannot traverse real
+    /// TCP framing. The bridge routes each side's outbound swap
+    /// messages straight into the peer's `handle_message`, exercising
+    /// the complete protocol across both runners' real transport state
+    /// (capacity, swap registry, chunk holders, leases).
+    async fn bridge_runners(a: &Arc<NodeRunner>, b: &Arc<NodeRunner>) {
+        let (tx_ab, mut rx_ab) =
+            tokio::sync::mpsc::channel::<static_mesh::wire::WireMessage>(64);
+        let (tx_ba, mut rx_ba) =
+            tokio::sync::mpsc::channel::<static_mesh::wire::WireMessage>(64);
+        a.transport
+            .connections
+            .write()
+            .await
+            .insert(b.transport.node_id, tx_ab);
+        b.transport
+            .connections
+            .write()
+            .await
+            .insert(a.transport.node_id, tx_ba);
+        let id_a = a.transport.node_id;
+        let id_b = b.transport.node_id;
+        let state_a = a.transport.clone();
+        let state_b = b.transport.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = rx_ba.recv().await {
+                let _ = static_mesh::transport::handle_message(msg, &state_a, id_b).await;
+            }
+        });
+        tokio::spawn(async move {
+            while let Some(msg) = rx_ab.recv().await {
+                let _ = static_mesh::transport::handle_message(msg, &state_b, id_a).await;
+            }
+        });
+    }
+
+    /// One-way variant of [`bridge_runners`]: only messages from
+    /// `from` are delivered to `to`; `to`'s replies are dropped (the
+    /// peer appears unresponsive — the timeout scenario).
+    async fn bridge_one_way(from: &Arc<NodeRunner>, to: &Arc<NodeRunner>) {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<static_mesh::wire::WireMessage>(64);
+        from.transport
+            .connections
+            .write()
+            .await
+            .insert(to.transport.node_id, tx);
+        let id_from = from.transport.node_id;
+        let state_to = to.transport.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                let _ = static_mesh::transport::handle_message(msg, &state_to, id_from).await;
+            }
+        });
+    }
+
     #[tokio::test]
     async fn test_compute_request_over_tcp() {
         let (a, b) = tcp_pair(true).await;
@@ -5490,5 +5609,285 @@ mod tests {
         let received = a.pending_payment(&request_id).await.unwrap();
         assert_eq!(received.amount, 1234);
         assert_eq!(received.address, "test-address");
+    }
+
+    /// Build a signed 1:1 swap proposal for `our_chunk` (real Merkle
+    /// proof + Ed25519 content binding, same as the transport tests).
+    fn make_signed_proposal(
+        from: NodeId,
+        chunk: static_storage::EncryptedChunk,
+    ) -> (static_storage::swap::SwapProposal, ed25519_dalek::SigningKey) {
+        use rand::RngCore;
+        let master = SymmetricKey::random();
+        let (content_root, proofs) =
+            static_storage::integrity::generate_proofs(std::slice::from_ref(&chunk));
+        let mut sk_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut sk_bytes);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
+        let content_public_key = signing_key.verifying_key().to_bytes();
+        let content_id = *blake3::hash(&content_public_key).as_bytes();
+        let proposal = static_storage::swap::create_swap_proposal(
+            from,
+            chunk,
+            &master,
+            static_storage::swap::DEFAULT_LEASE_DURATION_SECS,
+            content_root,
+            proofs.into_iter().next().expect("one chunk, one proof"),
+            content_id,
+            content_public_key,
+            Some(&signing_key),
+        );
+        (proposal, signing_key)
+    }
+
+    #[tokio::test]
+    async fn test_signed_heartbeat_sent() {
+        // End-to-end: the publisher's heartbeat propagation path sends a
+        // Sphinx-wrapped heartbeat whose signature the holder verifies,
+        // and the upserted lease records the verified owner key.
+        let (a, b) = tcp_pair(false).await;
+
+        let mut sk_bytes = [0x99u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut sk_bytes);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
+        let content_id: ContentId =
+            *blake3::hash(&signing_key.verifying_key().to_bytes()).as_bytes();
+        let chunk_id: ChunkId = [0x1Au8; 32];
+        let master = SymmetricKey::random();
+
+        // A owns the content and B holds one of its chunks (swap barter).
+        a.content_keypairs
+            .lock()
+            .await
+            .insert(content_id, signing_key.clone());
+        a.leases
+            .lock()
+            .await
+            .register_owned_content(content_id, master, vec![chunk_id]);
+        a.transport
+            .swap_state
+            .lock()
+            .await
+            .record_swap(chunk_id, b.transport.node_id, 256);
+        b.transport
+            .chunk_holder
+            .lock()
+            .await
+            .add_chunk(chunk_id, vec![0xDDu8; 256], content_id);
+
+        let notified = propagate_heartbeats_once(&a).await;
+        assert_eq!(notified, 1);
+
+        wait_until(async || {
+            b.leases
+                .lock()
+                .await
+                .leases
+                .get(&chunk_id)
+                .is_some_and(|lease| {
+                    lease.content_pub_key == signing_key.verifying_key().to_bytes()
+                })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_atomic_swap_complete() {
+        // Full 2-phase barter over TCP: A proposes (chunk in-band), B
+        // accepts + commits, A commits back. Neither side stores until
+        // both commits have been exchanged; both chunks end up stored
+        // with the barter recorded.
+        let (a, b) = tcp_pair(false).await;
+        bridge_runners(&a, &b).await;
+
+        // B's return chunk (what B offers back).
+        let ret_id: ChunkId = [0xB0u8; 32];
+        let ret_data = vec![0xB7u8; static_storage::CHUNK_SIZE + 16];
+        b.transport
+            .chunk_holder
+            .lock()
+            .await
+            .add_chunk(ret_id, ret_data.clone(), [0u8; 32]);
+
+        // A's offered chunk with a genuine content binding.
+        let our_id: ChunkId = [0xB1u8; 32];
+        let our_data = vec![0xC7u8; static_storage::CHUNK_SIZE + 16];
+        let (proposal, _signing_key) = make_signed_proposal(
+            a.transport.node_id,
+            static_storage::EncryptedChunk { id: our_id, data: our_data.clone() },
+        );
+
+        let pid = a
+            .transport
+            .begin_swap_proposal(b.transport.node_id, &proposal)
+            .await;
+        let sender = a
+            .transport
+            .connections
+            .read()
+            .await
+            .get(&b.transport.node_id)
+            .cloned()
+            .expect("connected to B");
+        sender
+            .send(static_mesh::wire::WireMessage::SwapProposal(proposal.clone()))
+            .await
+            .unwrap();
+
+        // Both sides finalize: A stores B's return chunk, B stores A's
+        // offered chunk.
+        wait_until(async || {
+            a.transport.chunk_holder.lock().await.get_chunk(&ret_id).is_some()
+                && b.transport.chunk_holder.lock().await.get_chunk(&our_id).is_some()
+        })
+        .await;
+
+        // Barter recorded on both sides; reservations fully converted.
+        let a_cap = a.transport.storage_capacity.lock().await;
+        assert_eq!(a_cap.current_bytes, (static_storage::CHUNK_SIZE + 16) as u64);
+        assert_eq!(a_cap.reserved_bytes, 0);
+        drop(a_cap);
+        // B holds its pre-populated return chunk (reconciled into the
+        // counter by the proposal handler) plus A's incoming chunk.
+        let b_cap = b.transport.storage_capacity.lock().await;
+        assert_eq!(b_cap.current_bytes, (static_storage::CHUNK_SIZE + 16) as u64 * 2);
+        assert_eq!(b_cap.reserved_bytes, 0);
+        drop(b_cap);
+        {
+            let swaps = a.transport.swap_state.lock().await;
+            assert_eq!(swaps.get_swap_partner(&ret_id), Some(&b.transport.node_id));
+            assert_eq!(swaps.completed_swaps, vec![pid]);
+        }
+        {
+            let swaps = b.transport.swap_state.lock().await;
+            assert_eq!(swaps.get_swap_partner(&our_id), Some(&a.transport.node_id));
+            assert_eq!(swaps.completed_swaps, vec![pid]);
+        }
+        // B's lease for A's chunk carries the content owner key from the
+        // proposal, so signed heartbeats verify from the first renewal.
+        let lease = b
+            .leases
+            .lock()
+            .await
+            .leases
+            .get(&our_id)
+            .cloned()
+            .expect("lease inserted at commit");
+        assert_eq!(lease.content_pub_key, proposal.content_public_key);
+    }
+
+    #[tokio::test]
+    async fn test_atomic_swap_abort() {
+        // The proposer times out: it aborts its pending swap and
+        // notifies B, whose prepare-phase reservation is released.
+        // Neither side stores anything; the 1:1 ratio is preserved.
+        let (a, b) = tcp_pair(false).await;
+        // One-way bridge (A -> B): B's accept/commit never reach A, so
+        // A's pending swap survives until the timeout fires — the
+        // crash-mid-swap scenario the abort path exists for.
+        bridge_one_way(&a, &b).await;
+
+        let ret_id: ChunkId = [0xB8u8; 32];
+        let ret_data = vec![0xB9u8; static_storage::CHUNK_SIZE + 16];
+        b.transport
+            .chunk_holder
+            .lock()
+            .await
+            .add_chunk(ret_id, ret_data.clone(), [0u8; 32]);
+
+        let our_id: ChunkId = [0xBAu8; 32];
+        let our_data = vec![0xC9u8; static_storage::CHUNK_SIZE + 16];
+        let (proposal, _signing_key) = make_signed_proposal(
+            a.transport.node_id,
+            static_storage::EncryptedChunk { id: our_id, data: our_data.clone() },
+        );
+
+        let pid = a
+            .transport
+            .begin_swap_proposal(b.transport.node_id, &proposal)
+            .await;
+        let sender = a
+            .transport
+            .connections
+            .read()
+            .await
+            .get(&b.transport.node_id)
+            .cloned()
+            .expect("connected to B");
+        sender
+            .send(static_mesh::wire::WireMessage::SwapProposal(proposal))
+            .await
+            .unwrap();
+
+        // B is in the prepare phase (reserved, not stored).
+        wait_until(async || {
+            b.transport
+                .swap_state
+                .lock()
+                .await
+                .get_pending_swap(&pid)
+                .is_some()
+        })
+        .await;
+        assert!(b
+            .transport
+            .chunk_holder
+            .lock()
+            .await
+            .get_chunk(&our_id)
+            .is_none());
+        assert!(b.transport.storage_capacity.lock().await.reserved_bytes > 0);
+
+        // Age A's pending swap past the timeout and run the sweep.
+        {
+            let mut swaps = a.transport.swap_state.lock().await;
+            let started = swaps.get_pending_swap(&pid).unwrap().started_at;
+            swaps.pending_swaps.get_mut(&pid).unwrap().started_at = started
+                .saturating_sub(a.transport.pending_swap_timeout_secs + 1);
+        }
+        let aborted = a.transport.expire_pending_swaps().await;
+        assert_eq!(aborted, 1);
+
+        // B received the abort: reservation released, nothing stored.
+        wait_until(async || {
+            b.transport
+                .swap_state
+                .lock()
+                .await
+                .get_pending_swap(&pid)
+                .is_none()
+        })
+        .await;
+        let b_cap = b.transport.storage_capacity.lock().await;
+        assert_eq!(b_cap.reserved_bytes, 0);
+        drop(b_cap);
+        assert!(b
+            .transport
+            .chunk_holder
+            .lock()
+            .await
+            .get_chunk(&our_id)
+            .is_none());
+        assert!(a
+            .transport
+            .chunk_holder
+            .lock()
+            .await
+            .get_chunk(&ret_id)
+            .is_none());
+        assert!(a
+            .transport
+            .swap_state
+            .lock()
+            .await
+            .aborted_swaps
+            .contains(&pid));
+        assert!(b
+            .transport
+            .swap_state
+            .lock()
+            .await
+            .aborted_swaps
+            .contains(&pid));
     }
 }
