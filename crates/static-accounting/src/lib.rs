@@ -242,6 +242,25 @@ impl AccountingState {
         self.get_or_create_peer(&peer).record_received(bytes, ts);
     }
 
+    /// Record a successful chunk integrity challenge against a peer
+    ///
+    /// The peer returned segment data matching the manifest hash: it
+    /// really stores the chunk it claims to store.
+    pub fn record_challenge_success(&mut self, peer: &NodeId) {
+        let ts = current_timestamp();
+        self.get_or_create_peer(peer).record_challenge_success(ts);
+    }
+
+    /// Record a failed chunk integrity challenge against a peer
+    ///
+    /// Covers wrong segment data, `found: false` answers, and timed-out
+    /// (unanswered) challenges. Repeated failures deprioritize the peer
+    /// via [`AccountingState::should_serve`].
+    pub fn record_challenge_failure(&mut self, peer: &NodeId) {
+        let ts = current_timestamp();
+        self.get_or_create_peer(peer).record_challenge_failure(ts);
+    }
+
     /// Record a prepayment to a sponsor peer
     ///
     /// Prepayments count toward the seed-only node's 1:1 contribution:
@@ -388,6 +407,19 @@ impl AccountingState {
                 requested_bytes <= self.initial_credit
             }
             Some(c) => {
+                // Deprioritize proven freeloaders (item 14): a peer with a
+                // meaningful challenge history (more than 10 challenges)
+                // and under 50% success rate is denied regardless of
+                // credit. This is a hard gate placed before the
+                // early-return checks below — appended after them it
+                // would be dead code for credit-rich peers, which is
+                // exactly the freeloading profile it targets. The >10
+                // threshold damps network-glitch false positives.
+                let total_challenges = c.successful_challenges + c.failed_challenges;
+                if total_challenges > 10 && c.challenge_success_rate() < 0.5 {
+                    return false;
+                }
+
                 // Check net credit first
                 if c.has_credit(requested_bytes) {
                     return true;
@@ -888,6 +920,67 @@ mod tests {
         // Ratio is 0.1, below min_ratio of 0.5
         // No net credit and bad ratio
         assert!(!state.should_serve(&peer, 100));
+    }
+
+    #[test]
+    fn test_challenge_success_tracking() {
+        let mut state = AccountingState::new();
+        let peer = random_node_id();
+
+        // Recording creates the peer entry (no silent drops) and
+        // updates the counters.
+        state.record_challenge_success(&peer);
+        state.record_challenge_success(&peer);
+        state.record_challenge_failure(&peer);
+
+        let credit = &state.peers[&peer];
+        assert_eq!(credit.successful_challenges, 2);
+        assert_eq!(credit.failed_challenges, 1);
+        assert_eq!(credit.challenge_success_rate(), 2.0 / 3.0);
+    }
+
+    #[test]
+    fn test_should_serve_rejects_low_success_rate() {
+        let mut state = AccountingState::new();
+        let peer = random_node_id();
+
+        // Ample credit would normally allow any small request...
+        state.record_served(peer, 10_000);
+        // ...but 11 challenges with a 5/11 (~45%) success rate flag the
+        // peer as a freeloader.
+        for _ in 0..5 {
+            state.record_challenge_success(&peer);
+        }
+        for _ in 0..6 {
+            state.record_challenge_failure(&peer);
+        }
+
+        assert!(!state.should_serve(&peer, 100));
+    }
+
+    #[test]
+    fn test_should_serve_allows_high_success_rate() {
+        let mut state = AccountingState::new();
+        let peer = random_node_id();
+
+        state.record_served(peer, 10_000);
+        for _ in 0..12 {
+            state.record_challenge_success(&peer);
+        }
+        for _ in 0..2 {
+            state.record_challenge_failure(&peer);
+        }
+        // 12/14 (~86%) success: the gate does not fire.
+        assert!(state.should_serve(&peer, 100));
+
+        // Boundary: exactly 10 challenges (even all failures) stays
+        // under the >10 threshold, so no history means no penalty.
+        let fresh = random_node_id();
+        state.record_served(fresh, 10_000);
+        for _ in 0..10 {
+            state.record_challenge_failure(&fresh);
+        }
+        assert!(state.should_serve(&fresh, 100));
     }
 
     #[test]

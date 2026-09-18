@@ -126,6 +126,14 @@ struct Cli {
     #[arg(long, default_value = "http://127.0.0.1:18082/json_rpc")]
     monero_rpc: String,
 
+    /// Enable chunk integrity verification challenges (item 14)
+    #[arg(long, default_value_t = true)]
+    verification_enabled: bool,
+
+    /// Verification challenge interval in seconds (default: 1800 = 30 minutes)
+    #[arg(long, default_value_t = 1800)]
+    verification_interval: u64,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -321,6 +329,8 @@ async fn main() -> Result<()> {
             },
             ..Default::default()
         },
+        verification_enabled: cli.verification_enabled,
+        verification_interval_secs: cli.verification_interval,
     };
 
     match cli.command {

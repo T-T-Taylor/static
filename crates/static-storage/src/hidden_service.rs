@@ -133,6 +133,7 @@ mod tests {
             data_shards: 10,
             parity_shards: 5,
             nonce: [0u8; 12],
+            segment_hashes: vec![],
         };
         
         let mut pub_key = [0u8; 32];

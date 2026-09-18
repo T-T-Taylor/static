@@ -258,6 +258,7 @@ mod tests {
             data_shards,
             parity_shards,
             nonce: [0u8; 12],
+            segment_hashes: vec![],
         }
     }
 

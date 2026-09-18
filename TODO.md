@@ -109,10 +109,27 @@
 - Or content transfers to another sponsor
 - Clear lifecycle: fund → host → withdraw/transfer → retire
 
-### 14. Chunk Integrity Verification
-- Nodes must prove they hold chunks without revealing content
-- ZK proof of storage (Proof of Space-Time already exists)
-- Extend to include content integrity checks
+### 14. Chunk Integrity Verification ✅ DONE
+- Implementation: segment-based challenge/response. Each 1 MiB chunk is
+  divided into 4 KiB segments; publish-time `blake3(segment)` hashes are
+  stored in the manifest (`ContentManifest::segment_hashes`) and ride
+  inside the encrypted manifest — only nodes with the content public key
+  can challenge. Any manifest holder can challenge any claimed holder via
+  Sphinx bodies 0x07 (challenge) / 0x08 (response), fragmented like
+  compute traffic — indistinguishable from cover traffic. Challenges are
+  targeted at swap-accepted claims only (`SwapState.active_swaps`), so
+  peers are never punished for chunks they never agreed to hold. Results
+  feed `PeerCredit::successful_challenges`/`failed_challenges` via
+  `AccountingState::record_challenge_success/failure`; `should_serve`
+  hard-gates peers with >10 challenges and <50% success. Unanswered
+  challenges (10 min timeout) count as failures. Full nodes only run the
+  challenger loop (default 30 min, `--verification-enabled`/
+  `--verification-interval`); dormant backups answer nothing (existing
+  dormant gate). Encrypted chunks carry a 16-byte AEAD tail, so full
+  chunks have 257 segments (last = 16 bytes); hash comparison is
+  length-agnostic. Limitations: only swap-accepted claims are verifiable
+  (retrieval-cached copies are not tracked); segment hashes grow the
+  manifest ~32 KiB per chunk (MVP).
 
 ## Core Architecture (Future Discussions)
 

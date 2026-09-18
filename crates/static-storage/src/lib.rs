@@ -18,6 +18,9 @@ pub mod swap;
 /// Content integrity verification via Merkle trees
 pub mod integrity;
 
+/// Chunk integrity verification via segment challenges (item 14)
+pub mod verification;
+
 /// Lease and heartbeat protocol
 pub mod heartbeat;
 
@@ -43,6 +46,17 @@ use std::collections::HashMap;
 
 /// Default chunk size: 1 MiB
 pub const CHUNK_SIZE: usize = 1024 * 1024;
+
+/// Size of each segment for integrity verification (4 KiB)
+pub const SEGMENT_SIZE: usize = 4096;
+
+/// Nominal number of segments per chunk (CHUNK_SIZE / SEGMENT_SIZE = 256)
+///
+/// Encrypted chunks carry a 16-byte AEAD tag (`CHUNK_SIZE + 16` bytes
+/// total), so full chunks actually slice into 257 segments with a
+/// 16-byte tail. `segment_hashes` stores whatever slices exist; the
+/// challenger picks uniformly over `hashes.len()`.
+pub const SEGMENTS_PER_CHUNK: usize = CHUNK_SIZE / SEGMENT_SIZE;
 
 /// Default data shards (K) for erasure coding
 pub const DEFAULT_DATA_SHARDS: usize = 10;
@@ -105,6 +119,17 @@ pub struct ContentManifest {
     pub parity_shards: usize,
     /// The nonce used for chunk encryption
     pub nonce: [u8; 12],
+    /// Segment hashes for integrity verification (item 14)
+    ///
+    /// Outer Vec is per chunk, inner Vec is per segment:
+    /// `segment_hashes[chunk_index][segment_index] = blake3(segment_data)`
+    /// where segments are `SEGMENT_SIZE`-byte slices of the encrypted
+    /// chunk (the last slice may be shorter). Stored inside the
+    /// encrypted manifest, so only nodes holding the content public key
+    /// can challenge storage nodes. Defaults to empty for manifests
+    /// serialized before item 14.
+    #[serde(default)]
+    pub segment_hashes: Vec<Vec<[u8; 32]>>,
 }
 
 /// A storage slot offered in a swap
@@ -327,6 +352,7 @@ pub fn encrypt_file(
         data_shards: DEFAULT_DATA_SHARDS,
         parity_shards: DEFAULT_PARITY_SHARDS,
         nonce: nonce.bytes,
+        segment_hashes: Vec::new(),
     };
 
     Ok((chunks, manifest))
@@ -879,6 +905,7 @@ mod tests {
             data_shards: 10,
             parity_shards: 5,
             nonce: [0u8; 12],
+            segment_hashes: vec![],
         };
         
         let serialized = serde_json::to_string(&manifest).unwrap();

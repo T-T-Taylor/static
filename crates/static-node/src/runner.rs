@@ -28,7 +28,7 @@ use static_mesh::wire::{
 };
 use static_sphinx::{MixNode, NodeId, Route, RouteHop};
 use static_storage::{
-    EncryptedChunk, ChunkId, ContentId, ContentManifest,
+    EncryptedChunk, ChunkId, ContentId, ContentManifest, SEGMENT_SIZE,
     compute::{
         ComputeRequest, ComputeResponse, PaymentConfirmation, PaymentRequest, ReturnRoute,
         MAX_COMPUTE_INPUT_SIZE, deserialize_payment_confirmation, deserialize_payment_request,
@@ -40,8 +40,12 @@ use static_storage::{
     retrieval::{ChunkHolder, ContentRetriever},
     rotation::{RotationConfig, RotationState},
     swap::{SwapState, StorageCapacity},
+    verification::{
+        ReturnRoute as VerificationReturnRoute, VerificationChallenge, VerificationResponse,
+        deserialize_challenge, deserialize_response, serialize_challenge, serialize_response,
+    },
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn, error, debug};
@@ -90,6 +94,39 @@ pub const PAYMENT_WATCH_INTERVAL_SECS: u64 = 15;
 /// Results are removed when polled via the local API; this cap only
 /// bounds growth for results nobody polls.
 pub const MAX_COMPLETED_COMPUTE_RESULTS: usize = 512;
+
+/// How long to wait for a verification response before counting the
+/// challenge as failed (10 minutes)
+pub const VERIFICATION_TIMEOUT_SECS: u64 = 600;
+
+/// A verification challenge awaiting a response (item 14)
+#[derive(Debug, Clone)]
+pub struct VerificationPending {
+    /// The chunk being verified
+    pub chunk_id: ChunkId,
+    /// The segment index requested
+    pub segment_index: u32,
+    /// Expected blake3 hash of the segment (from the manifest)
+    pub expected_hash: [u8; 32],
+    /// The node that was challenged
+    pub challenged_node: NodeId,
+    /// When the challenge was sent (unix timestamp)
+    pub sent_at: u64,
+}
+
+/// State for chunk integrity verification (item 14)
+///
+/// `pending` tracks in-flight challenges keyed by nonce: responses are
+/// matched by nonce, and stale or unsolicited nonces are discarded.
+/// `reassembler` reassembles inbound challenge/response fragments (one
+/// reassembly in flight at a time; concurrent exchanges serialize on it).
+#[derive(Default)]
+pub struct VerificationState {
+    /// Challenges in flight (nonce -> pending)
+    pub pending: HashMap<[u8; 32], VerificationPending>,
+    /// Reassembler for inbound verification fragments
+    pub reassembler: Reassembler,
+}
 
 impl std::fmt::Debug for ComputeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -225,6 +262,16 @@ pub struct NodeRunner {
     /// chunk intentionally has no proof: it stays with the publisher and
     /// never rotates.
     pub merkle_proofs: Arc<Mutex<HashMap<ChunkId, (MerkleRoot, MerkleProof)>>>,
+    /// Manifests of content this node published (content_id -> manifest)
+    ///
+    /// The challenger side of verification needs the per-segment hashes;
+    /// they live in the manifest and the node has no other manifest
+    /// store. Populated in `publish_content` (both full and seed-only
+    /// paths); seed-only nodes keep hashes for the chunks their sponsor
+    /// stores.
+    pub manifests: Arc<Mutex<HashMap<ContentId, ContentManifest>>>,
+    /// Chunk integrity verification state (item 14)
+    pub verification_state: Arc<Mutex<VerificationState>>,
     /// Blockchain watchers for payment verification (currency byte -> watcher)
     ///
     /// Built from the accepted currencies in [`NodeConfig::compute_config`].
@@ -301,6 +348,8 @@ impl NodeRunner {
             backup_state: Arc::new(Mutex::new(BackupState::default())),
             compute_state: Arc::new(Mutex::new(ComputeState::default())),
             merkle_proofs: Arc::new(Mutex::new(HashMap::new())),
+            manifests: Arc::new(Mutex::new(HashMap::new())),
+            verification_state: Arc::new(Mutex::new(VerificationState::default())),
             payment_watchers,
             inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
             config,
@@ -551,6 +600,16 @@ impl NodeRunner {
             });
         }
 
+        // Start chunk integrity verification loop (item 14). Full nodes
+        // only: dormant backups do not serve, seed-only nodes hold no
+        // chunks (rotation_loop precedent).
+        if matches!(self.config.mode, NodeMode::Full) {
+            let runner_for_verification = self.clone();
+            tokio::spawn(async move {
+                verification_loop(runner_for_verification).await;
+            });
+        }
+
         // Start local API server
         let api_addr = self.config.api_addr.clone();
         let runner_ref = self.clone();
@@ -621,6 +680,13 @@ impl NodeRunner {
                 // responses to the requester role). Non-compute bodies are
                 // ignored.
                 self.handle_compute_fragment(&packet.body).await;
+
+                // Verification dispatch (item 14): reassemble verification
+                // fragments and route by type byte (challenges to the
+                // responder role, responses to the challenger role).
+                // Dormant backups never reach this point: the gate above
+                // returns early, so they neither answer nor challenge.
+                self.handle_verification_fragment(&packet.body).await;
             }
             WireMessage::Prepayment(prepayment) => {
                 let accepted = self.handle_prepayment(inbound.from, prepayment).await?;
@@ -697,6 +763,174 @@ impl NodeRunner {
                 }
             }
             _ => debug!("Discarding non-compute payload after reassembly"),
+        }
+    }
+
+    /// Reassemble a verification fragment and dispatch by message type
+    ///
+    /// Inbound Sphinx bodies that are neither chunk requests nor compute
+    /// arrive here. Bodies that do not parse as fragments are ignored;
+    /// reassembled payloads whose type byte is not a verification message
+    /// are discarded. Type `0x07` challenges are answered from the local
+    /// chunk holder (responder role), type `0x08` responses are matched
+    /// against pending challenges and recorded in accounting (challenger
+    /// role).
+    async fn handle_verification_fragment(self: &Arc<Self>, body: &[u8]) {
+        let fragment = match deserialize_fragment(body) {
+            Ok(fragment) => fragment,
+            Err(_) => return,
+        };
+
+        let completed = {
+            let mut state = self.verification_state.lock().await;
+            if !state.reassembler.add_fragment(fragment) {
+                return;
+            }
+            if !state.reassembler.is_complete() {
+                return;
+            }
+            match state.reassembler.reassemble() {
+                Ok(payload) => Some(payload),
+                Err(_) => {
+                    // Corrupt reassembly: reset for the next exchange
+                    state.reassembler = Reassembler::new();
+                    None
+                }
+            }
+        };
+
+        let Some(payload) = completed else {
+            return;
+        };
+        // One reassembly has completed; reset for the next exchange.
+        self.verification_state.lock().await.reassembler = Reassembler::new();
+
+        match payload.first().copied() {
+            Some(m) if m == static_storage::verification::MSG_VERIFICATION_CHALLENGE => {
+                match deserialize_challenge(&payload) {
+                    Ok(challenge) => self.handle_verification_challenge(challenge).await,
+                    Err(_) => debug!("Dropping malformed verification challenge"),
+                }
+            }
+            Some(m) if m == static_storage::verification::MSG_VERIFICATION_RESPONSE => {
+                match deserialize_response(&payload) {
+                    Ok(response) => self.handle_verification_response(response).await,
+                    Err(_) => debug!("Dropping malformed verification response"),
+                }
+            }
+            _ => debug!("Discarding non-verification payload after reassembly"),
+        }
+    }
+
+    /// Answer a verification challenge from local storage (responder role)
+    ///
+    /// Slices the requested segment out of the held encrypted chunk and
+    /// sends it back over the challenge's return route. A chunk we do not
+    /// hold (or an out-of-range segment index) produces a `found: false`
+    /// response so the challenger can record the failure. The last
+    /// segment of a full chunk is shorter than `SEGMENT_SIZE` (the 16
+    /// byte AEAD tail); slicing mirrors how publish-time hashes were
+    /// computed.
+    async fn handle_verification_challenge(&self, challenge: VerificationChallenge) {
+        let segment_data = {
+            let holder = self.transport.chunk_holder.lock().await;
+            holder.get_chunk(&challenge.chunk_id).and_then(|data| {
+                let start = challenge.segment_index as usize * SEGMENT_SIZE;
+                if start >= data.len() {
+                    return None;
+                }
+                let end = (start + SEGMENT_SIZE).min(data.len());
+                Some(data[start..end].to_vec())
+            })
+        };
+
+        let found = segment_data.is_some();
+        let response = VerificationResponse {
+            chunk_id: challenge.chunk_id,
+            segment_index: challenge.segment_index,
+            segment_data: segment_data.unwrap_or_default(),
+            nonce: challenge.nonce,
+            found,
+        };
+
+        match self
+            .send_verification_response(&response, &challenge.return_route)
+            .await
+        {
+            Ok(()) => debug!(
+                "Answered verification challenge for chunk {:02x?} segment {} (found={})",
+                challenge.chunk_id, challenge.segment_index, found
+            ),
+            Err(e) => warn!("Failed to send verification response: {}", e),
+        }
+    }
+
+    /// Send a verification response over a challenge's return route
+    async fn send_verification_response(
+        &self,
+        response: &VerificationResponse,
+        return_route: &VerificationReturnRoute,
+    ) -> anyhow::Result<()> {
+        let payload = serialize_response(response)?;
+        let route = return_route.to_sphinx_route();
+        let packets = build_fragment_packets(&payload, &route)?;
+
+        let first_hop = return_route
+            .hops
+            .first()
+            .map(|h| h.node_id)
+            .ok_or_else(|| anyhow::anyhow!("empty return route"))?;
+        let connections = self.transport.connections.read().await;
+        if let Some(sender) = connections.get(&first_hop) {
+            for packet in packets {
+                let _ = sender.send(WireMessage::Sphinx(packet)).await;
+            }
+            Ok(())
+        } else {
+            anyhow::bail!("no connection to return route first hop");
+        }
+    }
+
+    /// Verify an inbound challenge response (challenger role)
+    ///
+    /// Matches the response to a pending challenge by nonce; unknown
+    /// nonces (stale or unsolicited) are discarded. `found: false` and
+    /// hash mismatches record a failure; segment data whose blake3 hash
+    /// matches the manifest's hash records a success. Results feed the
+    /// deprioritization gate in
+    /// [`static_accounting::AccountingState::should_serve`].
+    async fn handle_verification_response(&self, response: VerificationResponse) {
+        let pending = {
+            let mut state = self.verification_state.lock().await;
+            state.pending.remove(&response.nonce)
+        };
+        let Some(pending) = pending else {
+            debug!("Discarding verification response with unknown nonce");
+            return;
+        };
+
+        let verified = static_storage::verification::verify_segment_response(
+            &response,
+            &pending.expected_hash,
+        );
+        if verified {
+            info!(
+                "Chunk {:02x?} integrity verified for peer {:02x?}",
+                pending.chunk_id, pending.challenged_node
+            );
+            self.accounting
+                .lock()
+                .await
+                .record_challenge_success(&pending.challenged_node);
+        } else {
+            warn!(
+                "Chunk {:02x?} integrity check FAILED for peer {:02x?}",
+                pending.chunk_id, pending.challenged_node
+            );
+            self.accounting
+                .lock()
+                .await
+                .record_challenge_failure(&pending.challenged_node);
         }
     }
 
@@ -1717,6 +1951,15 @@ impl NodeRunner {
         // Update the manifest with the correct content_id
         manifest.content_id = content_id;
 
+        // Compute per-segment hashes (item 14) so any manifest holder can
+        // challenge storage nodes to prove possession. Hashes ride inside
+        // the encrypted manifest: only nodes with the content public key
+        // can challenge. Registered before the mode split so seed-only
+        // publishers keep hashes for the chunks their sponsor stores.
+        manifest.segment_hashes =
+            static_storage::verification::compute_segment_hashes(&chunks);
+        self.manifests.lock().await.insert(content_id, manifest.clone());
+
         // 5. Encrypt the manifest (needed to compute total prepaid size)
         let (encrypted_manifest, manifest_chunk_id) = static_storage::hidden_service::encrypt_manifest(&manifest, &content_pub_key)?;
 
@@ -2202,6 +2445,204 @@ pub(crate) async fn run_payment_watch_tick(runner: &Arc<NodeRunner>) {
                 entry.request_id, e
             ),
         }
+    }
+}
+
+/// Background loop periodically challenging peers to prove chunk possession
+///
+/// Full nodes only (dormant backups do not serve, seed-only nodes hold
+/// no chunks). Independent task: never touches cover traffic state.
+async fn verification_loop(runner: Arc<NodeRunner>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+        runner.config.verification_interval_secs.max(1),
+    ));
+    loop {
+        interval.tick().await;
+        if !runner.config.verification_enabled {
+            continue;
+        }
+        run_verification_tick(&runner).await;
+    }
+}
+
+/// Run one verification sweep (challenger role)
+///
+/// 1. Expires pending challenges older than
+///    [`VERIFICATION_TIMEOUT_SECS`]. No answer counts as a failure —
+///    non-response is the freeloader signature — and the >10-challenge
+///    gate in `should_serve` damps network-glitch false positives.
+/// 2. Issues at most one new challenge per tick against a swap-accepted
+///    claim: `SwapState::active_swaps` (chunk -> partner who accepted
+///    storing it) is the only evidence that a peer claims a chunk, so
+///    peers without such evidence are never challenged (no punishment
+///    for chunks they never agreed to hold). The chunk must appear in a
+///    manifest we hold, so we know the expected segment hash.
+///
+/// Lock discipline: state snapshots are taken under short locks, no two
+/// guards are ever held at once.
+async fn run_verification_tick(runner: &Arc<NodeRunner>) {
+    let now = current_timestamp();
+
+    // 1. Timeout sweep: unanswered challenges are failures.
+    let expired: Vec<VerificationPending> = {
+        let mut state = runner.verification_state.lock().await;
+        let due: Vec<[u8; 32]> = state
+            .pending
+            .iter()
+            .filter(|(_, pending)| now.saturating_sub(pending.sent_at) > VERIFICATION_TIMEOUT_SECS)
+            .map(|(nonce, _)| *nonce)
+            .collect();
+        due.into_iter()
+            .filter_map(|nonce| state.pending.remove(&nonce))
+            .collect()
+    };
+    for pending in &expired {
+        warn!(
+            "Verification challenge for chunk {:02x?} timed out (peer {:02x?})",
+            pending.chunk_id, pending.challenged_node
+        );
+        runner
+            .accounting
+            .lock()
+            .await
+            .record_challenge_failure(&pending.challenged_node);
+    }
+
+    // 2. Issue at most one new challenge per tick.
+    let (claims, connected): (Vec<(ChunkId, NodeId)>, HashSet<NodeId>) = {
+        let swaps = runner.swaps.lock().await;
+        let conns = runner.transport.connections.read().await;
+        (
+            swaps.active_swaps.iter().map(|(c, p)| (*c, *p)).collect(),
+            conns.keys().copied().collect(),
+        )
+    };
+    let known_chunks: HashSet<ChunkId> = {
+        let manifests = runner.manifests.lock().await;
+        manifests
+            .values()
+            .flat_map(|m| m.chunk_ids.iter().copied())
+            .collect()
+    };
+
+    let candidates: Vec<(ChunkId, NodeId)> = claims
+        .into_iter()
+        .filter(|(_, partner)| {
+            connected.contains(partner) && *partner != runner.transport.node_id
+        })
+        .filter(|(chunk_id, _)| known_chunks.contains(chunk_id))
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+
+    let (chunk_id, partner) = candidates[rand::random::<usize>() % candidates.len()];
+
+    // Segment hashes for the challenged chunk come from a manifest we hold.
+    let segment_hashes = {
+        let manifests = runner.manifests.lock().await;
+        manifests.values().find_map(|manifest| {
+            manifest
+                .chunk_ids
+                .iter()
+                .position(|id| id == &chunk_id)
+                .and_then(|index| manifest.segment_hashes.get(index))
+                .cloned()
+        })
+    };
+    let Some(segment_hashes) = segment_hashes.filter(|h| !h.is_empty()) else {
+        return;
+    };
+
+    let segment_index = rand::random::<usize>() % segment_hashes.len();
+    let expected_hash = segment_hashes[segment_index];
+    let mut nonce = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+
+    // Return route back to us (1-hop, same MVP pattern as retrieval).
+    let our_pubkey = runner.transport.mix_node.lock().await.public_key;
+    let our_node_id = runner.transport.node_id;
+    let return_route = VerificationReturnRoute {
+        hops: vec![static_storage::verification::RouteHopInfo {
+            public_key: our_pubkey,
+            node_id: our_node_id,
+        }],
+        destination: our_node_id,
+    };
+
+    let challenge = VerificationChallenge {
+        chunk_id,
+        segment_index: segment_index as u32,
+        nonce,
+        return_route,
+    };
+
+    // Record pending BEFORE sending so a fast response cannot race the
+    // registration; removed again if delivery fails.
+    runner.verification_state.lock().await.pending.insert(
+        nonce,
+        VerificationPending {
+            chunk_id,
+            segment_index: segment_index as u32,
+            expected_hash,
+            challenged_node: partner,
+            sent_at: now,
+        },
+    );
+
+    // Wrap the challenge in Sphinx toward the peer (1-hop forward route,
+    // fragmented like compute submissions).
+    let peer_pubkey = {
+        let routing = runner.transport.routing_table.read().await;
+        routing
+            .nodes
+            .values()
+            .find(|n| n.node_id == partner)
+            .map(|n| n.public_key)
+    };
+    let Some(peer_pubkey) = peer_pubkey else {
+        runner.verification_state.lock().await.pending.remove(&nonce);
+        return;
+    };
+    let forward_route = Route {
+        hops: vec![RouteHop {
+            public_key: peer_pubkey,
+            node_id: partner,
+        }],
+        destination: partner,
+    };
+
+    let payload = match serialize_challenge(&challenge) {
+        Ok(payload) => payload,
+        Err(e) => {
+            warn!("Failed to serialize verification challenge: {}", e);
+            runner.verification_state.lock().await.pending.remove(&nonce);
+            return;
+        }
+    };
+    let packets = match build_fragment_packets(&payload, &forward_route) {
+        Ok(packets) => packets,
+        Err(e) => {
+            warn!("Failed to build verification challenge packets: {}", e);
+            runner.verification_state.lock().await.pending.remove(&nonce);
+            return;
+        }
+    };
+
+    let mut sent = true;
+    for packet in packets {
+        if send_sphinx(&runner.transport, partner, packet).await.is_err() {
+            sent = false;
+            break;
+        }
+    }
+    if sent {
+        debug!(
+            "Challenged peer {:02x?} for chunk {:02x?} segment {}",
+            partner, chunk_id, segment_index
+        );
+    } else {
+        runner.verification_state.lock().await.pending.remove(&nonce);
     }
 }
 
@@ -3286,5 +3727,111 @@ mod tests {
         let state = runner.compute_state.lock().await;
         assert!(state.payment_pending.is_empty());
         assert!(state.active_executions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_verification_state_creation() {
+        let state = VerificationState::default();
+        assert!(state.pending.is_empty());
+        assert_eq!(state.reassembler.received_count(), 0);
+        assert_eq!(state.reassembler.total_expected(), None);
+
+        // The runner's verification state starts empty too.
+        let runner = NodeRunner::new(NodeConfig::default(), [0x42u8; 16], MixNode::new());
+        assert!(runner.verification_state.lock().await.pending.is_empty());
+        assert!(runner.manifests.lock().await.is_empty());
+   }
+
+    #[tokio::test]
+    async fn test_challenge_response_matching() {
+        let runner = Arc::new(NodeRunner::new(
+            NodeConfig::default(),
+            [0x42u8; 16],
+            MixNode::new(),
+        ));
+        let peer: NodeId = [0x77u8; 16];
+        let chunk_id: ChunkId = [0x88u8; 32];
+        let nonce = [0x99u8; 32];
+
+        // Expected hash comes from the same publish-time computation.
+        let chunk = EncryptedChunk {
+            id: chunk_id,
+            data: vec![0xABu8; SEGMENT_SIZE],
+        };
+        let hashes = static_storage::verification::compute_segment_hashes(&[chunk]);
+        let expected_hash = hashes[0][0];
+
+        runner.verification_state.lock().await.pending.insert(
+            nonce,
+            VerificationPending {
+                chunk_id,
+                segment_index: 0,
+                expected_hash,
+                challenged_node: peer,
+                sent_at: current_timestamp(),
+            },
+        );
+
+        let response = VerificationResponse {
+            chunk_id,
+            segment_index: 0,
+            segment_data: vec![0xABu8; SEGMENT_SIZE],
+            nonce,
+            found: true,
+        };
+        runner.handle_verification_response(response).await;
+
+        // Pending consumed; success recorded against the challenged peer.
+        assert!(runner.verification_state.lock().await.pending.is_empty());
+        let accounting = runner.accounting.lock().await;
+        let credit = accounting.peers.get(&peer).expect("peer tracked");
+        assert_eq!(credit.successful_challenges, 1);
+        assert_eq!(credit.failed_challenges, 0);
+    }
+
+    #[tokio::test]
+    async fn test_challenge_response_wrong_hash() {
+        let runner = Arc::new(NodeRunner::new(
+            NodeConfig::default(),
+            [0x42u8; 16],
+            MixNode::new(),
+        ));
+        let peer: NodeId = [0x78u8; 16];
+        let chunk_id: ChunkId = [0x89u8; 32];
+        let nonce = [0x9Au8; 32];
+
+        let chunk = EncryptedChunk {
+            id: chunk_id,
+            data: vec![0xABu8; SEGMENT_SIZE],
+        };
+        let hashes = static_storage::verification::compute_segment_hashes(&[chunk]);
+        let expected_hash = hashes[0][0];
+
+        runner.verification_state.lock().await.pending.insert(
+            nonce,
+            VerificationPending {
+                chunk_id,
+                segment_index: 0,
+                expected_hash,
+                challenged_node: peer,
+                sent_at: current_timestamp(),
+            },
+        );
+
+        // Same length, different bytes: a freeloader's garbage.
+        let response = VerificationResponse {
+            chunk_id,
+            segment_index: 0,
+            segment_data: vec![0xCDu8; SEGMENT_SIZE],
+            nonce,
+            found: true,
+        };
+        runner.handle_verification_response(response).await;
+
+        assert!(runner.verification_state.lock().await.pending.is_empty());
+        let accounting = runner.accounting.lock().await;
+        let credit = accounting.peers.get(&peer).expect("peer tracked");
+        assert_eq!(credit.failed_challenges, 1);
+        assert_eq!(credit.successful_challenges, 0);
     }
 }

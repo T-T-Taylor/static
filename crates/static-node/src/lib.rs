@@ -94,6 +94,12 @@ pub struct NodeConfig {
     /// Compute offering configuration (WASM execution for peers)
     #[serde(default = "default_compute_config")]
     pub compute_config: ComputeConfig,
+    /// Whether to run chunk integrity verification challenges (item 14)
+    #[serde(default = "default_verification_enabled")]
+    pub verification_enabled: bool,
+    /// Verification challenge sweep interval in seconds (default 1800)
+    #[serde(default = "default_verification_interval")]
+    pub verification_interval_secs: u64,
 }
 
 /// Default for `NodeConfig::use_hybrid_crypto`: new nodes opt into hybrid
@@ -197,6 +203,16 @@ fn default_compute_config() -> ComputeConfig {
     ComputeConfig::default()
 }
 
+/// Default for `NodeConfig::verification_enabled` (challenges on)
+fn default_verification_enabled() -> bool {
+    true
+}
+
+/// Default for `NodeConfig::verification_interval_secs` (30 minutes)
+fn default_verification_interval() -> u64 {
+    1800
+}
+
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
@@ -215,6 +231,8 @@ impl Default for NodeConfig {
             rotation_config: default_rotation_config(),
             backup_config: default_backup_config(),
             compute_config: default_compute_config(),
+            verification_enabled: default_verification_enabled(),
+            verification_interval_secs: default_verification_interval(),
         }
     }
 }
