@@ -22,7 +22,7 @@ pub const MAX_GOSSIP_PEERS: usize = 50;
 pub struct KnownNode {
     /// The node's ID
     pub node_id: NodeId,
-    /// The node's public key (Montgomery point bytes)
+    /// The node's public key (Montgomery point bytes, Sphinx)
     pub public_key: [u8; 32],
     /// The node's network address
     pub address: String,
@@ -40,15 +40,68 @@ pub struct KnownNode {
     /// Maximum concurrent compute executions on this node
     #[serde(default)]
     pub compute_capacity: u8,
+    /// Ed25519 identity public key (handshake authentication, gossip continuity)
+    #[serde(default)]
+    pub identity_public_key: Option<[u8; 32]>,
 }
 
-/// Peer gossip message
+/// Peer gossip message (authenticated sender, unauthenticated hints)
+///
+/// The sender signs (from_node || blake3(peers_json)) with its Ed25519
+/// identity key. Receivers verify the sender signature and apply key
+/// continuity: a known node_id whose mix or identity key changes is
+/// rejected (prevents hijack/overwrite). Gossiped peer entries themselves
+/// are hints, not trust anchors.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PeerGossip {
     /// The sending node's ID
     pub from_node: NodeId,
     /// The peers being gossiped
     pub peers: Vec<KnownNode>,
+    /// Ed25519 identity public key of the gossip sender
+    #[serde(default)]
+    pub identity_public_key: [u8; 32],
+    /// Ed25519 signature over the gossip signing bytes
+    #[serde(default)]
+    pub signature: Vec<u8>,
+}
+
+impl PeerGossip {
+    /// Bytes covered by the gossip signature.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let peers_json = serde_json::to_vec(&self.peers).unwrap_or_default();
+        let digest = blake3::hash(&peers_json);
+        let mut buf = Vec::with_capacity(16 + 32);
+        buf.extend_from_slice(&self.from_node);
+        buf.extend_from_slice(digest.as_bytes());
+        buf
+    }
+
+    /// Sign this gossip message.
+    pub fn sign(&mut self, signing_key: &ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        self.identity_public_key = signing_key.verifying_key().to_bytes();
+        let sig = signing_key.sign(&self.signing_bytes());
+        self.signature = sig.to_bytes().to_vec();
+    }
+
+    /// Verify sender signature (+ peer-count bound).
+    pub fn verify(&self) -> bool {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        if self.peers.len() > MAX_GOSSIP_PEERS {
+            return false;
+        }
+        if self.signature.len() != 64 {
+            return false;
+        }
+        let Ok(pk) = VerifyingKey::from_bytes(&self.identity_public_key) else {
+            return false;
+        };
+        let mut arr = [0u8; 64];
+        arr.copy_from_slice(&self.signature);
+        let sig = Signature::from_bytes(&arr);
+        pk.verify(&self.signing_bytes(), &sig).is_ok()
+    }
 }
 
 /// Routing table for storing known nodes
@@ -170,7 +223,26 @@ impl RoutingTable {
     /// KEM public keys are stripped from gossiped entries to bound message
     /// size (each ML-KEM key is ~1 KiB). KEM keys propagate via direct
     /// handshake only; hybrid routes use handshake-known peers.
+    /// Unsigned (for tests/back-compat); use `create_signed_gossip` in prod.
     pub fn create_gossip(&self, max_peers: usize) -> PeerGossip {
+        let mut unsigned = self.unsigned_gossip(max_peers);
+        // Leave unsigned: verify() will fail, callers must sign.
+        let _ = &mut unsigned;
+        unsigned
+    }
+
+    /// Create and Ed25519-sign a gossip message.
+    pub fn create_signed_gossip(
+        &self,
+        max_peers: usize,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> PeerGossip {
+        let mut g = self.unsigned_gossip(max_peers);
+        g.sign(signing_key);
+        g
+    }
+
+    fn unsigned_gossip(&self, max_peers: usize) -> PeerGossip {
         let mut nodes: Vec<&KnownNode> = self.nodes.values().collect();
         nodes.shuffle(&mut rand::thread_rng());
 
@@ -187,6 +259,8 @@ impl RoutingTable {
         PeerGossip {
             from_node: self.our_node_id,
             peers,
+            identity_public_key: [0u8; 32],
+            signature: vec![],
         }
     }
 
@@ -230,14 +304,38 @@ impl RoutingTable {
 
     /// Process a received gossip message, adding new peers to our table
     ///
-    /// Returns the number of new peers added.
+    /// Verifies the sender signature first; unverified gossip is dropped.
+    /// Enforces key continuity: a known node_id with changed mix or
+    /// identity keys is rejected (no overwrite). Returns new peers added.
     pub fn process_gossip(&mut self, gossip: &PeerGossip) -> usize {
+        if !gossip.verify() {
+            return 0;
+        }
+        // Sender key continuity: if we know the sender, its identity key
+        // must match (prevents impersonation after first encounter).
+        if let Some(known) = self.nodes.get(&gossip.from_node) {
+            if let Some(stored) = known.identity_public_key {
+                if stored != gossip.identity_public_key {
+                    return 0;
+                }
+            }
+        }
         let mut new_count = 0;
         for peer in &gossip.peers {
-            if peer.node_id != self.our_node_id && !self.nodes.contains_key(&peer.node_id) {
-                self.add_node(peer.clone());
-                new_count += 1;
+            if peer.node_id == self.our_node_id || self.nodes.contains_key(&peer.node_id) {
+                continue;
             }
+            // Bound per-entry sanity.
+            if peer.address.len() > 256 {
+                continue;
+            }
+            if let Some(kem) = &peer.kem_public_key {
+                if kem.len() != static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE {
+                    continue;
+                }
+            }
+            self.add_node(peer.clone());
+            new_count += 1;
         }
         new_count
     }
@@ -251,6 +349,7 @@ impl RoutingTable {
             kem_public_key: None,
             compute_enabled: false,
             compute_capacity: 0,
+            identity_public_key: None,
         }
     }
 
@@ -267,6 +366,7 @@ impl RoutingTable {
             kem_public_key: Some(kem_public_key),
             compute_enabled: false,
             compute_capacity: 0,
+            identity_public_key: None,
         }
     }
 }
@@ -308,7 +408,12 @@ mod tests {
             kem_public_key: None,
             compute_enabled: false,
             compute_capacity: 0,
+            identity_public_key: None,
         }
+    }
+
+    fn test_signing_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32])
     }
 
     #[test]
@@ -343,6 +448,7 @@ mod tests {
             kem_public_key: None,
                 compute_enabled: false,
                 compute_capacity: 0,
+                identity_public_key: None,
         };
 
         table.add_node(node);
@@ -445,8 +551,9 @@ mod tests {
             table2.add_node(random_known_node());
         }
 
-        // Table 1 gossips to Table 2
-        let gossip = table1.create_gossip(50);
+        // Table 1 gossips to Table 2 (signed)
+        let gossip = table1.create_signed_gossip(50, &test_signing_key());
+        assert!(gossip.verify());
         let new_count = table2.process_gossip(&gossip);
 
         // Table 2 should have learned 10 new nodes (minus any overlap)
@@ -457,15 +564,18 @@ mod tests {
     #[test]
     fn test_gossip_no_duplicates() {
         let our_id = random_node_id();
-        let mut table = RoutingTable::new(our_id);
+        let mut table = RoutingTable::new(our_id.clone());
 
         let node = random_known_node();
         table.add_node(node.clone());
 
-        let gossip = PeerGossip {
+        let mut gossip = PeerGossip {
             from_node: random_node_id(),
             peers: vec![node.clone()],
+            identity_public_key: [0u8; 32],
+            signature: vec![],
         };
+        gossip.sign(&test_signing_key());
 
         let new_count = table.process_gossip(&gossip);
         assert_eq!(new_count, 0); // Already knew this node
@@ -477,7 +587,7 @@ mod tests {
         let our_id = random_node_id();
         let mut table = RoutingTable::new(our_id);
 
-        let gossip = PeerGossip {
+        let mut gossip = PeerGossip {
             from_node: random_node_id(),
             peers: vec![KnownNode {
                 node_id: our_id,
@@ -486,8 +596,12 @@ mod tests {
                 kem_public_key: None,
                 compute_enabled: false,
                 compute_capacity: 0,
+                identity_public_key: None,
             }],
+            identity_public_key: [0u8; 32],
+            signature: vec![],
         };
+        gossip.sign(&test_signing_key());
 
         let new_count = table.process_gossip(&gossip);
         assert_eq!(new_count, 0);

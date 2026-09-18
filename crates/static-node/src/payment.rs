@@ -50,9 +50,7 @@ impl ComputePricing {
     ///
     /// Free-tier providers execute immediately with no payment round-trip.
     pub fn is_free(&self) -> bool {
-        self.price_per_execution == 0
-            && self.price_per_cpu_sec == 0
-            && self.price_per_mb == 0
+        self.price_per_execution == 0 && self.price_per_cpu_sec == 0 && self.price_per_mb == 0
     }
 
     /// Whether the given currency is accepted
@@ -221,9 +219,9 @@ impl BlockchainWatcher for MoneroWatcher {
         let response = self
             .rpc_call("create_address", serde_json::json!({"account_index": 0}))
             .await?;
-        let address = response["result"]["address"]
-            .as_str()
-            .ok_or_else(|| PaymentError::AddressGenerationFailed("No address in response".into()))?;
+        let address = response["result"]["address"].as_str().ok_or_else(|| {
+            PaymentError::AddressGenerationFailed("No address in response".into())
+        })?;
         Ok(address.to_string())
     }
 
@@ -292,7 +290,9 @@ impl DarkfiWatcher {
 impl BlockchainWatcher for DarkfiWatcher {
     async fn generate_address(&self) -> Result<String, PaymentError> {
         // TODO: Implement Darkfi blockchain watcher
-        Err(PaymentError::UnsupportedCurrency(Currency::Darkfi.as_str().to_string()))
+        Err(PaymentError::UnsupportedCurrency(
+            Currency::Darkfi.as_str().to_string(),
+        ))
     }
 
     async fn check_payment(
@@ -302,7 +302,9 @@ impl BlockchainWatcher for DarkfiWatcher {
         _tx_hash: Option<&str>,
     ) -> Result<Option<u32>, PaymentError> {
         // TODO: Implement Darkfi blockchain watcher
-        Err(PaymentError::UnsupportedCurrency(Currency::Darkfi.as_str().to_string()))
+        Err(PaymentError::UnsupportedCurrency(
+            Currency::Darkfi.as_str().to_string(),
+        ))
     }
 
     fn currency(&self) -> Currency {
@@ -331,7 +333,9 @@ impl NavioWatcher {
 impl BlockchainWatcher for NavioWatcher {
     async fn generate_address(&self) -> Result<String, PaymentError> {
         // TODO: Implement Navio blockchain watcher
-        Err(PaymentError::UnsupportedCurrency(Currency::Navio.as_str().to_string()))
+        Err(PaymentError::UnsupportedCurrency(
+            Currency::Navio.as_str().to_string(),
+        ))
     }
 
     async fn check_payment(
@@ -341,7 +345,9 @@ impl BlockchainWatcher for NavioWatcher {
         _tx_hash: Option<&str>,
     ) -> Result<Option<u32>, PaymentError> {
         // TODO: Implement Navio blockchain watcher
-        Err(PaymentError::UnsupportedCurrency(Currency::Navio.as_str().to_string()))
+        Err(PaymentError::UnsupportedCurrency(
+            Currency::Navio.as_str().to_string(),
+        ))
     }
 
     fn currency(&self) -> Currency {
@@ -428,8 +434,7 @@ mod tests {
             required_confirmations: 10,
         };
 
-        let serialized =
-            static_storage::compute::serialize_payment_request(&quote).unwrap();
+        let serialized = static_storage::compute::serialize_payment_request(&quote).unwrap();
         let back = static_storage::compute::deserialize_payment_request(&serialized).unwrap();
         assert_eq!(back, quote);
     }
@@ -438,15 +443,13 @@ mod tests {
     fn test_payment_confirmation_serialization() {
         let confirmation = PaymentConfirmation {
             request_id: [0xB2u8; 32],
-            tx_hash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
-                .to_string(),
+            tx_hash: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
             currency: Currency::Monero,
         };
 
         let serialized =
             static_storage::compute::serialize_payment_confirmation(&confirmation).unwrap();
-        let back =
-            static_storage::compute::deserialize_payment_confirmation(&serialized).unwrap();
+        let back = static_storage::compute::deserialize_payment_confirmation(&serialized).unwrap();
         assert_eq!(back, confirmation);
     }
 
@@ -465,14 +468,18 @@ mod tests {
             request: quote.clone(),
             sent_at: 1000,
         };
-        assert!(matches!(state, PaymentState::AwaitingPayment { ref request, .. } if request.request_id == quote.request_id));
+        assert!(
+            matches!(state, PaymentState::AwaitingPayment { ref request, .. } if request.request_id == quote.request_id)
+        );
 
         // 2. Payment confirmed on-chain
         state = PaymentState::PaymentConfirmed {
             tx_hash: "abc".to_string(),
             confirmed_at: 2000,
         };
-        assert!(matches!(state, PaymentState::PaymentConfirmed { ref tx_hash, .. } if tx_hash == "abc"));
+        assert!(
+            matches!(state, PaymentState::PaymentConfirmed { ref tx_hash, .. } if tx_hash == "abc")
+        );
 
         // 3. Timeout when the requester never pays
         state = PaymentState::PaymentTimeout;

@@ -27,24 +27,32 @@ pub mod payment;
 /// Async node runner
 pub mod runner;
 
-use static_crypto::SymmetricKey;
-use static_mesh::{MeshState, CoverTrafficConfig};
-use static_sphinx::MixNode;
-use static_accounting::AccountingState;
-use std::collections::HashMap;
-use std::path::PathBuf;
 use rand::rngs::OsRng;
 use rand::RngCore;
+use static_accounting::AccountingState;
+use static_crypto::SymmetricKey;
+use static_mesh::{CoverTrafficConfig, MeshState};
+use static_sphinx::MixNode;
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Node operation mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NodeMode {
-    /// Full node: hosts and retrieves content normally
+    /// Full node: hosts and retrieves content normally.
+    /// Cover traffic is mandatory at the configured tier rate.
     Full = 0,
-    /// Seed-only node: pre-pays a sponsor to host on its behalf
+    /// Seed-only node: pre-pays a sponsor to host on its behalf.
+    /// Reduced cover (runner forces a minimal rate) as a documented
+    /// privacy trade-off: funding-only nodes do not host content.
     SeedOnly = 1,
     /// Backup-only node: dormant until primary fails, then activates
     BackupOnly = 2,
+    /// Client (relay-only): relays mix traffic with reduced cover,
+    /// never hosts chunks and never participates in swap barter.
+    /// Suitable for lightweight / mobile nodes that only publish,
+    /// retrieve, and relay.
+    Client = 3,
 }
 
 impl Default for NodeMode {
@@ -100,6 +108,14 @@ pub struct NodeConfig {
     /// Verification challenge sweep interval in seconds (default 1800)
     #[serde(default = "default_verification_interval")]
     pub verification_interval_secs: u64,
+    /// Optional bearer token required by the local JSON API.
+    ///
+    /// When `Some`, [`crate::api`] rejects any [`crate::api::ApiRequest`]
+    /// whose `token` field does not match. When `None` (default), the
+    /// local API accepts unauthenticated requests from loopback.
+    /// Set via `--api-token`; never logged.
+    #[serde(default)]
+    pub api_token: Option<String>,
 }
 
 /// Default for `NodeConfig::use_hybrid_crypto`: new nodes opt into hybrid
@@ -233,6 +249,7 @@ impl Default for NodeConfig {
             compute_config: default_compute_config(),
             verification_enabled: default_verification_enabled(),
             verification_interval_secs: default_verification_interval(),
+            api_token: None,
         }
     }
 }
@@ -301,7 +318,8 @@ impl StaticNode {
         for peer_addr in &self.config.bootstrap_peers {
             let mut peer_id = [0u8; 16];
             OsRng.fill_bytes(&mut peer_id);
-            self.mesh.add_peer(peer_id, peer_addr.clone(), self.config.tier);
+            self.mesh
+                .add_peer(peer_id, peer_addr.clone(), self.config.tier);
         }
 
         tracing::info!("Static node initialized");
@@ -357,10 +375,7 @@ impl StaticNode {
 
     /// Get the total bytes stored for others
     pub fn total_stored_bytes(&self) -> u64 {
-        self.stored_chunks
-            .values()
-            .map(|c| c.len() as u64)
-            .sum()
+        self.stored_chunks.values().map(|c| c.len() as u64).sum()
     }
 }
 
@@ -492,5 +507,50 @@ mod tests {
         // NodeConfig carries it with serde defaults
         let node_config = NodeConfig::default();
         assert_eq!(node_config.backup_config, BackupConfig::default());
+    }
+
+    #[test]
+    fn test_node_mode_client_discriminant() {
+        assert_eq!(NodeMode::Full as u8, 0);
+        assert_eq!(NodeMode::SeedOnly as u8, 1);
+        assert_eq!(NodeMode::BackupOnly as u8, 2);
+        // Relay-only client: no hosting/barter, reduced cover.
+        assert_eq!(NodeMode::Client as u8, 3);
+    }
+
+    #[test]
+    fn test_api_token_defaults_to_none() {
+        let config = NodeConfig::default();
+        assert_eq!(config.api_token, None);
+    }
+
+    #[test]
+    fn test_node_config_serde_backwards_compat_no_api_token() {
+        // Old serialized configs without `api_token` must still load.
+        let json = serde_json::json!({
+            "data_dir": "./node-data",
+            "cover_traffic_rate_bps": 102400,
+            "cover_traffic_interval_ms": 100,
+            "cover_traffic_enabled": true,
+            "tier": "Standard",
+            "listen_addr": "0.0.0.0:9000",
+            "bootstrap_peers": [],
+            "api_addr": "127.0.0.1:9050",
+            "max_storage_bytes": 10737418240u64,
+            "mode": "Full",
+            "sponsor": null,
+            "use_hybrid_crypto": true
+        });
+        let config: NodeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.api_token, None);
+    }
+
+    #[test]
+    fn test_api_token_serde_roundtrip() {
+        let mut config = NodeConfig::default();
+        config.api_token = Some("secret-token".to_string());
+        let json = serde_json::to_string(&config).unwrap();
+        let back: NodeConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.api_token.as_deref(), Some("secret-token"));
     }
 }

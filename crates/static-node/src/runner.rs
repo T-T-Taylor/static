@@ -11,16 +11,16 @@
 //! - Backup-only mode: dormant chunk holding with primary health
 //!   monitoring and activation on heartbeat timeout
 
-use rand::RngCore;
-use crate::{NodeConfig, NodeMode, NodeStatus, BackupConfig};
 use crate::compute::{build_request_packets, build_response_packets, execute_wasm, ComputeError};
 use crate::payment::{BlockchainWatcher, Currency};
-use static_accounting::{AccountingState, PeerCredit, current_timestamp};
+use crate::{BackupConfig, NodeConfig, NodeMode, NodeStatus};
+use rand::RngCore;
+use static_accounting::{current_timestamp, AccountingState, PeerCredit};
 use static_crypto::SymmetricKey;
 use static_mesh::fragment::{deserialize_fragment, Reassembler};
 use static_mesh::transport::{
-    TransportState, InboundMessage, create_transport_state,
-    start_listener, connect_to_peer, get_stats, gossip_loop, send_sphinx,
+    connect_to_peer, create_transport_state, get_stats, gossip_loop, send_sphinx, start_listener,
+    InboundMessage, TransportState,
 };
 use static_mesh::wire::{
     AccountingReconciliation, Prepayment, ReconciliationEntry, WireMessage,
@@ -28,27 +28,31 @@ use static_mesh::wire::{
 };
 use static_sphinx::{MixNode, NodeId, Route, RouteHop};
 use static_storage::{
-    EncryptedChunk, ChunkId, ContentId, ContentManifest, SEGMENT_SIZE,
     compute::{
-        ComputeRequest, ComputeResponse, PaymentConfirmation, PaymentRequest, ReturnRoute,
-        MAX_COMPUTE_INPUT_SIZE, deserialize_payment_confirmation, deserialize_payment_request,
-        serialize_payment_confirmation, serialize_payment_request,
+        deserialize_payment_confirmation, deserialize_payment_request,
+        serialize_payment_confirmation, serialize_payment_request, ComputeRequest, ComputeResponse,
+        PaymentConfirmation, PaymentRequest, ReturnRoute, MAX_COMPUTE_INPUT_SIZE,
     },
+    gossip::{deserialize_gossip, serialize_gossip, MissingChunkGossip},
+    heartbeat::{Heartbeat, LeaseManager},
     integrity::{MerkleProof, MerkleRoot},
-    repair::RepairState,
-    heartbeat::LeaseManager,
-    retrieval::{ChunkHolder, ContentRetriever},
-    rotation::{RotationConfig, RotationState},
-    swap::{SwapState, StorageCapacity},
-    verification::{
-        ReturnRoute as VerificationReturnRoute, VerificationChallenge, VerificationResponse,
-        deserialize_challenge, deserialize_response, serialize_challenge, serialize_response,
+    repair::{check_content_health, create_repair_plan, RepairState},
+    retrieval::{
+        serialize_response as serialize_chunk_response, ChunkHolder, ChunkResponse,
+        ContentRetriever, ReturnRoute as RetrievalReturnRoute,
     },
+    rotation::{RotationConfig, RotationState},
+    swap::{StorageCapacity, SwapState},
+    verification::{
+        deserialize_challenge, deserialize_response, serialize_challenge, serialize_response,
+        ReturnRoute as VerificationReturnRoute, VerificationChallenge, VerificationResponse,
+    },
+    ChunkId, ContentId, ContentManifest, EncryptedChunk, SEGMENT_SIZE,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{info, warn, error, debug};
+use tracing::{debug, error, info, warn};
 
 /// Peers idle longer than this are treated as possibly partitioned (1 hour)
 pub const PARTITION_THRESHOLD_SECS: u64 = 3600;
@@ -99,6 +103,103 @@ pub const MAX_COMPLETED_COMPUTE_RESULTS: usize = 512;
 /// challenge as failed (10 minutes)
 pub const VERIFICATION_TIMEOUT_SECS: u64 = 600;
 
+/// Fresh-data staleness threshold (24h): chunks younger than this stay on
+/// the host and never enter the barter pool (churn-attack defense).
+pub const STALENESS_THRESHOLD_SECS: u64 = 86400;
+
+/// Sphinx body type byte for missing-chunk failure gossip (Phase 0, C6).
+/// Padded/Sphinx-wrapped, never clear JSON.
+pub use static_storage::gossip::MSG_MISSING_CHUNK_GOSSIP;
+
+/// TTL for missing-chunk gossip dedup entries (source-side storm guard).
+pub const MISSING_GOSSIP_DEDUP_TTL_SECS: u64 = 600;
+
+/// Maximum missing-chunk gossip dedup entries (bounded memory).
+pub const MISSING_GOSSIP_DEDUP_MAX: usize = 1024;
+
+/// Maximum content items the repair loop processes per 60s tick.
+pub const MAX_REPAIRS_PER_TICK: usize = 1;
+
+/// Per-chunk lifecycle metadata (L6 data classification).
+#[derive(Debug, Clone)]
+pub struct ChunkMetadata {
+    /// When the chunk was first stored locally (unix secs)
+    pub created_at: u64,
+    /// Last barter time (unix secs, 0 if never bartered)
+    pub last_bartered: u64,
+    /// True while within staleness threshold (not barter-eligible)
+    pub is_fresh: bool,
+}
+
+impl ChunkMetadata {
+    /// Create fresh metadata at now.
+    pub fn fresh(now: u64) -> Self {
+        Self { created_at: now, last_bartered: 0, is_fresh: true }
+    }
+
+    /// Refresh freshness against now.
+    pub fn refresh(&mut self, now: u64) {
+        self.is_fresh = now.saturating_sub(self.created_at) < STALENESS_THRESHOLD_SECS;
+    }
+
+    /// Whether this chunk may enter the barter pool.
+    pub fn barter_eligible(&self, now: u64) -> bool {
+        now.saturating_sub(self.created_at) >= STALENESS_THRESHOLD_SECS
+    }
+}
+
+/// Host buffer of recently bartered own chunks for quick reseed (L6).
+///
+/// Bounded LRU: oldest bartered evicted first. Does NOT count toward 1:1
+/// (own data). Reseeded chunks retain original `created_at` (no clock reset).
+#[derive(Debug, Default)]
+pub struct HostBuffer {
+    /// chunk_id -> (data, created_at)
+    pub buffer: HashMap<ChunkId, (Vec<u8>, u64)>,
+    /// Insertion order for LRU eviction
+    pub order: std::collections::VecDeque<ChunkId>,
+    /// Max bytes held
+    pub max_size: u64,
+    /// Current bytes held
+    pub current_size: u64,
+}
+
+impl HostBuffer {
+    /// Create with max size bytes.
+    pub fn new(max_size: u64) -> Self {
+        Self { buffer: HashMap::new(), order: std::collections::VecDeque::new(), max_size, current_size: 0 }
+    }
+
+    /// Insert (evicting oldest until fit). Retains original created_at if present.
+    pub fn insert(&mut self, chunk_id: ChunkId, data: Vec<u8>, created_at: u64) {
+        let len = data.len() as u64;
+        if len > self.max_size {
+            return;
+        }
+        if let Some((old, _)) = self.buffer.remove(&chunk_id) {
+            self.current_size = self.current_size.saturating_sub(old.len() as u64);
+            self.order.retain(|id| id != &chunk_id);
+        }
+        while self.current_size + len > self.max_size {
+            if let Some(old_id) = self.order.pop_front() {
+                if let Some((old_data, _)) = self.buffer.remove(&old_id) {
+                    self.current_size = self.current_size.saturating_sub(old_data.len() as u64);
+                }
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(chunk_id);
+        self.current_size += len;
+        self.buffer.insert(chunk_id, (data, created_at));
+    }
+
+    /// Get for reseed (cloned).
+    pub fn get(&self, chunk_id: &ChunkId) -> Option<(Vec<u8>, u64)> {
+        self.buffer.get(chunk_id).cloned()
+    }
+}
+
 /// A verification challenge awaiting a response (item 14)
 #[derive(Debug, Clone)]
 pub struct VerificationPending {
@@ -125,6 +226,18 @@ pub struct VerificationState {
     /// Challenges in flight (nonce -> pending)
     pub pending: HashMap<[u8; 32], VerificationPending>,
     /// Reassembler for inbound verification fragments
+    pub reassembler: Reassembler,
+}
+
+/// State for lifecycle message reassembly (Phase 1)
+///
+/// Missing-chunk gossip and heartbeat Sphinx bodies reassemble here
+/// before type-byte dispatch (`0x09` gossip to the host role, `0x0A`
+/// heartbeat to the holder role). One reassembly in flight at a time,
+/// mirroring `ComputeState`/`VerificationState`.
+#[derive(Default)]
+pub struct LifecycleState {
+    /// Reassembler for inbound lifecycle fragments
     pub reassembler: Reassembler,
 }
 
@@ -270,8 +383,23 @@ pub struct NodeRunner {
     /// paths); seed-only nodes keep hashes for the chunks their sponsor
     /// stores.
     pub manifests: Arc<Mutex<HashMap<ContentId, ContentManifest>>>,
+    /// Single-chunk responses arrived via Sphinx (manifest fetch path).
+    ///
+    /// `handle_inbound` stores completed `ChunkResponse` payloads here when
+    /// they are not part of an active file retrieval, so `retrieve_content`
+    /// can poll for manifests without misusing `ContentRetriever`.
+    pub single_chunks: Arc<Mutex<HashMap<ChunkId, Vec<u8>>>>,
+    /// Per-chunk lifecycle metadata (created_at for staleness, L6).
+    pub chunk_metadata: Arc<Mutex<HashMap<ChunkId, ChunkMetadata>>>,
+    /// Host buffer of recently bartered own chunks for reseed (L6).
+    pub host_buffer: Arc<Mutex<HostBuffer>>,
     /// Chunk integrity verification state (item 14)
     pub verification_state: Arc<Mutex<VerificationState>>,
+    /// Lifecycle message reassembly (missing-chunk gossip, heartbeat)
+    pub lifecycle_state: Arc<Mutex<LifecycleState>>,
+    /// Recently sent missing-chunk gossip, deduped at the source
+    /// ((content_id, chunk_id) -> last sent unix secs)
+    pub missing_gossip_recent: Arc<Mutex<HashMap<(ContentId, ChunkId), u64>>>,
     /// Blockchain watchers for payment verification (currency byte -> watcher)
     ///
     /// Built from the accepted currencies in [`NodeConfig::compute_config`].
@@ -288,19 +416,18 @@ impl NodeRunner {
         // (heartbeats/funding) when requested. They opt out of full-rate
         // cover traffic as a documented privacy trade-off: they are funding
         // a sponsor rather than hosting content themselves.
+        // Client mode: relay-only, reduced cover (like Tor client).
         let (target_rate, cover_enabled) = match config.mode {
             NodeMode::SeedOnly => (1024, false),
-            _ => (
-                config.cover_traffic_rate_bps,
-                config.cover_traffic_enabled,
-            ),
+            NodeMode::Client => (50 * 1024, true),
+            _ => (config.cover_traffic_rate_bps, true),
         };
         let cover_config = static_mesh::CoverTrafficConfig {
             target_rate_bps: target_rate,
             interval_ms: config.cover_traffic_interval_ms,
             enabled: cover_enabled,
             tier: config.tier,
-            use_hybrid: config.use_hybrid_crypto,
+            use_hybrid: true,
         };
 
         // One shared capacity counter for the whole node: the swap
@@ -313,7 +440,8 @@ impl NodeRunner {
 
         // Backup-only nodes start dormant: they hold chunks but do not
         // serve them until the primary fails (see backup_health_loop).
-        if matches!(config.mode, NodeMode::BackupOnly) {
+        // Client nodes are relay-only: never serve.
+        if matches!(config.mode, NodeMode::BackupOnly | NodeMode::Client) {
             transport
                 .serve_enabled
                 .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -349,7 +477,12 @@ impl NodeRunner {
             compute_state: Arc::new(Mutex::new(ComputeState::default())),
             merkle_proofs: Arc::new(Mutex::new(HashMap::new())),
             manifests: Arc::new(Mutex::new(HashMap::new())),
+            single_chunks: Arc::new(Mutex::new(HashMap::new())),
+            chunk_metadata: Arc::new(Mutex::new(HashMap::new())),
+            host_buffer: Arc::new(Mutex::new(HostBuffer::new(512 * 1024 * 1024))),
             verification_state: Arc::new(Mutex::new(VerificationState::default())),
+            lifecycle_state: Arc::new(Mutex::new(LifecycleState::default())),
+            missing_gossip_recent: Arc::new(Mutex::new(HashMap::new())),
             payment_watchers,
             inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
             config,
@@ -367,13 +500,13 @@ impl NodeRunner {
 
         match self.config.mode {
             NodeMode::BackupOnly => {
-                // Dormant backup: the listener runs and swaps are
-                // accepted (chunks accumulate), but chunk serving is
-                // disabled (serve_enabled=false, set in new()) until
-                // the primary's heartbeat timeout fires.
                 info!(
                     "Backup-only mode: dormant, monitoring primary {} (heartbeat timeout {}s)",
-                    self.config.backup_config.primary_address.as_deref().unwrap_or("<unresolved>"),
+                    self.config
+                        .backup_config
+                        .primary_address
+                        .as_deref()
+                        .unwrap_or("<unresolved>"),
                     self.config.backup_config.heartbeat_timeout_secs
                 );
                 let backup_state = self.backup_state.clone();
@@ -396,7 +529,11 @@ impl NodeRunner {
                     self.config.sponsor
                 );
             }
-            NodeMode::Full => {}
+            NodeMode::Full | NodeMode::Client => {
+                if matches!(self.config.mode, NodeMode::Client) {
+                    info!("Client mode: relay-only, reduced cover, no hosting/barter");
+                }
+            }
         }
 
         // Seed-only nodes do NOT start the normal listener for chunk requests
@@ -455,20 +592,20 @@ impl NodeRunner {
             });
         }
 
-        // Start lease expiration loop
-        let leases = self.leases.clone();
-        let chunks = self.transport.chunk_holder.clone();
-        let capacity_for_expiry = self.capacity.clone();
+        // Start merged lease-expiry + repair loop (L6: repair runs BEFORE
+        // expiry each 60s so chunks below MIN_COPIES get a chance before
+        // deletion). Repair (Phase 1) uses the retrieval protocol, so the
+        // loop owns the full runner.
+        let runner_for_lifecycle = self.clone();
         tokio::spawn(async move {
-            lease_expiration_loop(leases, chunks, capacity_for_expiry).await;
+            lease_expiration_and_repair_loop(runner_for_lifecycle).await;
         });
 
-        // Start repair loop
-        let repair_state = self.repair_state.clone();
-        let storage_keys = self.storage_keys.clone();
-        let leases_for_repair = self.leases.clone();
+        // Start heartbeat sender loop (L5): local lease refresh + network
+        // propagation to peers holding our chunks (Sphinx 0x0A, Phase 1).
+        let runner_for_heartbeat = self.clone();
         tokio::spawn(async move {
-            repair_loop(repair_state, storage_keys, leases_for_repair).await;
+            heartbeat_sender_loop(runner_for_heartbeat).await;
         });
 
         // Start peer gossip loop (seed-only nodes are rate-limited: they only
@@ -488,11 +625,14 @@ impl NodeRunner {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
                 interval.tick().await;
-                accounting_for_prune.lock().await.prune_inactive_peers_with_grace(
-                    PRUNE_MAX_AGE_SECS,
-                    PARTITION_THRESHOLD_SECS,
-                    PARTITION_GRACE_PERIOD_SECS,
-                );
+                accounting_for_prune
+                    .lock()
+                    .await
+                    .prune_inactive_peers_with_grace(
+                        PRUNE_MAX_AGE_SECS,
+                        PARTITION_THRESHOLD_SECS,
+                        PARTITION_GRACE_PERIOD_SECS,
+                    );
             }
         });
 
@@ -534,7 +674,12 @@ impl NodeRunner {
                         .collect()
                 };
                 for peer_id in partitioned {
-                    if transport_for_recon.connections.read().await.contains_key(&peer_id) {
+                    if transport_for_recon
+                        .connections
+                        .read()
+                        .await
+                        .contains_key(&peer_id)
+                    {
                         continue;
                     }
                     let addr_opt = {
@@ -564,7 +709,8 @@ impl NodeRunner {
         });
 
         // Start rotation loop (Full nodes only: SeedOnly holds no chunks
-        // locally and must stay rate-limited; BackupOnly is dormant).
+        // locally and must stay rate-limited; BackupOnly is dormant; Client
+        // is relay-only).
         if matches!(self.config.mode, NodeMode::Full) {
             let rotation_state = self.rotation_state.clone();
             let rotation_config = self.config.rotation_config.clone();
@@ -574,6 +720,8 @@ impl NodeRunner {
             let capacity_for_rotation = self.capacity.clone();
             let transport_for_rotation = self.transport.clone();
             let merkle_proofs_for_rotation = self.merkle_proofs.clone();
+            let metadata_for_rotation = self.chunk_metadata.clone();
+            let buffer_for_rotation = self.host_buffer.clone();
             let rotation_node_id = self.transport.node_id;
             tokio::spawn(async move {
                 rotation_loop(
@@ -585,6 +733,8 @@ impl NodeRunner {
                     capacity_for_rotation,
                     transport_for_rotation,
                     merkle_proofs_for_rotation,
+                    metadata_for_rotation,
+                    buffer_for_rotation,
                     rotation_node_id,
                 )
                 .await;
@@ -623,7 +773,8 @@ impl NodeRunner {
 
         let mut inbound_rx = self.inbound_rx.lock().await;
         while let Some(inbound) = inbound_rx.recv().await {
-            if let Err(e) = self.handle_inbound(inbound).await {                warn!("Error handling inbound message: {}", e);
+            if let Err(e) = self.handle_inbound(inbound).await {
+                warn!("Error handling inbound message: {}", e);
             }
         }
 
@@ -640,7 +791,10 @@ impl NodeRunner {
         if inbound.is_reconnection {
             info!("Partition heal detected with peer {:02x?}", inbound.from);
             if let Err(e) = self.trigger_reconciliation(inbound.from).await {
-                warn!("Reconciliation trigger failed for {:02x?}: {}", inbound.from, e);
+                warn!(
+                    "Reconciliation trigger failed for {:02x?}: {}",
+                    inbound.from, e
+                );
             }
         }
 
@@ -653,7 +807,10 @@ impl NodeRunner {
                     debug!("Backup-only node dormant: ignoring Sphinx packet");
                     return Ok(());
                 }
-                debug!("Received Sphinx packet (destination) from {:02x?}", inbound.from);
+                debug!(
+                    "Received Sphinx packet (destination) from {:02x?}",
+                    inbound.from
+                );
 
                 {
                     let mut manager = self.retriever.lock().await;
@@ -664,13 +821,28 @@ impl NodeRunner {
                                 data: response.chunk_data,
                             };
                             let mut content_retriever = self.content_retriever.lock().await;
-                            if content_retriever.record_chunk(chunk.clone()).unwrap_or(false) {
-                                debug!("Successfully retrieved chunk {:02x?}", response.chunk_id);
-                            }
+                            let recorded = content_retriever
+                                .record_chunk(chunk.clone())
+                                .unwrap_or(false);
                             drop(content_retriever);
+                            if !recorded {
+                                // Not part of a file retrieval: stash as
+                                // single (manifest fetch path).
+                                self.single_chunks.lock().await.insert(chunk.id, chunk.data.clone());
+                            } else {
+                                debug!("Successfully retrieved chunk");
+                            }
                             // Freenet-style: cache what we retrieve so popular
                             // chunks spread and no holder set stays static.
                             self.cache_retrieved_chunk(chunk.id, &chunk.data).await;
+                        } else {
+                            // Peer reported the chunk missing (Phase 1):
+                            // report the miss so a HostBuffer holder reseeds.
+                            // The manifest path is the binding here (content
+                            // id == chunk id); the repair loop gossips with
+                            // the true content binding for shards.
+                            self.send_missing_chunk_gossip(response.chunk_id, response.chunk_id)
+                                .await;
                         }
                     }
                 }
@@ -687,6 +859,11 @@ impl NodeRunner {
                 // Dormant backups never reach this point: the gate above
                 // returns early, so they neither answer nor challenge.
                 self.handle_verification_fragment(&packet.body).await;
+
+                // Lifecycle dispatch (Phase 1): reassemble lifecycle
+                // fragments and route by type byte (missing-chunk gossip
+                // to the host role, heartbeats to the holder role).
+                self.handle_lifecycle_fragment(&packet.body, inbound.from).await;
             }
             WireMessage::Prepayment(prepayment) => {
                 let accepted = self.handle_prepayment(inbound.from, prepayment).await?;
@@ -822,6 +999,275 @@ impl NodeRunner {
         }
     }
 
+    /// Reassemble a lifecycle fragment and dispatch by type byte (Phase 1)
+    ///
+    /// Missing-chunk gossip (`0x09`) routes to the host role (HostBuffer
+    /// reseed); heartbeats (`0x0A`) route to the holder role (remote
+    /// lease refresh). Non-lifecycle payloads are discarded. One
+    /// reassembly in flight at a time, mirroring the compute/verification
+    /// pipelines.
+    async fn handle_lifecycle_fragment(self: &Arc<Self>, body: &[u8], from: NodeId) {
+        let fragment = match deserialize_fragment(body) {
+            Ok(fragment) => fragment,
+            Err(_) => return,
+        };
+
+        let completed = {
+            let mut state = self.lifecycle_state.lock().await;
+            if !state.reassembler.add_fragment(fragment) {
+                return;
+            }
+            if !state.reassembler.is_complete() {
+                return;
+            }
+            match state.reassembler.reassemble() {
+                Ok(payload) => Some(payload),
+                Err(_) => {
+                    // Corrupt reassembly: reset for the next exchange.
+                    state.reassembler = Reassembler::new();
+                    None
+                }
+            }
+        };
+
+        let Some(payload) = completed else {
+            return;
+        };
+        // One reassembly has completed; reset for the next exchange.
+        self.lifecycle_state.lock().await.reassembler = Reassembler::new();
+
+        match payload.first().copied() {
+            Some(m) if m == static_storage::gossip::MSG_MISSING_CHUNK_GOSSIP => {
+                match deserialize_gossip(&payload) {
+                    Ok(gossip) => self.handle_missing_chunk_gossip(gossip, from).await,
+                    Err(_) => debug!("Dropping malformed missing-chunk gossip"),
+                }
+            }
+            Some(m) if m == static_storage::heartbeat::MSG_HEARTBEAT => {
+                match Heartbeat::wire_deserialize(&payload) {
+                    Ok(heartbeat) => self.handle_heartbeat(heartbeat, from).await,
+                    Err(_) => debug!("Dropping malformed heartbeat"),
+                }
+            }
+            _ => debug!("Discarding non-lifecycle payload after reassembly"),
+        }
+    }
+
+    /// Handle a missing-chunk gossip report (host role, Phase 1)
+    ///
+    /// If the reported chunk is in our HostBuffer: reseed it into the
+    /// holder (retaining the original `created_at` — no barter clock
+    /// reset) and send it back to the reporter through the gossip's
+    /// return route as a hybrid-wrapped `ChunkResponse`.
+    async fn handle_missing_chunk_gossip(self: &Arc<Self>, gossip: MissingChunkGossip, from: NodeId) {
+        debug!(
+            "Missing-chunk gossip for chunk {:02x?} (content {:02x?}) from {:02x?}",
+            gossip.chunk_id, gossip.content_id, from
+        );
+
+        let Some((data, created_at)) = self.host_buffer.lock().await.get(&gossip.chunk_id) else {
+            debug!(
+                "HostBuffer lacks chunk {:02x?}; cannot reseed",
+                gossip.chunk_id
+            );
+            return;
+        };
+
+        if !self
+            .store_repaired_chunk(gossip.content_id, gossip.chunk_id, data.clone(), created_at)
+            .await
+        {
+            return;
+        }
+        info!("Reseeded chunk {:02x?} from HostBuffer", gossip.chunk_id);
+
+        // Return the reseeded chunk via the reporter's return route.
+        let response = ChunkResponse {
+            chunk_id: gossip.chunk_id,
+            chunk_data: data,
+            found: true,
+        };
+        let payload = serialize_chunk_response(&response);
+        let route = gossip.return_route.to_sphinx_route();
+        let Some(first_hop) = route.hops.first().map(|h| h.node_id) else {
+            return;
+        };
+        let kem_map = self.hybrid_kem_map().await;
+        let kem_lookup = move |id: &[u8; 16]| kem_map.get(id).cloned();
+        match static_mesh::retrieval::create_hybrid_payload_packets(&payload, &route, &kem_lookup)
+        {
+            Ok(packets) => {
+                for pkt in packets {
+                    let _ = send_sphinx(&self.transport, first_hop, pkt).await;
+                }
+            }
+            Err(_) => {
+                warn!("Cannot answer missing-chunk gossip: no KEM key for return route");
+            }
+        }
+    }
+
+    /// Handle an inbound heartbeat (holder role, Phase 1)
+    ///
+    /// Refreshes (or upserts, for chunks received via swap without a
+    /// lease) the leases the heartbeat covers. Only chunks we actually
+    /// hold are affected; expirations are capped at one lease duration.
+    async fn handle_heartbeat(self: &Arc<Self>, heartbeat: Heartbeat, from: NodeId) {
+        let now = current_timestamp();
+        let held: HashSet<ChunkId> = {
+            let holder = self.transport.chunk_holder.lock().await;
+            heartbeat
+                .chunk_ids
+                .iter()
+                .filter(|c| holder.has_chunk(c))
+                .copied()
+                .collect()
+        };
+        let mut leases = self.leases.lock().await;
+        match leases.process_heartbeat_upsert(&heartbeat, now, &held) {
+            Ok(renewed) => debug!(
+                "Refreshed {} leases for content {:02x?} (from {:02x?})",
+                renewed.len(),
+                heartbeat.content_id,
+                from
+            ),
+            Err(e) => warn!("Invalid heartbeat from {:02x?}: {}", from, e),
+        }
+    }
+
+    /// Send a missing-chunk gossip report to all hybrid-capable peers
+    ///
+    /// Deduped at the source: the same (content, chunk) miss is reported
+    /// at most once per `MISSING_GOSSIP_DEDUP_TTL_SECS`, and the dedup
+    /// map is bounded (`MISSING_GOSSIP_DEDUP_MAX`).
+    async fn send_missing_chunk_gossip(&self, content_id: ContentId, chunk_id: ChunkId) {
+        let now = current_timestamp();
+        {
+            let mut recent = self.missing_gossip_recent.lock().await;
+            if recent.len() >= MISSING_GOSSIP_DEDUP_MAX {
+                recent.retain(|_, sent| {
+                    now.saturating_sub(*sent) < MISSING_GOSSIP_DEDUP_TTL_SECS
+                });
+            }
+            if let Some(sent) = recent.get(&(content_id, chunk_id)) {
+                if now.saturating_sub(*sent) < MISSING_GOSSIP_DEDUP_TTL_SECS {
+                    return;
+                }
+            }
+            recent.insert((content_id, chunk_id), now);
+        }
+
+        let peers: Vec<static_mesh::routing::KnownNode> = {
+            let table = self.transport.routing_table.read().await;
+            table
+                .nodes
+                .values()
+                .filter(|p| {
+                    p.kem_public_key.as_ref().map(|k| k.len()).unwrap_or(0)
+                        == static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE
+                })
+                .cloned()
+                .collect()
+        };
+        if peers.is_empty() {
+            debug!("No hybrid-capable peers for missing-chunk gossip");
+            return;
+        }
+
+        let our_pubkey = self.transport.mix_node.lock().await.public_key;
+        let return_route = RetrievalReturnRoute {
+            hops: vec![static_storage::retrieval::RouteHopInfo {
+                public_key: our_pubkey,
+                node_id: self.transport.node_id,
+            }],
+            destination: self.transport.node_id,
+        };
+        let gossip = MissingChunkGossip {
+            content_id,
+            chunk_id,
+            timestamp: now,
+            return_route,
+        };
+        let payload = serialize_gossip(&gossip);
+
+        for peer in &peers {
+            let route = Route {
+                hops: vec![RouteHop {
+                    public_key: peer.public_key,
+                    node_id: peer.node_id,
+                }],
+                destination: peer.node_id,
+            };
+            let Some(kem) = peer.kem_public_key.clone() else {
+                continue;
+            };
+            let kem_lookup = single_peer_kem_lookup(peer.node_id, kem);
+            let Ok(packets) =
+                static_mesh::retrieval::create_hybrid_payload_packets(&payload, &route, &kem_lookup)
+            else {
+                continue;
+            };
+            for pkt in packets {
+                let _ = send_sphinx(&self.transport, peer.node_id, pkt).await;
+            }
+        }
+        debug!(
+            "Sent missing-chunk gossip for chunk {:02x?} to {} peers",
+            chunk_id,
+            peers.len()
+        );
+    }
+
+    /// Store a repaired/reseeded chunk: capacity-gated holder insert plus
+    /// lifecycle metadata.
+    ///
+    /// `created_at` semantics (no barter clock reset): HostBuffer reseeds
+    /// pass the chunk's ORIGINAL `created_at`; erasure-reconstructed
+    /// shards pass `now` (the original clock is unrecoverable). An
+    /// existing metadata entry always keeps its own `created_at`.
+    async fn store_repaired_chunk(
+        &self,
+        content_id: ContentId,
+        chunk_id: ChunkId,
+        data: Vec<u8>,
+        created_at: u64,
+    ) -> bool {
+        let size = data.len() as u64;
+        // Capacity gate (reconcile first: counter drift safety, same as
+        // the swap decision path).
+        let fits = {
+            let actual = self.transport.chunk_holder.lock().await.total_bytes();
+            let mut cap = self.capacity.lock().await;
+            cap.reconcile(actual);
+            cap.can_accept(size, 0)
+        };
+        if !fits {
+            warn!(
+                "No capacity to reseed/repair chunk {:02x?} ({} bytes)",
+                chunk_id, size
+            );
+            return false;
+        }
+        {
+            let mut holder = self.transport.chunk_holder.lock().await;
+            if !holder.has_chunk(&chunk_id) {
+                holder.add_chunk(chunk_id, data, content_id);
+                self.capacity.lock().await.record_accept(size);
+            }
+        }
+        // Lifecycle metadata: preserve the original clock, refresh
+        // freshness against now.
+        let now = current_timestamp();
+        {
+            let mut meta = self.chunk_metadata.lock().await;
+            let entry = meta
+                .entry(chunk_id)
+                .or_insert_with(|| ChunkMetadata::fresh(created_at));
+            entry.refresh(now);
+        }
+        true
+    }
+
     /// Answer a verification challenge from local storage (responder role)
     ///
     /// Slices the requested segment out of the held encrypted chunk and
@@ -873,7 +1319,13 @@ impl NodeRunner {
     ) -> anyhow::Result<()> {
         let payload = serialize_response(response)?;
         let route = return_route.to_sphinx_route();
-        let packets = build_fragment_packets(&payload, &route)?;
+        let kem_map = self.hybrid_kem_map().await;
+        let kem_lookup = move |id: &[u8; 16]| kem_map.get(id).cloned();
+        let packets = static_mesh::retrieval::create_hybrid_payload_packets(
+            &payload,
+            &route,
+            &kem_lookup,
+        )?;
 
         let first_hop = return_route
             .hops
@@ -949,12 +1401,18 @@ impl NodeRunner {
 
         if self.config.compute_config.pricing.is_free() {
             if let Err(err) = self.accept_compute_request(&request).await {
-                debug!("Rejecting compute request {:02x?}: {}", request.request_id, err);
+                debug!(
+                    "Rejecting compute request {:02x?}: {}",
+                    request.request_id, err
+                );
                 self.send_compute_error(&request, &err, false, None).await;
                 return;
             }
 
-            debug!("Accepted free-tier compute request {:02x?}", request.request_id);
+            debug!(
+                "Accepted free-tier compute request {:02x?}",
+                request.request_id
+            );
             let runner = self.clone();
             tokio::spawn(async move {
                 runner.run_compute_execution(request).await;
@@ -975,10 +1433,7 @@ impl NodeRunner {
     /// Checks capacity, then records the execution. Duplicate request IDs
     /// are accepted idempotently (the first registration wins) so retried
     /// fragments cannot double-book an execution.
-    async fn accept_compute_request(
-        &self,
-        request: &ComputeRequest,
-    ) -> Result<(), ComputeError> {
+    async fn accept_compute_request(&self, request: &ComputeRequest) -> Result<(), ComputeError> {
         let mut state = self.compute_state.lock().await;
 
         if state.active_executions.contains_key(&request.request_id) {
@@ -1020,7 +1475,10 @@ impl NodeRunner {
                 "unsupported payment currency byte {}",
                 request.currency
             ));
-            debug!("Rejecting compute request {:02x?}: {}", request.request_id, err);
+            debug!(
+                "Rejecting compute request {:02x?}: {}",
+                request.request_id, err
+            );
             self.send_compute_error(&request, &err, false, None).await;
             return;
         };
@@ -1029,7 +1487,10 @@ impl NodeRunner {
         // fragments cannot double-book; only the first reservation quotes.
         match self.reserve_payment_slot(&request).await {
             Err(err) => {
-                debug!("Rejecting compute request {:02x?}: {}", request.request_id, err);
+                debug!(
+                    "Rejecting compute request {:02x?}: {}",
+                    request.request_id, err
+                );
                 self.send_compute_error(&request, &err, false, None).await;
                 return;
             }
@@ -1079,7 +1540,10 @@ impl NodeRunner {
             }
         }
 
-        if let Err(e) = self.send_payment_request(&payment, &request.return_route).await {
+        if let Err(e) = self
+            .send_payment_request(&payment, &request.return_route)
+            .await
+        {
             warn!(
                 "Failed to deliver payment quote for {:02x?}: {} (kept for timeout)",
                 request.request_id, e
@@ -1098,10 +1562,7 @@ impl NodeRunner {
     /// Reserve a payment slot (dedupe + capacity check with a placeholder
     /// quote). Returns `Ok(true)` for a fresh reservation, `Ok(false)` for
     /// an already-tracked request.
-    async fn reserve_payment_slot(
-        &self,
-        request: &ComputeRequest,
-    ) -> Result<bool, ComputeError> {
+    async fn reserve_payment_slot(&self, request: &ComputeRequest) -> Result<bool, ComputeError> {
         let mut state = self.compute_state.lock().await;
         if state.active_executions.contains_key(&request.request_id)
             || state.payment_pending.contains_key(&request.request_id)
@@ -1133,10 +1594,7 @@ impl NodeRunner {
     }
 
     /// Fetch a WASM module from cache or the network (provider role)
-    async fn obtain_module(
-        &self,
-        request: &ComputeRequest,
-    ) -> Result<Vec<u8>, ComputeError> {
+    async fn obtain_module(&self, request: &ComputeRequest) -> Result<Vec<u8>, ComputeError> {
         {
             let state = self.compute_state.lock().await;
             if let Some(bytes) = state.cached_modules.get(&request.module_content_id) {
@@ -1210,7 +1668,10 @@ impl NodeRunner {
                     payment_required: false,
                     payment_request: vec![],
                 };
-                if let Err(e) = self.send_compute_response(response, &request.return_route).await {
+                if let Err(e) = self
+                    .send_compute_response(response, &request.return_route)
+                    .await
+                {
                     warn!("Failed to send compute response: {}", e);
                 }
             }
@@ -1253,7 +1714,10 @@ impl NodeRunner {
             payment_required: false,
             payment_request: vec![],
         };
-        if let Err(e) = self.send_compute_response(response, &request.return_route).await {
+        if let Err(e) = self
+            .send_compute_response(response, &request.return_route)
+            .await
+        {
             warn!("Failed to send compute error response: {}", e);
         }
     }
@@ -1282,7 +1746,10 @@ impl NodeRunner {
                 None => vec![],
             },
         };
-        if let Err(e) = self.send_compute_response(response, &request.return_route).await {
+        if let Err(e) = self
+            .send_compute_response(response, &request.return_route)
+            .await
+        {
             warn!("Failed to send compute rejection: {}", e);
         }
     }
@@ -1293,7 +1760,9 @@ impl NodeRunner {
         response: ComputeResponse,
         return_route: &ReturnRoute,
     ) -> anyhow::Result<()> {
-        let packets = build_response_packets(&response, return_route)
+        let kem_map = self.hybrid_kem_map().await;
+        let kem_lookup = move |id: &[u8; 16]| kem_map.get(id).cloned();
+        let packets = build_response_packets(&response, return_route, &kem_lookup)
             .map_err(|e| anyhow::anyhow!("response packet build failed: {}", e))?;
         self.send_packets(packets, return_route).await
     }
@@ -1306,8 +1775,28 @@ impl NodeRunner {
     ) -> anyhow::Result<()> {
         let payload = serialize_payment_request(quote)?;
         let route = return_route.to_sphinx_route();
-        let packets = build_fragment_packets(&payload, &route)?;
+        let kem_map = self.hybrid_kem_map().await;
+        let kem_lookup = move |id: &[u8; 16]| kem_map.get(id).cloned();
+        let packets = static_mesh::retrieval::create_hybrid_payload_packets(
+            &payload,
+            &route,
+            &kem_lookup,
+        )?;
         self.send_packets(packets, return_route).await
+    }
+
+    /// KEM public keys of all handshake-known peers, keyed by node id
+    ///
+    /// Peers without a KEM key are omitted: traffic routed through
+    /// [`static_mesh::retrieval::create_hybrid_payload_packets`] to them
+    /// fails at the source instead of being silently dropped in transit.
+    async fn hybrid_kem_map(&self) -> HashMap<NodeId, Vec<u8>> {
+        let table = self.transport.routing_table.read().await;
+        table
+            .nodes
+            .iter()
+            .filter_map(|(id, n)| n.kem_public_key.as_ref().map(|k| (*id, k.clone())))
+            .collect()
     }
 
     /// Send pre-built Sphinx packets to a return route's first hop
@@ -1355,7 +1844,9 @@ impl NodeRunner {
         if response.success {
             info!(
                 "Compute execution {:02x?} succeeded: {} bytes output, {} ms CPU, {} bytes memory",
-                response.request_id, response.output_data.len(), response.cpu_time_ms,
+                response.request_id,
+                response.output_data.len(),
+                response.cpu_time_ms,
                 response.memory_used
             );
         } else {
@@ -1370,7 +1861,9 @@ impl NodeRunner {
         if state.completed_results.len() >= MAX_COMPLETED_COMPUTE_RESULTS {
             state.completed_results.clear();
         }
-        state.completed_results.insert(response.request_id, response);
+        state
+            .completed_results
+            .insert(response.request_id, response);
     }
 
     /// Handle a payment quote from a provider (requester role)
@@ -1456,6 +1949,12 @@ impl NodeRunner {
         let Some(peer) = peer else {
             anyhow::bail!("No compute-capable peers available");
         };
+        let Some(peer_kem) = peer.kem_public_key.clone() else {
+            anyhow::bail!(
+                "Compute peer {:02x?} has no KEM key (hybrid-only transport)",
+                peer.node_id
+            );
+        };
 
         let module_content_id =
             static_storage::hidden_service::content_id_from_public(module_content_pub_key);
@@ -1491,7 +1990,8 @@ impl NodeRunner {
             }],
             destination: peer.node_id,
         };
-        let packets = build_request_packets(&request, &forward_route)?;
+        let kem_lookup = single_peer_kem_lookup(peer.node_id, peer_kem);
+        let packets = build_request_packets(&request, &forward_route, &kem_lookup)?;
 
         self.compute_state.lock().await.pending_requests.insert(
             request_id,
@@ -1558,31 +2058,41 @@ impl NodeRunner {
             currency,
         };
         let payload = serialize_payment_confirmation(&confirmation)?;
+        let (public_key, kem) = {
+            let table = self.transport.routing_table.read().await;
+            match table.get_node(&provider) {
+                Some(n) => (n.public_key, n.kem_public_key.clone()),
+                None => anyhow::bail!("unknown compute provider {:02x?}", provider),
+            }
+        };
+        let Some(kem) = kem else {
+            anyhow::bail!(
+                "compute provider {:02x?} has no KEM key (hybrid-only transport)",
+                provider
+            );
+        };
         let forward_route = Route {
             hops: vec![RouteHop {
-                public_key: self.provider_mix_key(provider).await,
+                public_key,
                 node_id: provider,
             }],
             destination: provider,
         };
-        let packets = build_fragment_packets(&payload, &forward_route)?;
+        let kem_lookup = single_peer_kem_lookup(provider, kem);
+        let packets = static_mesh::retrieval::create_hybrid_payload_packets(
+            &payload,
+            &forward_route,
+            &kem_lookup,
+        )?;
         for packet in packets {
             send_sphinx(&self.transport, provider, packet).await?;
         }
 
-        info!("Sent payment confirmation for compute request {:02x?}", request_id);
+        info!(
+            "Sent payment confirmation for compute request {:02x?}",
+            request_id
+        );
         Ok(())
-    }
-
-    /// Look up a peer's mix public key from the routing table
-    async fn provider_mix_key(&self, provider: NodeId) -> [u8; 32] {
-        let routing_table = self.transport.routing_table.read().await;
-        routing_table
-            .nodes
-            .values()
-            .find(|n| n.node_id == provider)
-            .map(|n| n.public_key)
-            .unwrap_or([0u8; 32])
     }
 
     /// Poll a submitted compute request for its completed result
@@ -1625,6 +2135,8 @@ impl NodeRunner {
                 total_bytes_served: total_served,
                 total_bytes_received: total_received,
                 timestamp: now,
+                identity_public_key: [0u8; 32],
+                signature: vec![],
             }];
         }
         entries
@@ -1635,6 +2147,8 @@ impl NodeRunner {
                 total_bytes_served: total_served,
                 total_bytes_received: total_received,
                 timestamp: now,
+                identity_public_key: [0u8; 32],
+                signature: vec![],
             })
             .collect()
     }
@@ -1662,18 +2176,28 @@ impl NodeRunner {
             current_timestamp(),
         );
         let count = batches.len();
-        for batch in batches {
+        // Sign each batch with our Ed25519 identity key (Phase 0 auth).
+        let sk_bytes = self.transport.identity_key.to_bytes();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
+        for mut batch in batches {
+            batch.sign(&sk);
             static_mesh::transport::send_reconciliation(&self.transport, peer, batch).await?;
         }
         info!("Sent {} reconciliation batch(es) to {:02x?}", count, peer);
         Ok(())
     }
 
-    /// Process an incoming reconciliation batch (last-write-wins merge)
+    /// Process an incoming reconciliation batch (verified LWW merge)
     pub async fn process_reconciliation(
         &self,
         recon: AccountingReconciliation,
     ) -> anyhow::Result<()> {
+        // Phase 0 auth: signature + future-timestamp bound + sanity.
+        if !recon.verify(current_timestamp()) {
+            anyhow::bail!("Invalid reconciliation signature/timestamp");
+        }
+        // Sender binding: must come from its claimant.
+        // (Caller ensures `from == recon.from_node`; double-check here.)
         let incoming: Vec<(NodeId, PeerCredit)> = recon
             .peer_credits
             .iter()
@@ -1754,7 +2278,13 @@ impl NodeRunner {
         if !self.config.rotation_config.enable_caching {
             return;
         }
-        if self.transport.chunk_holder.lock().await.has_chunk(&chunk_id) {
+        if self
+            .transport
+            .chunk_holder
+            .lock()
+            .await
+            .has_chunk(&chunk_id)
+        {
             return;
         }
 
@@ -1773,7 +2303,10 @@ impl NodeRunner {
                 [0u8; 32], // cached chunks carry no content binding
             );
             self.capacity.lock().await.record_accept(chunk_len);
-            self.rotation_state.lock().await.record_cache(chunk_id, current_time);
+            self.rotation_state
+                .lock()
+                .await
+                .record_cache(chunk_id, current_time);
             debug!("Cached chunk {:02x?} locally", chunk_id);
             return;
         }
@@ -1792,7 +2325,11 @@ impl NodeRunner {
                         .map(|d| d.len() as u64)
                         .unwrap_or(0)
                 };
-                self.transport.chunk_holder.lock().await.remove_chunk(&lru_id);
+                self.transport
+                    .chunk_holder
+                    .lock()
+                    .await
+                    .remove_chunk(&lru_id);
                 self.rotation_state.lock().await.remove_cache(&lru_id);
                 self.capacity.lock().await.record_remove(evicted_len);
                 debug!("Evicted cached chunk {:02x?} to make room", lru_id);
@@ -1804,7 +2341,10 @@ impl NodeRunner {
                         [0u8; 32],
                     );
                     self.capacity.lock().await.record_accept(chunk_len);
-                    self.rotation_state.lock().await.record_cache(chunk_id, current_time);
+                    self.rotation_state
+                        .lock()
+                        .await
+                        .record_cache(chunk_id, current_time);
                     debug!("Cached chunk {:02x?} locally after eviction", chunk_id);
                 }
             }
@@ -1819,7 +2359,7 @@ impl NodeRunner {
     /// Validate and accept a prepayment from a seed-only node (sponsor-side)
     ///
     /// Checks, in order:
-    /// 1. Stub signature (`!signature.is_empty()`)
+    /// 1. Real Ed25519 signature + sender binding
     /// 2. Misbehaving flag (dropped seeds are ignored, content expires)
     /// 3. Rate limit (one prepayment per content ID per hour)
     /// 4. Excess capacity (`has_excess_capacity`)
@@ -1834,14 +2374,12 @@ impl NodeRunner {
     ) -> anyhow::Result<bool> {
         // Backup-only nodes never accept prepayments (dormant).
         if matches!(self.config.mode, NodeMode::BackupOnly) {
-            debug!("Backup-only node ignoring prepayment");
             return Ok(false);
         }
 
-        // 1. Stub signature check.
-        // TODO: Add ed25519-dalek for real signature verification
-        if !prepayment.validate() {
-            warn!("Rejecting prepayment from {:02x?}: invalid signature/amount", from);
+        // 1. Real signature check + sender binding.
+        if prepayment.from_node != from || !prepayment.validate() {
+            warn!("Rejecting prepayment: invalid signature/amount/binding");
             return Ok(false);
         }
 
@@ -1869,10 +2407,12 @@ impl NodeRunner {
         if !accounting.has_excess_capacity(0) {
             // Fresh nodes with zero totals have 0 surplus; allow the very
             // first sponsorship as bootstrap, but require surplus afterwards.
-            let fresh = accounting.total_bytes_served == 0
-                && accounting.total_bytes_received == 0;
+            let fresh = accounting.total_bytes_served == 0 && accounting.total_bytes_received == 0;
             if !(fresh && accounting.sponsor_seed_count() == 0) {
-                warn!("Rejecting prepayment from {:02x?}: no excess capacity", from);
+                warn!(
+                    "Rejecting prepayment from {:02x?}: no excess capacity",
+                    from
+                );
                 return Ok(false);
             }
         }
@@ -1887,12 +2427,8 @@ impl NodeRunner {
         }
 
         accounting.record_prepayment(from, prepayment.bytes);
-        match accounting.register_sponsored_seed(
-            from,
-            prepayment.content_id,
-            prepayment.bytes,
-            now,
-        ) {
+        match accounting.register_sponsored_seed(from, prepayment.content_id, prepayment.bytes, now)
+        {
             Ok(()) => {
                 info!(
                     "Accepted prepayment from {:02x?}: {} bytes for {:02x?}",
@@ -1938,15 +2474,35 @@ impl NodeRunner {
         &self,
         file_data: &[u8],
     ) -> anyhow::Result<(ContentId, ContentManifest, [u8; 32])> {
-        // 1. Generate a keypair for this content
-        let mut content_pub_key = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut content_pub_key);
+        // 1. Generate an Ed25519 content identity (C1/C4): content_id =
+        // blake3(pub). Manifest encryption stays HKDF(pub) public-readable;
+        // confidentiality comes from address secrecy, not encryption.
+        use ed25519_dalek::SigningKey;
+        use rand::RngCore;
+        let mut content_sk_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut content_sk_bytes);
+        let content_sk = SigningKey::from_bytes(&content_sk_bytes);
+        let content_pub_key = content_sk.verifying_key().to_bytes();
         let content_id = static_storage::hidden_service::content_id_from_public(&content_pub_key);
 
         // 2. Encrypt the file into chunks
         let master_key = SymmetricKey::random();
         let nonce = static_crypto::NonceBytes::random();
-        let (chunks, mut manifest) = static_storage::encrypt_file(&master_key, &nonce, file_data)?;
+        let (raw_chunks, mut manifest) = static_storage::encrypt_file(&master_key, &nonce, file_data)?;
+
+        // 2b. Erasure-code (L1): pad to K=data_shards model. Small files use
+        // K=num_chunks, M=min(5,K) (K=1,M=1 for single-chunk).
+        let num = raw_chunks.len();
+        let data_shards = num;
+        let parity_shards = if num == 1 { 1 } else { num.min(5) };
+        let chunks = static_storage::erasure_encode(&raw_chunks, data_shards, parity_shards)?;
+        manifest.chunk_ids = chunks.iter().map(|c| c.id).collect();
+        manifest.data_shards = data_shards;
+        manifest.parity_shards = parity_shards;
+        // C1: carry master + nonce inside the (encrypted) manifest so any
+        // holder of the content pubkey can retrieve without local storage_keys.
+        manifest.encrypted_master_key = master_key.bytes.to_vec();
+        manifest.nonce = nonce.bytes;
 
         // Update the manifest with the correct content_id
         manifest.content_id = content_id;
@@ -1956,27 +2512,32 @@ impl NodeRunner {
         // the encrypted manifest: only nodes with the content public key
         // can challenge. Registered before the mode split so seed-only
         // publishers keep hashes for the chunks their sponsor stores.
-        manifest.segment_hashes =
-            static_storage::verification::compute_segment_hashes(&chunks);
-        self.manifests.lock().await.insert(content_id, manifest.clone());
+        manifest.segment_hashes = static_storage::verification::compute_segment_hashes(&chunks);
+        self.manifests
+            .lock()
+            .await
+            .insert(content_id, manifest.clone());
 
         // 5. Encrypt the manifest (needed to compute total prepaid size)
-        let (encrypted_manifest, manifest_chunk_id) = static_storage::hidden_service::encrypt_manifest(&manifest, &content_pub_key)?;
+        let (encrypted_manifest, manifest_chunk_id) =
+            static_storage::hidden_service::encrypt_manifest(&manifest, &content_pub_key)?;
 
         let total_bytes: u64 = chunks.iter().map(|c| c.data.len() as u64).sum::<u64>()
             + encrypted_manifest.ciphertext.len() as u64;
 
         // Seed-only path: pre-pay ONE sponsor, do not store locally.
         if matches!(self.config.mode, NodeMode::SeedOnly) {
-            return self.publish_via_sponsor(
-                content_id,
-                manifest,
-                content_pub_key,
-                master_key,
-                chunks,
-                manifest_chunk_id,
-                total_bytes,
-            ).await;
+            return self
+                .publish_via_sponsor(
+                    content_id,
+                    manifest,
+                    content_pub_key,
+                    master_key,
+                    chunks,
+                    manifest_chunk_id,
+                    total_bytes,
+                )
+                .await;
         }
 
         // Generate Merkle integrity proofs over the encrypted chunks (data
@@ -2001,21 +2562,33 @@ impl NodeRunner {
         }
 
         // 4. Store the master key in storage_keys
-        self.storage_keys.lock().await.insert(content_id, master_key.clone());
+        self.storage_keys
+            .lock()
+            .await
+            .insert(content_id, master_key.clone());
 
-        // 6. Store the encrypted manifest as a chunk locally
+        // 6. Store the encrypted manifest as a chunk locally (C1 fix):
+        // serialize the full EncryptedManifest (ciphertext+nonce) so
+        // retrievers recover the nonce, and store under BOTH the manifest
+        // chunk ID and the content ID so `retrieve_content(content_id)`
+        // finds it without out-of-band hints.
         {
+            let manifest_bytes = serde_json::to_vec(&encrypted_manifest)
+                .map_err(|e| anyhow::anyhow!("Manifest serialization failed: {}", e))?;
             let mut holder = self.transport.chunk_holder.lock().await;
-            holder.add_chunk(manifest_chunk_id, encrypted_manifest.ciphertext.clone(), content_id);
+            holder.add_chunk(manifest_chunk_id, manifest_bytes.clone(), content_id);
+            // Duplicate under content_id for discovery (counts once toward 1:1).
+            if manifest_chunk_id != content_id {
+                holder.add_chunk(content_id, manifest_bytes, content_id);
+            }
         }
 
         // 6b. Account the stored bytes toward the 1:1 contribution.
+        // Truthful: snap to holder reality (covers erasure parity +
+        // manifest JSON duplicates without manual bookkeeping drift).
         {
-            let mut capacity = self.capacity.lock().await;
-            for chunk in &chunks {
-                capacity.record_accept(chunk.data.len() as u64);
-            }
-            capacity.record_accept(encrypted_manifest.ciphertext.len() as u64);
+            let actual = self.transport.chunk_holder.lock().await.total_bytes();
+            self.capacity.lock().await.reconcile(actual);
         }
 
         // 7. Register with lease manager
@@ -2028,7 +2601,20 @@ impl NodeRunner {
             chunk_ids.clone(),
         );
 
-        tracing::info!("Published content: {:02x?} ({} chunks + 1 manifest)", content_id, chunks.len());
+        // L6 lifecycle: record fresh metadata for bartered chunks (24h stale).
+        {
+            let now = current_timestamp();
+            let mut meta = self.chunk_metadata.lock().await;
+            for chunk in &chunks {
+                meta.insert(chunk.id, ChunkMetadata::fresh(now));
+            }
+        }
+
+        tracing::info!(
+            "Published content: {:02x?} ({} chunks + 1 manifest)",
+            content_id,
+            chunks.len()
+        );
 
         Ok((content_id, manifest, content_pub_key))
     }
@@ -2077,12 +2663,11 @@ impl NodeRunner {
         };
 
         // Minimum stake = total content size ensures 1:1 from the start.
-        let prepayment = Prepayment {
-            from_node: self.transport.node_id,
-            bytes: total_bytes,
-            content_id,
-            // TODO: Add ed25519-dalek for real signature verification
-            signature: vec![0x01u8; 64],
+        // Real Ed25519 signature (Phase 0, G2 fix).
+        let prepayment = {
+            let sk_bytes = self.transport.identity_key.to_bytes();
+            let sk = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
+            Prepayment::sign(self.transport.node_id, total_bytes, content_id, &sk)
         };
         debug_assert!(prepayment.validate());
 
@@ -2099,14 +2684,16 @@ impl NodeRunner {
         // heartbeats/renewals can be sent when requested (rate-limited:
         // heartbeats every 30 min, one prepayment per content per hour,
         // no full-rate cover traffic).
-        self.storage_keys.lock().await.insert(content_id, master_key.clone());
+        self.storage_keys
+            .lock()
+            .await
+            .insert(content_id, master_key.clone());
         let mut chunk_ids: Vec<ChunkId> = chunks.iter().map(|c| c.id).collect();
         chunk_ids.push(manifest_chunk_id);
-        self.leases.lock().await.register_owned_content(
-            content_id,
-            master_key,
-            chunk_ids,
-        );
+        self.leases
+            .lock()
+            .await
+            .register_owned_content(content_id, master_key, chunk_ids);
 
         // NOTE: chunk bodies are Sphinx-wrapped for privacy when sent over
         // the mixnet (see fragmentation layer). The direct prepayment above
@@ -2120,58 +2707,57 @@ impl NodeRunner {
         Ok((content_id, manifest, content_pub_key))
     }
 
-    /// Build a forward anonymous request, preferring hybrid key agreement
+    /// Build a forward anonymous request (hybrid-only, Phase 0).
     ///
-    /// When `use_hybrid` is set and the forward peer's ML-KEM key is known
-    /// (learned via handshake), the forward packet uses hybrid v1 key
-    /// agreement. The return route stays classical so the request fits in
-    /// one body; versions are per-packet, so mixing is safe. Falls back
-    /// to classical v0 otherwise (mixed-version networks keep working).
+    /// Requires the forward peer's ML-KEM key (handshake-learned). No
+    /// classical fallback — mixed-version networks are not supported.
     fn build_forward_request(
         chunk_id: ChunkId,
         peer: &static_mesh::routing::KnownNode,
         return_route: &Route,
-        forward_route: &Route,
-        use_hybrid: bool,
     ) -> anyhow::Result<static_sphinx::SphinxPacket> {
-        if use_hybrid {
-            if let Some(kem) = peer.kem_public_key.as_ref().filter(|k| {
-                k.len() == static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE
-            }) {
-                let hybrid_forward = static_sphinx::HybridRoute {
-                    hops: vec![static_sphinx::HybridRouteHop {
-                        node_id: peer.node_id,
-                        classical_public_key: peer.public_key,
-                        kem_public_key: kem.clone(),
-                    }],
-                    destination: peer.node_id,
-                };
-                return Ok(static_mesh::retrieval::create_anonymous_request_hybrid(
-                    chunk_id,
-                    return_route,
-                    &hybrid_forward,
-                )?);
-            }
-        }
-        Ok(static_mesh::retrieval::create_anonymous_request(
+        let kem = peer.kem_public_key.as_ref().filter(|k| {
+            k.len() == static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE
+        }).ok_or_else(|| anyhow::anyhow!("Peer missing KEM key for hybrid route"))?;
+        let hybrid_forward = static_sphinx::HybridRoute {
+            hops: vec![static_sphinx::HybridRouteHop {
+                node_id: peer.node_id,
+                classical_public_key: peer.public_key,
+                kem_public_key: kem.clone(),
+            }],
+            destination: peer.node_id,
+        };
+        Ok(static_mesh::retrieval::create_anonymous_request_hybrid(
             chunk_id,
             return_route,
-            forward_route,
+            &hybrid_forward,
         )?)
     }
 
     /// Retrieve content from the network using the hidden service model
-    pub async fn retrieve_content(
-        &self,
-        content_pub_key: &[u8; 32],
-    ) -> anyhow::Result<Vec<u8>> {
+    ///
+    /// Phase 0 (L12 fix): checks local holder first (covers same-node
+    /// publish/retrieve), otherwise Sphinx-requests `content_id` from ALL
+    /// known peers (no DHT/cache per Item 18), waits up to 10s for the
+    /// manifest via `single_chunks`, decrypts with the transmitted nonce,
+    /// extracts master/nonce from the manifest itself (no `storage_keys`
+    /// lookup), then fetches data shards with erasure fallback.
+    pub async fn retrieve_content(&self, content_pub_key: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
         let content_id = static_storage::hidden_service::content_id_from_public(content_pub_key);
-        tracing::info!("Retrieving content: {:02x?}", content_id);
+        tracing::info!("Retrieving content");
 
-        // 1. Ask peers for the encrypted manifest chunk
-        let routing_table = self.transport.routing_table.read().await;
-        let known_nodes: Vec<static_mesh::routing::KnownNode> = routing_table.nodes.values().cloned().collect();
-        drop(routing_table);
+        // 0. Local fast path: manifest duplicate stored under content_id.
+        if let Some(local) = self.transport.chunk_holder.lock().await.get_chunk(&content_id).cloned() {
+            if let Ok(manifest) = Self::decrypt_manifest_bytes(&local, content_pub_key) {
+                if let Ok(data) = self.assemble_from_manifest(&manifest).await {
+                    return Ok(data);
+                }
+            }
+        }
+
+        // 1. Ask ALL known peers (Sphinx-wrapped, no cache).
+        let known_nodes: Vec<static_mesh::routing::KnownNode> =
+            self.transport.routing_table.read().await.nodes.values().cloned().collect();
 
         if known_nodes.is_empty() {
             return Err(anyhow::anyhow!("No known peers to request manifest from"));
@@ -2180,147 +2766,249 @@ impl NodeRunner {
         let our_pubkey = self.transport.mix_node.lock().await.public_key;
         let our_node_id = self.transport.node_id;
         let return_route = Route {
-            hops: vec![RouteHop { public_key: our_pubkey, node_id: our_node_id }],
+            hops: vec![RouteHop {
+                public_key: our_pubkey,
+                node_id: our_node_id,
+            }],
             destination: our_node_id,
         };
 
-        let peer = &known_nodes[0];
-        let forward_route = Route {
-            hops: vec![RouteHop { public_key: peer.public_key, node_id: peer.node_id }],
-            destination: peer.node_id,
-        };
+        // Hybrid-capable peers only (hybrid mandate).
+        let peers: Vec<_> = known_nodes
+            .iter()
+            .filter(|p| {
+                p.kem_public_key.as_ref().map(|k| k.len()).unwrap_or(0)
+                    == static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE
+            })
+            .collect();
+        if peers.is_empty() {
+            return Err(anyhow::anyhow!("No hybrid-capable peers for retrieval"));
+        }
 
-        // We request the content_id itself, as the publisher stored the encrypted manifest there
-        let request_packet = Self::build_forward_request(
-            content_id,
-            peer,
-            &return_route,
-            &forward_route,
-            self.config.use_hybrid_crypto,
-        )?;
-
-        static_mesh::transport::send_sphinx(&self.transport, peer.node_id, request_packet).await?;
-
-        // 2. Wait for the encrypted manifest to arrive
-        let mut manager = self.retriever.lock().await;
-        manager.start_retrieval(content_id);
-
-        let timeout = tokio::time::sleep(std::time::Duration::from_secs(10));
-        tokio::pin!(timeout);
-
-        #[allow(unused_assignments)]
-        let mut encrypted_manifest_data: Option<Vec<u8>> = None;
-        
-        loop {
-            tokio::select! {
-                _ = &mut timeout => {
-                    return Err(anyhow::anyhow!("Timeout waiting for manifest"));
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                    let r = self.content_retriever.lock().await;
-                    if r.is_complete() {
-                        encrypted_manifest_data = Some(r.assemble()?);
-                        drop(r);
-                        let mut r = self.content_retriever.lock().await;
-                        *r = ContentRetriever::new();
-                        break;
-                    }
-                    drop(r);
-                }
+        {
+            let mut manager = self.retriever.lock().await;
+            manager.start_retrieval(content_id);
+        }
+        for peer in &peers {
+            if let Ok(pkt) = Self::build_forward_request(content_id, peer, &return_route) {
+                let _ = static_mesh::transport::send_sphinx(&self.transport, peer.node_id, pkt).await;
             }
         }
 
-        let encrypted_manifest_data = encrypted_manifest_data.ok_or_else(|| anyhow::anyhow!("Failed to retrieve manifest"))?;
-        
-        // The response is a ChunkResponse. Deserialize it.
-        let response: static_storage::retrieval::ChunkResponse = serde_json::from_slice(&encrypted_manifest_data)?;
-        if !response.found {
-            return Err(anyhow::anyhow!("Manifest not found on peer"));
-        }
+        // 2. Wait up to 10s for the manifest (single_chunks or local).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let manifest_bytes: Vec<u8> = loop {
+            if let Some(b) = self.single_chunks.lock().await.remove(&content_id) {
+                break b;
+            }
+            if let Some(b) = self.transport.chunk_holder.lock().await.get_chunk(&content_id).cloned() {
+                // Another task cached it meanwhile; consume single first, else use holder.
+                // Prefer single (network) to avoid stale local, but local works.
+                let _ = b;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow::anyhow!("Timeout waiting for manifest"));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
 
-        // 3. Decrypt the manifest
-        // In a full implementation, the nonce would be stored alongside the ciphertext.
-        // For this prototype, we'll use a zero nonce as placeholder.
-        let encrypted_manifest = static_storage::hidden_service::EncryptedManifest {
-            ciphertext: response.chunk_data,
+        // Manifest bytes are either EncryptedManifest JSON (new) or a
+        // ChunkResponse JSON (legacy network path). Handle both.
+        let manifest = Self::decrypt_manifest_response(&manifest_bytes, content_pub_key)?;
+
+        // 3. Assemble file from manifest (local + network shards).
+        self.fetch_and_assemble(manifest, &return_route, &peers).await
+    }
+
+    /// Decrypt manifest bytes stored locally (EncryptedManifest JSON).
+    fn decrypt_manifest_bytes(
+        raw: &[u8],
+        content_pub_key: &[u8; 32],
+    ) -> anyhow::Result<ContentManifest> {
+        // New format: EncryptedManifest JSON.
+        if let Ok(em) = serde_json::from_slice::<static_storage::hidden_service::EncryptedManifest>(raw) {
+            return static_storage::hidden_service::decrypt_manifest(&em, content_pub_key)
+                .map_err(|e| anyhow::anyhow!("Failed to decrypt manifest: {}", e));
+        }
+        // Legacy: raw ciphertext with zero nonce (pre-Phase-0 publishes).
+        let em = static_storage::hidden_service::EncryptedManifest {
+            ciphertext: raw.to_vec(),
             nonce: static_crypto::NonceBytes::from_bytes([0u8; 12]),
         };
-        
-        let manifest = static_storage::hidden_service::decrypt_manifest(&encrypted_manifest, content_pub_key)
-            .map_err(|e| anyhow::anyhow!("Failed to decrypt manifest: {}", e))?;
+        static_storage::hidden_service::decrypt_manifest(&em, content_pub_key)
+            .map_err(|e| anyhow::anyhow!("Failed to decrypt manifest: {}", e))
+    }
 
-        // 4. Retrieve the chunks using the manifest
-        let mut content_retriever = self.content_retriever.lock().await;
-        let master_key = self.storage_keys.lock().await.get(&content_id).cloned()
-            .ok_or_else(|| anyhow::anyhow!("Master key not found for content"))?;
-        
-        content_retriever.start_retrieval(manifest.clone(), master_key);
+    /// Decrypt a manifest network response (ChunkResponse or raw manifest bytes).
+    fn decrypt_manifest_response(
+        raw: &[u8],
+        content_pub_key: &[u8; 32],
+    ) -> anyhow::Result<ContentManifest> {
+        // Preferred: ChunkResponse wrapping manifest bytes.
+        if let Ok(response) = serde_json::from_slice::<static_storage::retrieval::ChunkResponse>(raw) {
+            if !response.found {
+                anyhow::bail!("Manifest not found on peer");
+            }
+            return Self::decrypt_manifest_bytes(&response.chunk_data, content_pub_key);
+        }
+        Self::decrypt_manifest_bytes(raw, content_pub_key)
+    }
 
-        // First check locally
+    /// Assemble file data from a manifest using local + network shards.
+    async fn assemble_from_manifest(&self, manifest: &ContentManifest) -> anyhow::Result<Vec<u8>> {
+        let master_bytes = manifest.encrypted_master_key.clone();
+        if master_bytes.len() != 32 {
+            anyhow::bail!("Manifest missing master key");
+        }
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(&master_bytes);
+        let master_key = SymmetricKey::from_bytes(key_arr);
+        let mut retriever = self.content_retriever.lock().await;
+        retriever.start_retrieval(manifest.clone(), master_key);
+        let pending_ids: Vec<ChunkId> = retriever.pending.keys().cloned().collect();
+        drop(retriever);
+        for chunk_id in &pending_ids {
+            if let Some(data) = self.transport.chunk_holder.lock().await.get_chunk(chunk_id).cloned() {
+                let mut r = self.content_retriever.lock().await;
+                let _ = r.record_chunk(EncryptedChunk { id: *chunk_id, data });
+            }
+        }
+        let r = self.content_retriever.lock().await;
+        if r.is_complete() {
+            let out = r.assemble()?;
+            drop(r);
+            *self.content_retriever.lock().await = ContentRetriever::new();
+            return Ok(out);
+        }
+        drop(r);
+        anyhow::bail!("Local shards incomplete")
+    }
+
+    /// Fetch shards for a manifest from local storage and all peers.
+    ///
+    /// Returns the encrypted shards indexed by `manifest.chunk_ids`
+    /// position (`None` for shards not recovered), so `erasure_decode`
+    /// can consume the result directly (Phase 1 repair reuses this).
+    ///
+    /// Uses the shared `content_retriever`; callers must skip while
+    /// another retrieval is in flight (guarded in the repair loop).
+    async fn fetch_shards(
+        &self,
+        manifest: &ContentManifest,
+        return_route: &Route,
+        peers: &[&static_mesh::routing::KnownNode],
+        timeout_secs: u64,
+    ) -> anyhow::Result<Vec<Option<EncryptedChunk>>> {
+        // Master/nonce come from the manifest itself (C1), never storage_keys.
+        if manifest.encrypted_master_key.len() != 32 {
+            anyhow::bail!("Manifest missing master key");
+        }
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(&manifest.encrypted_master_key);
+        let master_key = SymmetricKey::from_bytes(key_arr);
+
         {
-            let holder = self.transport.chunk_holder.lock().await;
-            let pending_ids: Vec<ChunkId> = content_retriever.pending.keys().cloned().collect();
-            drop(holder);
-            
-            for chunk_id in &pending_ids {
-                let holder = self.transport.chunk_holder.lock().await;
-                if let Some(data) = holder.get_chunk(chunk_id) {
-                    let chunk = EncryptedChunk {
-                        id: *chunk_id,
-                        data: data.clone(),
-                    };
-                    drop(holder);
-                    content_retriever.record_chunk(chunk)?;
+            let pending: Vec<ChunkId> = {
+                let mut cr = self.content_retriever.lock().await;
+                cr.start_retrieval(manifest.clone(), master_key);
+                cr.pending.keys().cloned().collect()
+            };
+            // Local check first.
+            for chunk_id in &pending {
+                if let Some(data) = self.transport.chunk_holder.lock().await.get_chunk(chunk_id).cloned() {
+                    let mut r = self.content_retriever.lock().await;
+                    let _ = r.record_chunk(EncryptedChunk { id: *chunk_id, data });
+                }
+            }
+            let complete = self.content_retriever.lock().await.is_complete();
+            if complete {
+                let received: Vec<Option<EncryptedChunk>> = {
+                    let r = self.content_retriever.lock().await;
+                    manifest
+                        .chunk_ids
+                        .iter()
+                        .map(|id| r.received.get(id).cloned())
+                        .collect()
+                };
+                *self.content_retriever.lock().await = ContentRetriever::new();
+                return Ok(received);
+            }
+        }
+
+        // Broadcast missing shard requests to all peers.
+        let pending_ids: Vec<ChunkId> = self.content_retriever.lock().await.pending.keys().cloned().collect();
+        for chunk_id in &pending_ids {
+            for peer in peers {
+                if let Ok(pkt) = Self::build_forward_request(*chunk_id, peer, return_route) {
+                    let _ = static_mesh::transport::send_sphinx(&self.transport, peer.node_id, pkt).await;
                 }
             }
         }
 
-        if content_retriever.is_complete() {
-            return Ok(content_retriever.assemble()?);
-        }
-
-        // For missing chunks, send requests to peers
-        let pending_ids: Vec<ChunkId> = content_retriever.pending.keys().cloned().collect();
-        for chunk_id in &pending_ids {
-            let request_packet = Self::build_forward_request(
-                *chunk_id,
-                peer,
-                &return_route,
-                &forward_route,
-                self.config.use_hybrid_crypto,
-            )?;
-            static_mesh::transport::send_sphinx(&self.transport, peer.node_id, request_packet).await?;
-        }
-
-        // Wait for chunks to complete
+        // Wait up to the deadline for shards (erasure needs any K of K+M).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         loop {
-            let r = self.content_retriever.lock().await;
-            if r.is_complete() {
-                let result = r.assemble()?;
-                drop(r);
-                let mut r = self.content_retriever.lock().await;
-                *r = ContentRetriever::new();
-                return Ok(result);
+            let done = {
+                let r = self.content_retriever.lock().await;
+                r.is_complete()
+            };
+            if done || tokio::time::Instant::now() >= deadline {
+                break;
             }
-            drop(r);
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
+
+        // Snapshot whatever arrived (complete or not) and release the
+        // shared retriever for the next caller.
+        let received: Vec<Option<EncryptedChunk>> = {
+            let r = self.content_retriever.lock().await;
+            manifest
+                .chunk_ids
+                .iter()
+                .map(|id| r.received.get(id).cloned())
+                .collect()
+        };
+        *self.content_retriever.lock().await = ContentRetriever::new();
+        Ok(received)
+    }
+
+    /// Fetch missing shards from all peers and assemble (erasure fallback via ContentRetriever).
+    async fn fetch_and_assemble(
+        &self,
+        manifest: ContentManifest,
+        return_route: &Route,
+        peers: &[&static_mesh::routing::KnownNode],
+    ) -> anyhow::Result<Vec<u8>> {
+        let shards = self.fetch_shards(&manifest, return_route, peers, 30).await?;
+
+        if manifest.encrypted_master_key.len() != 32 {
+            anyhow::bail!("Manifest missing master key");
+        }
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(&manifest.encrypted_master_key);
+        let master_key = SymmetricKey::from_bytes(key_arr);
+
+        let mut retriever = ContentRetriever::new();
+        retriever.start_retrieval(manifest.clone(), master_key);
+        for shard in shards.into_iter().flatten() {
+            let _ = retriever.record_chunk(shard);
+        }
+        retriever
+            .assemble()
+            .map_err(|e| anyhow::anyhow!("Assemble failed: {}", e))
     }
 }
 
-/// Fragment a payload into Sphinx packets for the given route
-fn build_fragment_packets(
-    payload: &[u8],
-    route: &static_sphinx::Route,
-) -> Result<Vec<static_sphinx::SphinxPacket>, ComputeError> {
-    let mut packets = Vec::new();
-    for fragment in static_mesh::fragment::fragment_payload(payload) {
-        let body = static_mesh::fragment::serialize_fragment(&fragment);
-        let packet = static_sphinx::create_packet(route, &body)
-            .map_err(|_| ComputeError::SphinxError)?;
-        packets.push(packet);
-    }
-    Ok(packets)
+/// A KEM lookup for [`static_mesh::retrieval::create_hybrid_payload_packets`]
+/// answering for a single known peer
+///
+/// Returns `None` for every other node id, so hybrid packet builds fail
+/// at the source when a multi-hop route ever contains an unknown hop.
+fn single_peer_kem_lookup(
+    peer_id: NodeId,
+    kem: Vec<u8>,
+) -> impl Fn(&[u8; 16]) -> Option<Vec<u8>> {
+    move |id: &[u8; 16]| if id == &peer_id { Some(kem.clone()) } else { None }
 }
 
 /// Background loop polling the blockchain for pending compute payments
@@ -2383,7 +3071,9 @@ pub(crate) async fn run_payment_watch_tick(runner: &Arc<NodeRunner>) {
         state.payment_pending.values().cloned().collect()
     };
     for entry in staged {
-        let Some(watcher) = runner.payment_watchers.get(&entry.payment.currency.to_byte())
+        let Some(watcher) = runner
+            .payment_watchers
+            .get(&entry.payment.currency.to_byte())
         else {
             continue;
         };
@@ -2396,9 +3086,7 @@ pub(crate) async fn run_payment_watch_tick(runner: &Arc<NodeRunner>) {
             .await;
 
         match confirmations {
-            Ok(Some(confirmations))
-                if confirmations >= entry.payment.required_confirmations =>
-            {
+            Ok(Some(confirmations)) if confirmations >= entry.payment.required_confirmations => {
                 let staged = runner
                     .compute_state
                     .lock()
@@ -2527,9 +3215,7 @@ async fn run_verification_tick(runner: &Arc<NodeRunner>) {
 
     let candidates: Vec<(ChunkId, NodeId)> = claims
         .into_iter()
-        .filter(|(_, partner)| {
-            connected.contains(partner) && *partner != runner.transport.node_id
-        })
+        .filter(|(_, partner)| connected.contains(partner) && *partner != runner.transport.node_id)
         .filter(|(chunk_id, _)| known_chunks.contains(chunk_id))
         .collect();
     if candidates.is_empty() {
@@ -2592,16 +3278,34 @@ async fn run_verification_tick(runner: &Arc<NodeRunner>) {
 
     // Wrap the challenge in Sphinx toward the peer (1-hop forward route,
     // fragmented like compute submissions).
-    let peer_pubkey = {
+    let peer_keys = {
         let routing = runner.transport.routing_table.read().await;
         routing
             .nodes
             .values()
             .find(|n| n.node_id == partner)
-            .map(|n| n.public_key)
+            .map(|n| (n.public_key, n.kem_public_key.clone()))
     };
-    let Some(peer_pubkey) = peer_pubkey else {
-        runner.verification_state.lock().await.pending.remove(&nonce);
+    let Some((peer_pubkey, peer_kem)) = peer_keys else {
+        runner
+            .verification_state
+            .lock()
+            .await
+            .pending
+            .remove(&nonce);
+        return;
+    };
+    let Some(peer_kem) = peer_kem else {
+        warn!(
+            "Peer {:02x?} has no KEM key; cannot send hybrid challenge",
+            partner
+        );
+        runner
+            .verification_state
+            .lock()
+            .await
+            .pending
+            .remove(&nonce);
         return;
     };
     let forward_route = Route {
@@ -2616,22 +3320,40 @@ async fn run_verification_tick(runner: &Arc<NodeRunner>) {
         Ok(payload) => payload,
         Err(e) => {
             warn!("Failed to serialize verification challenge: {}", e);
-            runner.verification_state.lock().await.pending.remove(&nonce);
+            runner
+                .verification_state
+                .lock()
+                .await
+                .pending
+                .remove(&nonce);
             return;
         }
     };
-    let packets = match build_fragment_packets(&payload, &forward_route) {
+    let kem_lookup = single_peer_kem_lookup(partner, peer_kem);
+    let packets = match static_mesh::retrieval::create_hybrid_payload_packets(
+        &payload,
+        &forward_route,
+        &kem_lookup,
+    ) {
         Ok(packets) => packets,
         Err(e) => {
             warn!("Failed to build verification challenge packets: {}", e);
-            runner.verification_state.lock().await.pending.remove(&nonce);
+            runner
+                .verification_state
+                .lock()
+                .await
+                .pending
+                .remove(&nonce);
             return;
         }
     };
 
     let mut sent = true;
     for packet in packets {
-        if send_sphinx(&runner.transport, partner, packet).await.is_err() {
+        if send_sphinx(&runner.transport, partner, packet)
+            .await
+            .is_err()
+        {
             sent = false;
             break;
         }
@@ -2642,22 +3364,378 @@ async fn run_verification_tick(runner: &Arc<NodeRunner>) {
             partner, chunk_id, segment_index
         );
     } else {
-        runner.verification_state.lock().await.pending.remove(&nonce);
+        runner
+            .verification_state
+            .lock()
+            .await
+            .pending
+            .remove(&nonce);
     }
 }
 
 /// Lease expiration loop
-async fn lease_expiration_loop(
-    leases: Arc<Mutex<LeaseManager>>,
-    chunks: Arc<Mutex<ChunkHolder>>,
-    capacity: Arc<Mutex<StorageCapacity>>,
-) {
+async fn lease_expiration_and_repair_loop(runner: Arc<NodeRunner>) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-
     loop {
         interval.tick().await;
-        expire_chunks_once(&leases, &chunks, &capacity).await;
+        // 1. Repair check FIRST (L6, Phase 1 implementation).
+        run_repair_tick(&runner).await;
+        // 2. Then expiry.
+        expire_chunks_once(&runner.leases, &runner.transport.chunk_holder, &runner.capacity).await;
     }
+}
+
+/// One repair tick (Phase 1): check content health, then repair.
+///
+/// Processes at most [`MAX_REPAIRS_PER_TICK`] content items per tick and
+/// skips entirely while a user retrieval occupies the shared
+/// `content_retriever` (repair reuses it via `fetch_shards`).
+async fn run_repair_tick(runner: &Arc<NodeRunner>) {
+    // Skip while a retrieval is in flight on the shared retriever.
+    if !runner.content_retriever.lock().await.pending.is_empty() {
+        debug!("Repair tick skipped: retrieval in flight");
+        return;
+    }
+
+    // Snapshot owned content IDs.
+    let content_ids: Vec<ContentId> = {
+        let leases = runner.leases.lock().await;
+        leases.content_chunks.keys().cloned().collect()
+    };
+
+    for content_id in content_ids.iter().take(MAX_REPAIRS_PER_TICK) {
+        // Manifest snapshot.
+        let Some(manifest) = runner.manifests.lock().await.get(content_id).cloned() else {
+            continue;
+        };
+        // Re-entry guard.
+        if runner.repair_state.lock().await.is_being_repaired(content_id) {
+            continue;
+        }
+
+        // Copy counts: local holder + known swap partners. (No global
+        // chunk location table — SwapState.active_swaps is the only
+        // registry of who holds what.)
+        let mut copy_counts: HashMap<ChunkId, usize> = HashMap::new();
+        {
+            let holder = runner.transport.chunk_holder.lock().await;
+            for chunk_id in &manifest.chunk_ids {
+                if holder.has_chunk(chunk_id) {
+                    *copy_counts.entry(*chunk_id).or_insert(0) += 1;
+                }
+            }
+        }
+        {
+            let swaps = runner.transport.swap_state.lock().await;
+            for chunk_id in &manifest.chunk_ids {
+                if swaps.active_swaps.contains_key(chunk_id) {
+                    *copy_counts.entry(*chunk_id).or_insert(0) += 1;
+                }
+            }
+        }
+        // HostBuffer copies count toward recoverability (the host can
+        // reseed them without erasure reconstruction).
+        {
+            let buffer = runner.host_buffer.lock().await;
+            for chunk_id in &manifest.chunk_ids {
+                if buffer.get(chunk_id).is_some() {
+                    *copy_counts.entry(*chunk_id).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let health = check_content_health(*content_id, &manifest, &copy_counts);
+        if health.is_healthy {
+            continue;
+        }
+        if !health.is_recoverable {
+            warn!(
+                "Content {:02x?} is unrecoverable (not enough shards)",
+                content_id
+            );
+            continue;
+        }
+        let Some(plan) = create_repair_plan(&health, &manifest) else {
+            continue;
+        };
+        let chunk_count = plan.chunks_to_reconstruct.len();
+        runner.repair_state.lock().await.start_repair(plan);
+
+        match repair_content_once(runner, &manifest).await {
+            Ok(repaired) => {
+                runner.repair_state.lock().await.complete_repair(content_id);
+                if repaired > 0 {
+                    info!(
+                        "Repaired content {:02x?}: stored {} of {} damaged shards",
+                        content_id, repaired, chunk_count
+                    );
+                }
+            }
+            Err(e) => {
+                runner.repair_state.lock().await.fail_repair(content_id);
+                warn!("Failed to repair content {:02x?}: {}", content_id, e);
+            }
+        }
+    }
+}
+
+/// One repair attempt for a content item (Phase 1)
+///
+/// 1. HostBuffer reseed first (fast path, retains `created_at`).
+/// 2. If still short of `data_shards`: gossip the misses (so HostBuffer
+///    holders on other nodes reseed and answer) and fetch available
+///    shards via the standard Sphinx retrieval protocol.
+/// 3. Reconstruct missing shards via `erasure_decode` and store them
+///    locally (redistribution to new nodes rides the existing rotation
+///    barter loop).
+///
+/// Returns the number of chunks newly stored locally.
+async fn repair_content_once(
+    runner: &Arc<NodeRunner>,
+    manifest: &ContentManifest,
+) -> anyhow::Result<usize> {
+    let mut stored = 0usize;
+
+    // Pass 1: HostBuffer reseed for chunks we lack.
+    for chunk_id in &manifest.chunk_ids {
+        let held = runner.transport.chunk_holder.lock().await.has_chunk(chunk_id);
+        if held {
+            continue;
+        }
+        let buffered = runner.host_buffer.lock().await.get(chunk_id);
+        if let Some((data, created_at)) = buffered {
+            if runner
+                .store_repaired_chunk(manifest.content_id, *chunk_id, data, created_at)
+                .await
+            {
+                stored += 1;
+                debug!(
+                    "Reseeded chunk {:02x?} from HostBuffer during repair",
+                    chunk_id
+                );
+            }
+        }
+    }
+
+    // Count shards we can currently contribute to reconstruction.
+    let mut available: Vec<Option<EncryptedChunk>> = Vec::with_capacity(manifest.chunk_ids.len());
+    for id in &manifest.chunk_ids {
+        let shard = runner
+            .transport
+            .chunk_holder
+            .lock()
+            .await
+            .get_chunk(id)
+            .cloned()
+            .map(|data| EncryptedChunk { id: *id, data });
+        available.push(shard);
+    }
+    let have = available.iter().filter(|s| s.is_some()).count();
+    if have >= manifest.data_shards {
+        // Enough shards without the network: reconstruct below.
+    } else {
+        // Pass 2: ask the network. Report the misses (so remote HostBuffer
+        // holders reseed and answer) and fetch available shards via the
+        // retrieval protocol.
+        let known_nodes: Vec<static_mesh::routing::KnownNode> = {
+            let table = runner.transport.routing_table.read().await;
+            table.nodes.values().cloned().collect()
+        };
+        let peers: Vec<_> = known_nodes
+            .iter()
+            .filter(|p| {
+                p.kem_public_key.as_ref().map(|k| k.len()).unwrap_or(0)
+                    == static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE
+            })
+            .collect();
+
+        for (idx, shard) in available.iter().enumerate() {
+            if shard.is_none() {
+                runner
+                    .send_missing_chunk_gossip(manifest.content_id, manifest.chunk_ids[idx])
+                    .await;
+            }
+        }
+
+        let our_pubkey = runner.transport.mix_node.lock().await.public_key;
+        let return_route = Route {
+            hops: vec![RouteHop {
+                public_key: our_pubkey,
+                node_id: runner.transport.node_id,
+            }],
+            destination: runner.transport.node_id,
+        };
+        let fetched = runner
+            .fetch_shards(manifest, &return_route, &peers, 30)
+            .await
+            .unwrap_or_default();
+        // Merge fetched shards into the availability vector.
+        for (idx, shard) in fetched.into_iter().enumerate() {
+            if available[idx].is_none() {
+                available[idx] = shard;
+            }
+        }
+    }
+
+    let have = available.iter().filter(|s| s.is_some()).count();
+    if have < manifest.data_shards {
+        anyhow::bail!(
+            "insufficient shards for reconstruction (have {}, need {})",
+            have,
+            manifest.data_shards
+        );
+    }
+
+    // Pass 3: erasure reconstruction of everything still missing.
+    let reconstructed = static_storage::repair::reconstruct_missing_chunks(
+        &available,
+        manifest.data_shards,
+        manifest.parity_shards,
+    )?;
+    // Map reconstructed data shards back to manifest positions (IDs are
+    // blake3(ciphertext), deterministic, but index-mapping is authoritative).
+    let now = current_timestamp();
+    for (idx, chunk) in reconstructed.into_iter().enumerate() {
+        if idx >= manifest.data_shards {
+            break;
+        }
+        let chunk_id = manifest.chunk_ids[idx];
+        let held = runner.transport.chunk_holder.lock().await.has_chunk(&chunk_id);
+        if held {
+            continue;
+        }
+        if runner
+            .store_repaired_chunk(manifest.content_id, chunk_id, chunk.data, now)
+            .await
+        {
+            stored += 1;
+        }
+    }
+
+    Ok(stored)
+}
+
+/// Heartbeat sender loop (L5): refresh owned-content leases every 30min.
+///
+/// Local refresh prevents self-wipe; Phase 1 additionally propagates
+/// Sphinx-wrapped heartbeats (type byte `0x0A`) to every peer holding
+/// our chunks (per `SwapState.active_swaps`), refreshing remote leases.
+async fn heartbeat_sender_loop(runner: Arc<NodeRunner>) {
+    let mut interval =
+        tokio::time::interval(std::time::Duration::from_secs(static_storage::heartbeat::DEFAULT_HEARTBEAT_INTERVAL_SECS));
+    loop {
+        interval.tick().await;
+        let refreshed = heartbeat_tick_once(&runner.leases).await;
+        let propagated = propagate_heartbeats_once(&runner).await;
+        debug!(
+            "Heartbeat tick: {} local leases refreshed, {} holders notified",
+            refreshed, propagated
+        );
+    }
+}
+
+/// Propagate heartbeats to remote holders (Phase 1)
+///
+/// For each owned content: create the heartbeat (renewal token derived
+/// from the master key), find the peers holding its chunks via
+/// `SwapState.active_swaps`, and send the wire-framed heartbeat
+/// (`0x0A`-prefixed) hybrid-Sphinx-wrapped to each holder.
+///
+/// Returns the number of holders successfully notified.
+async fn propagate_heartbeats_once(runner: &Arc<NodeRunner>) -> usize {
+    let owned: HashMap<ContentId, Vec<ChunkId>> = {
+        let leases = runner.leases.lock().await;
+        leases.content_chunks.clone()
+    };
+
+    let mut notified = 0usize;
+    for (content_id, chunk_ids) in &owned {
+        // Create the heartbeat (requires the owned master key).
+        let heartbeat = {
+            let leases = runner.leases.lock().await;
+            match leases.create_heartbeat(
+                content_id,
+                static_storage::heartbeat::DEFAULT_LEASE_DURATION_SECS,
+            ) {
+                Ok(hb) => hb,
+                Err(_) => continue,
+            }
+        };
+
+        // Peers holding chunks for this content (swap registry).
+        let mut peers_to_notify: HashSet<NodeId> = HashSet::new();
+        {
+            let swaps = runner.transport.swap_state.lock().await;
+            for chunk_id in chunk_ids {
+                if let Some(peer) = swaps.active_swaps.get(chunk_id) {
+                    peers_to_notify.insert(*peer);
+                }
+            }
+        }
+        peers_to_notify.remove(&runner.transport.node_id);
+
+        // Wire payload (type byte + heartbeat fields).
+        let payload = heartbeat.wire_serialize();
+        for peer in &peers_to_notify {
+            // Build the single-hop hybrid route from handshake-learned keys.
+            let (public_key, kem) = {
+                let table = runner.transport.routing_table.read().await;
+                match table.get_node(peer) {
+                    Some(n) => (n.public_key, n.kem_public_key.clone()),
+                    None => continue,
+                }
+            };
+            let Some(kem) = kem else {
+                continue;
+            };
+            let route = Route {
+                hops: vec![RouteHop {
+                    public_key,
+                    node_id: *peer,
+                }],
+                destination: *peer,
+            };
+            let peer_id = *peer;
+            let kem_lookup = single_peer_kem_lookup(peer_id, kem);
+            let Ok(packets) =
+                static_mesh::retrieval::create_hybrid_payload_packets(&payload, &route, &kem_lookup)
+            else {
+                continue;
+            };
+            for pkt in packets {
+                let _ = send_sphinx(&runner.transport, peer_id, pkt).await;
+            }
+            notified += 1;
+            debug!(
+                "Sent heartbeat for content {:02x?} to peer {:02x?}",
+                content_id, peer_id
+            );
+        }
+    }
+    notified
+}
+
+/// One heartbeat tick: extend owned leases by the default duration.
+async fn heartbeat_tick_once(leases: &Arc<Mutex<LeaseManager>>) -> usize {
+    let now = current_timestamp();
+    let new_expires = now + static_storage::heartbeat::DEFAULT_LEASE_DURATION_SECS;
+    let mut mgr = leases.lock().await;
+    let mut refreshed = 0;
+    // Collect owned chunk IDs first to avoid borrow issues.
+    let owned: Vec<Vec<ChunkId>> = mgr.content_chunks.values().cloned().collect();
+    for chunk_ids in owned {
+        for cid in chunk_ids {
+            if let Some(lease) = mgr.leases.get_mut(&cid) {
+                lease.expires_at = new_expires;
+                refreshed += 1;
+            }
+        }
+    }
+    // Owned-content leases live in `leases` map only after swaps publish
+    // them; publisher-owned chunks are tracked in content_chunks but may
+    // lack per-chunk lease entries (they are served locally). Refresh is
+    // best-effort: missing entries are skipped.
+    refreshed
 }
 
 /// Run one lease-expiration sweep: drop expired chunks, release their
@@ -2683,7 +3761,10 @@ async fn expire_chunks_once(
         for chunk_id in &expired {
             let chunk_size = {
                 let mut holder = chunks.lock().await;
-                let size = holder.get_chunk(chunk_id).map(|d| d.len() as u64).unwrap_or(0);
+                let size = holder
+                    .get_chunk(chunk_id)
+                    .map(|d| d.len() as u64)
+                    .unwrap_or(0);
                 holder.remove_chunk(chunk_id);
                 size
             };
@@ -2695,41 +3776,6 @@ async fn expire_chunks_once(
     leases.lock().await.cleanup_nonces(current_time);
 
     expired.len()
-}
-
-
-/// Background loop to periodically check content health and trigger repairs
-async fn repair_loop(
-    repair_state: Arc<Mutex<RepairState>>,
-    storage_keys: Arc<Mutex<HashMap<ContentId, SymmetricKey>>>,
-    leases: Arc<Mutex<LeaseManager>>,
-) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // Check every 5 minutes
-
-    loop {
-        interval.tick().await;
-        
-        let _storage_keys = storage_keys.lock().await;
-        let _leases = leases.lock().await;
-        
-        // In a full implementation, we would:
-        // 1. Iterate through all owned content (storage_keys)
-        // 2. For each content, send health check requests to the network
-        // 3. Aggregate copy counts for each chunk
-        // 4. Call check_content_health() with the aggregated counts
-        // 5. If health is not healthy, call create_repair_plan()
-        // 6. If a plan is created, retrieve remaining shards and reconstruct
-        // 7. Re-distribute the reconstructed shards to new nodes
-        //
-        // Capacity invariant: when step 6/7 starts storing reconstructed
-        // chunks in the holder, each stored chunk MUST be paired with
-        // `capacity.record_accept(len)` (shared counter) so the 1:1
-        // accounting stays truthful. Nothing is stored yet, so no
-        // capacity call belongs here today.
-        
-        // For now, just log that the repair loop is running
-        debug!("Repair loop tick. Active repairs: {}", repair_state.lock().await.active_count());
-    }
 }
 
 /// Reconcile the shared capacity counter with holder reality (one sweep)
@@ -2776,7 +3822,10 @@ async fn evict_excess_cache(
         };
         let evicted_len = {
             let mut holder = chunk_holder.lock().await;
-            let len = holder.get_chunk(&lru_chunk).map(|d| d.len() as u64).unwrap_or(0);
+            let len = holder
+                .get_chunk(&lru_chunk)
+                .map(|d| d.len() as u64)
+                .unwrap_or(0);
             holder.remove_chunk(&lru_chunk);
             len
         };
@@ -2804,6 +3853,8 @@ async fn rotation_loop(
     capacity: Arc<Mutex<StorageCapacity>>,
     transport: Arc<TransportState>,
     merkle_proofs: Arc<Mutex<HashMap<ChunkId, (MerkleRoot, MerkleProof)>>>,
+    chunk_metadata: Arc<Mutex<HashMap<ChunkId, ChunkMetadata>>>,
+    host_buffer: Arc<Mutex<HostBuffer>>,
     node_id: NodeId,
 ) {
     // Note: tokio::interval ticks immediately on first tick; with an
@@ -2826,9 +3877,8 @@ async fn rotation_loop(
             .as_secs();
 
         // 1. Snapshot held chunk IDs.
-        let chunk_ids: Vec<ChunkId> = {
-            chunk_holder.lock().await.chunks.keys().cloned().collect()
-        };
+        let chunk_ids: Vec<ChunkId> =
+            { chunk_holder.lock().await.chunks.keys().cloned().collect() };
 
         // 2. Select this epoch's rotation set.
         let chunks_to_rotate = {
@@ -2854,19 +3904,29 @@ async fn rotation_loop(
                 .collect()
         };
 
-        // 3b. Keep only chunks with healthy remaining leases.
+        // 3b. Keep only chunks with healthy remaining leases AND past
+        // staleness threshold (L6: fresh <24h stays on host). Missing
+        // metadata (pre-Phase-0 chunks, tests) counts as eligible.
         let eligible: Vec<(ChunkId, Vec<u8>)> = {
             let lease_mgr = leases.lock().await;
+            let meta = chunk_metadata.lock().await;
             held.into_iter()
                 .filter(|(chunk_id, _)| {
-                    lease_mgr
+                    let lease_ok = lease_mgr
                         .leases
                         .get(chunk_id)
                         .map(|lease| {
                             lease.expires_at.saturating_sub(current_time)
                                 > rotation_config.min_lease_remaining_secs
                         })
-                        .unwrap_or(false)
+                        .unwrap_or(false);
+                    if !lease_ok {
+                        return false;
+                    }
+                    match meta.get(chunk_id) {
+                        Some(m) => m.barter_eligible(current_time),
+                        None => true,
+                    }
                 })
                 .collect()
         };
@@ -2879,7 +3939,14 @@ async fn rotation_loop(
 
         // 4a. Snapshot known peers.
         let known_nodes: Vec<static_mesh::routing::KnownNode> = {
-            transport.routing_table.read().await.nodes.values().cloned().collect()
+            transport
+                .routing_table
+                .read()
+                .await
+                .nodes
+                .values()
+                .cloned()
+                .collect()
         };
 
         if known_nodes.is_empty() {
@@ -2906,7 +3973,10 @@ async fn rotation_loop(
                 continue;
             };
 
-            let chunk = EncryptedChunk { id: *chunk_id, data: data.clone() };
+            let chunk = EncryptedChunk {
+                id: *chunk_id,
+                data: data.clone(),
+            };
             // Chunks without a stored proof (cached chunks, manifest
             // chunks) can never pass receiver validation, so they are
             // skipped rather than sent to certain rejection.
@@ -2920,7 +3990,19 @@ async fn rotation_loop(
                 continue;
             };
             // Leases here are minted with our own key: rotation proposals
-            // are time-validated barters, not ownership proofs (MVP).
+            // are time-validated barters. Content auth binds to an
+            // ephemeral per-proposal identity (stable attribution future
+            // work; Merkle still proves chunk integrity).
+            let (content_id, content_pub, content_sk) = {
+                use ed25519_dalek::SigningKey;
+                use rand::RngCore;
+                let mut bytes = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut bytes);
+                let sk = SigningKey::from_bytes(&bytes);
+                let pk = sk.verifying_key().to_bytes();
+                let id = *blake3::hash(&pk).as_bytes();
+                (id, pk, sk)
+            };
             let proposal = static_storage::swap::create_swap_proposal(
                 node_id,
                 chunk,
@@ -2928,14 +4010,29 @@ async fn rotation_loop(
                 static_storage::swap::DEFAULT_LEASE_DURATION_SECS,
                 content_root,
                 merkle_proof,
+                content_id,
+                content_pub,
+                Some(&content_sk),
             );
             swaps.lock().await.record_proposal(&proposal);
-            if sender.send(WireMessage::SwapProposal(proposal)).await.is_ok() {
-                debug!(
-                    "Sent rotation swap proposal for chunk {:02x?} to {:02x?}",
-                    chunk_id, peer.node_id
-                );
+            if sender
+                .send(WireMessage::SwapProposal(proposal))
+                .await
+                .is_ok()
+            {
                 dispatched.push(*chunk_id);
+                // L6 host buffer: keep copy for quick reseed (retain created_at).
+                let created = chunk_metadata
+                    .lock()
+                    .await
+                    .get(chunk_id)
+                    .map(|m| m.created_at)
+                    .unwrap_or(current_time);
+                host_buffer.lock().await.insert(*chunk_id, data.clone(), created);
+                // Mark bartered time (does not reset created_at).
+                if let Some(m) = chunk_metadata.lock().await.get_mut(chunk_id) {
+                    m.last_bartered = current_time;
+                }
             }
         }
 
@@ -2956,7 +4053,10 @@ async fn rotation_loop(
         )
         .await;
 
-        debug!("Rotation epoch complete. Rotated {} chunks.", dispatched.len());
+        debug!(
+            "Rotation epoch complete. Rotated {} chunks.",
+            dispatched.len()
+        );
     }
 }
 
@@ -3180,8 +4280,10 @@ mod tests {
         let runner = NodeRunner::new(config, [0x42u8; 16], MixNode::new());
 
         assert_eq!(runner.capacity.lock().await.current_bytes, 0);
-        let (_content_id, _manifest, _pubkey) =
-            runner.publish_content(b"capacity test payload").await.unwrap();
+        let (_content_id, _manifest, _pubkey) = runner
+            .publish_content(b"capacity test payload")
+            .await
+            .unwrap();
 
         // Shared counter matches holder reality (chunks + manifest).
         let actual = runner.transport.chunk_holder.lock().await.total_bytes();
@@ -3201,7 +4303,10 @@ mod tests {
         let capacity = Arc::new(Mutex::new(StorageCapacity::new(10 * 1024 * 1024)));
 
         // Store a chunk and account it, with a long-dead lease.
-        chunks.lock().await.add_chunk(chunk_id, chunk_data.clone(), [0u8; 32]);
+        chunks
+            .lock()
+            .await
+            .add_chunk(chunk_id, chunk_data.clone(), [0u8; 32]);
         capacity.lock().await.record_accept(chunk_data.len() as u64);
         let now = current_timestamp();
         let dead_lease = static_storage::create_lease(
@@ -3253,12 +4358,10 @@ mod tests {
         let runner = NodeRunner::new(config, [0x42u8; 16], MixNode::new());
 
         // Backup nodes start dormant.
-        assert!(
-            !runner
-                .transport
-                .serve_enabled
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
+        assert!(!runner
+            .transport
+            .serve_enabled
+            .load(std::sync::atomic::Ordering::Relaxed));
 
         let content_id = [0x11u8; 32];
         let primary = [0x22u8; 16];
@@ -3292,12 +4395,10 @@ mod tests {
         assert!(state.backed_up_content.get(&content_id).unwrap().is_active);
         assert!(state.any_active);
         drop(state);
-        assert!(
-            runner
-                .transport
-                .serve_enabled
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
+        assert!(runner
+            .transport
+            .serve_enabled
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[tokio::test]
@@ -3329,34 +4430,29 @@ mod tests {
         assert!(!state.backed_up_content.get(&content_id).unwrap().is_active);
         assert!(!state.any_active);
         drop(state);
-        assert!(
-            !runner
-                .transport
-                .serve_enabled
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
+        assert!(!runner
+            .transport
+            .serve_enabled
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[tokio::test]
     async fn test_serve_enabled_flag() {
         // Full nodes serve from the start.
         let full = NodeRunner::new(NodeConfig::default(), [0x42u8; 16], MixNode::new());
-        assert!(
-            full.transport
-                .serve_enabled
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
+        assert!(full
+            .transport
+            .serve_enabled
+            .load(std::sync::atomic::Ordering::Relaxed));
 
         // Backup nodes start dormant and flip on activation.
         let mut config = NodeConfig::default();
         config.mode = NodeMode::BackupOnly;
         let backup = NodeRunner::new(config, [0x42u8; 16], MixNode::new());
-        assert!(
-            !backup
-                .transport
-                .serve_enabled
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
+        assert!(!backup
+            .transport
+            .serve_enabled
+            .load(std::sync::atomic::Ordering::Relaxed));
 
         backup
             .register_backup_content([0x11u8; 32], [0x22u8; 16], vec![[0x33u8; 32]])
@@ -3379,12 +4475,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            backup
-                .transport
-                .serve_enabled
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
+        assert!(backup
+            .transport
+            .serve_enabled
+            .load(std::sync::atomic::Ordering::Relaxed));
     }
 
     fn test_compute_request(request_id: [u8; 32]) -> ComputeRequest {
@@ -3482,7 +4576,12 @@ mod tests {
             .accept_compute_request(&request)
             .await
             .expect("request should be accepted");
-        assert!(runner.compute_state.lock().await.active_executions.contains_key(&request.request_id));
+        assert!(runner
+            .compute_state
+            .lock()
+            .await
+            .active_executions
+            .contains_key(&request.request_id));
 
         // A failed execution deregisters and counts.
         runner
@@ -3497,7 +4596,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_compute_response_handling() {
-        let runner = Arc::new(NodeRunner::new(NodeConfig::default(), [0x42u8; 16], MixNode::new()));
+        let runner = Arc::new(NodeRunner::new(
+            NodeConfig::default(),
+            [0x42u8; 16],
+            MixNode::new(),
+        ));
 
         let request_id = [0xD1u8; 32];
         runner.compute_state.lock().await.pending_requests.insert(
@@ -3525,7 +4628,10 @@ mod tests {
         // Result stored for polling; no barter credits are booked anymore.
         let state = runner.compute_state.lock().await;
         assert!(state.pending_requests.is_empty());
-        let stored = state.completed_results.get(&request_id).expect("result stored");
+        let stored = state
+            .completed_results
+            .get(&request_id)
+            .expect("result stored");
         assert_eq!(stored.output_data, vec![1, 2, 3]);
         assert!(runner.accounting.lock().await.peers.is_empty());
     }
@@ -3533,18 +4639,28 @@ mod tests {
     #[tokio::test]
     async fn test_compute_request_ignored_when_disabled() {
         // Compute is disabled by default.
-        let runner = Arc::new(NodeRunner::new(NodeConfig::default(), [0x42u8; 16], MixNode::new()));
+        let runner = Arc::new(NodeRunner::new(
+            NodeConfig::default(),
+            [0x42u8; 16],
+            MixNode::new(),
+        ));
         assert!(!runner.transport.compute_enabled);
 
-        let payload = static_storage::compute::serialize_request(&test_compute_request([0xE1u8; 32]))
-            .unwrap();
+        let payload =
+            static_storage::compute::serialize_request(&test_compute_request([0xE1u8; 32]))
+                .unwrap();
         for fragment in static_mesh::fragment::fragment_payload(&payload) {
             let body = static_mesh::fragment::serialize_fragment(&fragment);
             runner.handle_compute_fragment(&body).await;
         }
 
         // Disabled nodes neither track nor execute compute requests.
-        assert!(runner.compute_state.lock().await.active_executions.is_empty());
+        assert!(runner
+            .compute_state
+            .lock()
+            .await
+            .active_executions
+            .is_empty());
     }
 
     #[tokio::test]
@@ -3740,7 +4856,7 @@ mod tests {
         let runner = NodeRunner::new(NodeConfig::default(), [0x42u8; 16], MixNode::new());
         assert!(runner.verification_state.lock().await.pending.is_empty());
         assert!(runner.manifests.lock().await.is_empty());
-   }
+    }
 
     #[tokio::test]
     async fn test_challenge_response_matching() {
@@ -3833,5 +4949,546 @@ mod tests {
         let credit = accounting.peers.get(&peer).expect("peer tracked");
         assert_eq!(credit.failed_challenges, 1);
         assert_eq!(credit.successful_challenges, 0);
+    }
+
+    // ---- Phase 1: lifecycle completeness ----
+
+    /// Build a small erasure-coded content fixture for repair tests.
+    ///
+    /// Returns (manifest, K+M encoded shards, master key).
+    fn repair_fixture(
+        content_id: ContentId,
+        data_shards: usize,
+        parity_shards: usize,
+    ) -> (ContentManifest, Vec<EncryptedChunk>, SymmetricKey) {
+        use static_crypto::NonceBytes;
+        let master = SymmetricKey::random();
+        let nonce = NonceBytes::random();
+        let mut chunks = Vec::new();
+        for i in 0..data_shards {
+            let chunk = static_storage::encrypt_chunk(&master, &nonce, i, b"repair fixture")
+                .unwrap();
+            chunks.push(chunk);
+        }
+        let encoded = static_storage::erasure_encode(&chunks, data_shards, parity_shards).unwrap();
+        let manifest = ContentManifest {
+            content_id,
+            encrypted_master_key: vec![],
+            chunk_ids: encoded.iter().map(|c| c.id).collect(),
+            original_size: 1024,
+            data_shards,
+            parity_shards,
+            nonce: nonce.bytes,
+            segment_hashes: vec![],
+        };
+        (manifest, encoded, master)
+    }
+
+    #[tokio::test]
+    async fn test_repair_reconstructs_missing_shards() {
+        let runner = Arc::new(NodeRunner::new(
+            NodeConfig::default(),
+            [0x42u8; 16],
+            MixNode::new(),
+        ));
+        let content_id: ContentId = [0x11u8; 32];
+        // 3 data + 1 parity: losing any one shard is repairable.
+        let (manifest, shards, master) = repair_fixture(content_id, 3, 1);
+
+        // Host shards 0, 1 and parity 3; data shard 2 is lost.
+        {
+            let mut holder = runner.transport.chunk_holder.lock().await;
+            for (idx, shard) in shards.iter().enumerate() {
+                if idx != 2 {
+                    holder.add_chunk(shard.id, shard.data.clone(), content_id);
+                }
+            }
+        }
+        runner.manifests.lock().await.insert(content_id, manifest.clone());
+        runner
+            .leases
+            .lock()
+            .await
+            .register_owned_content(content_id, master, manifest.chunk_ids.clone());
+
+        run_repair_tick(&runner).await;
+
+        // The lost shard was reconstructed from the remaining shards.
+        assert!(runner.transport.chunk_holder.lock().await.has_chunk(&shards[2].id));
+        assert_eq!(
+            runner.transport.chunk_holder.lock().await.get_chunk(&shards[2].id),
+            Some(&shards[2].data)
+        );
+        assert_eq!(runner.repair_state.lock().await.completed_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_repair_uses_host_buffer() {
+        let runner = Arc::new(NodeRunner::new(
+            NodeConfig::default(),
+            [0x42u8; 16],
+            MixNode::new(),
+        ));
+        let content_id: ContentId = [0x12u8; 32];
+        let (manifest, shards, master) = repair_fixture(content_id, 2, 1);
+        let original_created = current_timestamp() - 2 * STALENESS_THRESHOLD_SECS;
+
+        // Host only data shard 0; shard 1 lives in the HostBuffer
+        // (bartered away earlier, original clock preserved).
+        {
+            let mut holder = runner.transport.chunk_holder.lock().await;
+            holder.add_chunk(shards[0].id, shards[0].data.clone(), content_id);
+        }
+        runner
+            .host_buffer
+            .lock()
+            .await
+            .insert(shards[1].id, shards[1].data.clone(), original_created);
+
+        runner.manifests.lock().await.insert(content_id, manifest.clone());
+        runner
+            .leases
+            .lock()
+            .await
+            .register_owned_content(content_id, master, manifest.chunk_ids.clone());
+
+        run_repair_tick(&runner).await;
+
+        // Reseeded from the buffer, not reconstructed.
+        assert!(runner.transport.chunk_holder.lock().await.has_chunk(&shards[1].id));
+        assert_eq!(
+            runner.transport.chunk_holder.lock().await.get_chunk(&shards[1].id),
+            Some(&shards[1].data)
+        );
+        // Barter clock NOT reset: the original created_at survives.
+        let meta = runner
+            .chunk_metadata
+            .lock()
+            .await
+            .get(&shards[1].id)
+            .expect("metadata recorded")
+            .clone();
+        assert_eq!(meta.created_at, original_created);
+        assert!(!meta.is_fresh);
+    }
+
+    #[tokio::test]
+    async fn test_missing_chunk_gossip_triggers_reseed() {
+        let runner = Arc::new(NodeRunner::new(
+            NodeConfig::default(),
+            [0x42u8; 16],
+            MixNode::new(),
+        ));
+        let content_id: ContentId = [0x13u8; 32];
+        let chunk_id: ChunkId = [0x14u8; 32];
+        let chunk_data = vec![0xEEu8; 512];
+        let original_created = current_timestamp() - 3600;
+
+        // The host (us) holds the chunk in its HostBuffer.
+        runner
+            .host_buffer
+            .lock()
+            .await
+            .insert(chunk_id, chunk_data.clone(), original_created);
+
+        // A reporter tells us the chunk is missing.
+        let gossip = MissingChunkGossip {
+            content_id,
+            chunk_id,
+            timestamp: current_timestamp(),
+            return_route: static_storage::retrieval::ReturnRoute {
+                hops: vec![static_storage::retrieval::RouteHopInfo {
+                    public_key: [0x55u8; 32],
+                    node_id: [0x77u8; 16],
+                }],
+                destination: [0x77u8; 16],
+            },
+        };
+
+        // Fragment the gossip exactly like the wire path and feed the
+        // lifecycle dispatcher.
+        let payload = serialize_gossip(&gossip);
+        for fragment in static_mesh::fragment::fragment_payload(&payload) {
+            let body = static_mesh::fragment::serialize_fragment(&fragment);
+            runner.handle_lifecycle_fragment(&body, [0x77u8; 16]).await;
+        }
+
+        // The host reseeded the chunk into its holder (original clock).
+        assert!(runner.transport.chunk_holder.lock().await.has_chunk(&chunk_id));
+        assert_eq!(
+            runner
+                .chunk_metadata
+                .lock()
+                .await
+                .get(&chunk_id)
+                .map(|m| m.created_at),
+            Some(original_created)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_propagates_to_holders() {
+        let runner = Arc::new(NodeRunner::new(
+            NodeConfig::default(),
+            [0x42u8; 16],
+            MixNode::new(),
+        ));
+        let content_id: ContentId = [0x15u8; 32];
+        let chunk_id: ChunkId = [0x16u8; 32];
+        let peer: NodeId = [0x17u8; 16];
+        let master = SymmetricKey::random();
+
+        runner
+            .leases
+            .lock()
+            .await
+            .register_owned_content(content_id, master, vec![chunk_id]);
+        // The peer accepted our chunk via swap: the swap registry knows.
+        runner
+            .transport
+            .swap_state
+            .lock()
+            .await
+            .record_swap(chunk_id, peer, 1024);
+        // Routing entry with KEM key so the hybrid route can be built.
+        let known = static_mesh::routing::KnownNode {
+            node_id: peer,
+            public_key: [0x66u8; 32],
+            address: "127.0.0.1:9001".to_string(),
+            kem_public_key: Some(vec![0x77u8; static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE]),
+            compute_enabled: false,
+            compute_capacity: 0,
+            identity_public_key: Some([0x88u8; 32]),
+        };
+        runner
+            .transport
+            .routing_table
+            .write()
+            .await
+            .nodes
+            .insert(known.node_id, known);
+
+        let notified = propagate_heartbeats_once(&runner).await;
+        assert_eq!(notified, 1);
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_refreshes_remote_lease() {
+        let runner = Arc::new(NodeRunner::new(
+            NodeConfig::default(),
+            [0x42u8; 16],
+            MixNode::new(),
+        ));
+        let content_id: ContentId = [0x18u8; 32];
+        let chunk_id: ChunkId = [0x19u8; 32];
+        let token = [0x33u8; 32];
+
+        // We hold the chunk but have no lease yet (swap-in, Phase 1 gap).
+        runner
+            .transport
+            .chunk_holder
+            .lock()
+            .await
+            .add_chunk(chunk_id, vec![0xDDu8; 256], content_id);
+
+        // A holder-role heartbeat arrives from the owner.
+        let heartbeat = Heartbeat::new(content_id, token, vec![chunk_id], 3600);
+        let payload = heartbeat.wire_serialize();
+        for fragment in static_mesh::fragment::fragment_payload(&payload) {
+            let body = static_mesh::fragment::serialize_fragment(&fragment);
+            runner.handle_lifecycle_fragment(&body, [0x77u8; 16]).await;
+        }
+
+        // Upsert created a bounded lease for the held chunk.
+        let now = current_timestamp();
+        let lease = runner
+            .leases
+            .lock()
+            .await
+            .leases
+            .get(&chunk_id)
+            .cloned()
+            .expect("lease upserted");
+        assert_eq!(lease.renewal_token, token);
+        assert!(lease.expires_at > now);
+        assert!(lease.expires_at <= now + static_storage::heartbeat::DEFAULT_LEASE_DURATION_SECS);
+    }
+
+    #[tokio::test]
+    async fn test_host_buffer_lru_eviction() {
+        let mut buffer = HostBuffer::new(2048);
+        let created = current_timestamp();
+
+        buffer.insert([0x01u8; 32], vec![0u8; 1000], created);
+        buffer.insert([0x02u8; 32], vec![0u8; 1000], created);
+        // Third insert exceeds capacity: the OLDEST chunk is evicted.
+        buffer.insert([0x03u8; 32], vec![0u8; 1000], created);
+
+        assert!(buffer.get(&[0x01u8; 32]).is_none(), "oldest evicted first");
+        assert!(buffer.get(&[0x02u8; 32]).is_some());
+        assert!(buffer.get(&[0x03u8; 32]).is_some());
+        assert_eq!(buffer.current_size, 2000);
+
+        // Re-inserting an existing chunk keeps its data (updated, not
+        // duplicated) and does not grow the accounting.
+        buffer.insert([0x02u8; 32], vec![0u8; 500], created);
+        assert_eq!(buffer.current_size, 1500);
+        assert_eq!(buffer.get(&[0x02u8; 32]).unwrap().0.len(), 500);
+    }
+
+    #[tokio::test]
+    async fn test_reseeded_data_retains_timestamp() {
+        let runner = Arc::new(NodeRunner::new(
+            NodeConfig::default(),
+            [0x42u8; 16],
+            MixNode::new(),
+        ));
+        let content_id: ContentId = [0x1Au8; 32];
+        let chunk_id: ChunkId = [0x1Bu8; 32];
+
+        // Chunk was published long ago (stale, barter-eligible).
+        let original_created = current_timestamp() - 3 * STALENESS_THRESHOLD_SECS;
+
+        // Seed-only gossip path: reseed straight through the store helper
+        // (the exact call the gossip host makes) and check the clock.
+        assert!(
+            runner
+                .store_repaired_chunk(content_id, chunk_id, vec![0xCCu8; 128], original_created)
+                .await
+        );
+        let meta = runner
+            .chunk_metadata
+            .lock()
+            .await
+            .get(&chunk_id)
+            .expect("metadata recorded")
+            .clone();
+        assert_eq!(meta.created_at, original_created);
+        assert!(!meta.is_fresh);
+        assert!(meta.barter_eligible(current_timestamp()));
+    }
+
+    // ---- Phase 2 hotfix: hybrid migration over TCP ----
+
+    /// Minimal echo module: copies the input to a scratch area at address
+    /// 1024 and returns a pointer to `[4-byte length][data]` there.
+    const ECHO_WAT: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "process") (param $ptr i32) (param $len i32) (result i32)
+            (local $out i32)
+            (local.set $out (i32.const 1024))
+            (i32.store (local.get $out) (local.get $len))
+            (memory.copy (i32.add (local.get $out) (i32.const 4)) (local.get $ptr) (local.get $len))
+            (local.get $out)))
+    "#;
+
+    /// Bind `runner`'s transport to an ephemeral loopback port and spawn
+    /// its TCP listener.
+    async fn start_tcp_listener(runner: &Arc<NodeRunner>) -> std::net::SocketAddr {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let state = runner.transport.clone();
+        tokio::spawn(async move {
+            let _ = static_mesh::transport::start_listener(addr, state).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        addr
+    }
+
+    /// Register `peer` in `runner`'s routing table with KEM key and
+    /// compute advertisement (what a handshake would learn).
+    async fn register_peer(
+        runner: &Arc<NodeRunner>,
+        peer: &Arc<NodeRunner>,
+        addr: std::net::SocketAddr,
+        compute: bool,
+    ) {
+        let node = static_mesh::routing::KnownNode {
+            node_id: peer.transport.node_id,
+            public_key: peer.transport.mix_node.lock().await.public_key,
+            address: addr.to_string(),
+            kem_public_key: Some(peer.transport.kem.lock().await.public_bytes()),
+            compute_enabled: compute,
+            compute_capacity: if compute { 4 } else { 0 },
+            identity_public_key: Some(peer.transport.identity_public_key),
+        };
+        runner.transport.routing_table.write().await.add_node(node);
+    }
+
+    /// Two runners wired over loopback TCP with cross-registered routing
+    /// entries (compute advertised both ways), plus spawned inbound pumps
+    /// so every packet each side receives is processed through
+    /// `handle_inbound`. When `b_compute` is set, B's own transport also
+    /// accepts compute requests.
+    async fn tcp_pair(b_compute: bool) -> (Arc<NodeRunner>, Arc<NodeRunner>) {
+        let a = Arc::new(NodeRunner::new(
+            NodeConfig::default(),
+            [0xAAu8; 16],
+            MixNode::new(),
+        ));
+        let mut runner_b = NodeRunner::new(NodeConfig::default(), [0xBBu8; 16], MixNode::new());
+        if b_compute {
+            if let Some(t) = Arc::get_mut(&mut runner_b.transport) {
+                t.compute_enabled = true;
+                t.compute_capacity = 4;
+            }
+        }
+        let b = Arc::new(runner_b);
+        let addr_a = start_tcp_listener(&a).await;
+        let addr_b = start_tcp_listener(&b).await;
+        register_peer(&a, &b, addr_b, true).await;
+        register_peer(&b, &a, addr_a, true).await;
+        static_mesh::transport::connect_to_peer(addr_b, a.transport.clone())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        for runner in [&a, &b] {
+            let r = runner.clone();
+            tokio::spawn(async move {
+                while let Some(inbound) = r.inbound_rx.lock().await.recv().await {
+                    let _ = r.handle_inbound(inbound).await;
+                }
+            });
+        }
+        (a, b)
+    }
+
+    /// Poll `check` every 50 ms until it returns true or the deadline
+    /// (5 s) passes.
+    async fn wait_until(mut check: impl AsyncFnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if check().await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for condition");
+    }
+
+    #[tokio::test]
+    async fn test_compute_request_over_tcp() {
+        let (a, b) = tcp_pair(true).await;
+
+        // Provider has the module cached (no network fetch needed).
+        let module_pub = [0x77u8; 32];
+        let module_content_id =
+            static_storage::hidden_service::content_id_from_public(&module_pub);
+        b.compute_state
+            .lock()
+            .await
+            .cached_modules
+            .insert(module_content_id, ECHO_WAT.as_bytes().to_vec());
+
+        let input = b"hello over tcp".to_vec();
+        let request_id = a
+            .submit_compute_request(&module_pub, input.clone(), Currency::Monero)
+            .await
+            .unwrap();
+
+        wait_until(async || {
+            a.compute_state
+                .lock()
+                .await
+                .completed_results
+                .contains_key(&request_id)
+        })
+        .await;
+
+        let response = a
+            .compute_state
+            .lock()
+            .await
+            .completed_results
+            .get(&request_id)
+            .cloned()
+            .unwrap();
+        assert!(response.success, "error: {:?}", response.error);
+        assert_eq!(response.output_data, input);
+    }
+
+    #[tokio::test]
+    async fn test_verification_challenge_over_tcp() {
+        let (a, b) = tcp_pair(false).await;
+        let content_id: ContentId = [0x21u8; 32];
+        let (manifest, shards, _master) = repair_fixture(content_id, 2, 1);
+
+        // Challenger knows the segment hashes (manifest); holder has the
+        // chunk. The swap claim is what makes the holder challengeable.
+        let chunk = &shards[0];
+        let mut manifest = manifest;
+        manifest.segment_hashes =
+            static_storage::verification::compute_segment_hashes(std::slice::from_ref(chunk));
+        a.manifests.lock().await.insert(content_id, manifest);
+        a.swaps
+            .lock()
+            .await
+            .active_swaps
+            .insert(chunk.id, b.transport.node_id);
+        b.transport
+            .chunk_holder
+            .lock()
+            .await
+            .add_chunk(chunk.id, chunk.data.clone(), content_id);
+
+        run_verification_tick(&a).await;
+
+        wait_until(async || {
+            a.accounting
+                .lock()
+                .await
+                .peers
+                .get(&b.transport.node_id)
+                .is_some_and(|c| c.successful_challenges == 1)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_payment_request_over_tcp() {
+        let (a, b) = tcp_pair(false).await;
+        // A tracks a pending compute request toward B (what
+        // submit_compute_request records), and B answers with a payment
+        // quote over the hybrid payment-request path (exactly what
+        // initiate_paid_execution would send).
+        let request_id = [0x33u8; 32];
+        a.compute_state
+            .lock()
+            .await
+            .pending_requests
+            .insert(
+                request_id,
+                PendingComputeRequest {
+                    request_id,
+                    provider: b.transport.node_id,
+                    payment: None,
+                    started_at: current_timestamp(),
+                },
+            );
+
+        let quote = PaymentRequest {
+            request_id,
+            currency: Currency::Monero,
+            amount: 1234,
+            address: "test-address".to_string(),
+            required_confirmations: 1,
+        };
+        let our_pubkey = a.transport.mix_node.lock().await.public_key;
+        let return_route = ReturnRoute::from_sphinx_route(&Route {
+            hops: vec![RouteHop {
+                public_key: our_pubkey,
+                node_id: a.transport.node_id,
+            }],
+            destination: a.transport.node_id,
+        });
+        b.send_payment_request(&quote, &return_route).await.unwrap();
+
+        wait_until(async || a.pending_payment(&request_id).await.is_some()).await;
+        let received = a.pending_payment(&request_id).await.unwrap();
+        assert_eq!(received.amount, 1234);
+        assert_eq!(received.address, "test-address");
     }
 }

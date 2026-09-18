@@ -1,33 +1,46 @@
 # Static Network - Mainnet TODO
 
+> Phase 0 audit (2026-09-18): items 1-4, 9 marked PARTIAL (see notes).
+> Only Darkfi/Navio/Bluetooth/TEE are external blockers (Items 11, 17-stubs, 18).
+
 ## High Priority (MVP Blockers)
 
-### 1. Tiered Bandwidth Modes ✅ DONE
+### 1. Tiered Bandwidth Modes ⚠️ PARTIAL (Phase 0)
 - Add Low (50 KB/s), Standard (500 KB/s), High (5 MB/s) modes
 - User picks tier at startup; switching requires restart (preserves deniability)
-- Higher tiers get priority in tit-for-tat accounting
+- Tier REMOVED from Handshake (Phase 0 privacy: peers infer from observed rate)
+- Higher tiers get priority in tit-for-tat accounting — NOT DONE (`should_serve` is tier-agnostic AND-gate)
 - Extend CoverTrafficConfig with a `mode` enum
-- Update accounting `should_serve()` to factor in tier
+- Per-node TokenBucket shaper DONE, `--no-cover` removed, Client mode added
 
-### 2. Content Discovery via Hidden Services ✅ DONE
+### 2. Content Discovery via Hidden Services ⚠️ PARTIAL (Phase 0)
 - Content ID IS the hidden service address
 - Retriever builds Sphinx route to content ID, sends request
 - Node holding the chunk responds via return route
 - No DHT needed — the mixnet is the discovery mechanism
-- Seed-only nodes (or their sponsors) act as introduction points by holding manifests
+- Phase 0: try ALL known peers (hybrid-only, Sphinx-wrapped, no cache per Item 18)
+- Seed-only sponsor-as-intro-point: NOT DONE (sponsor never stores manifest)
 
-### 3. Chunk Repair Protocol ✅ DONE
+### 3. Chunk Repair Protocol ✅ DONE (Phase 1)
 - When nodes leave, their chunks need re-replication
 - Detect chunk loss via erasure coding threshold
 - Trigger re-replication from remaining shards
 - Leases with heartbeats already track node availability
-- Add repair logic to the lease expiration loop
+- Phase 1 DONE: repair loop reconstructs (health from holder + swap registry +
+  HostBuffer → HostBuffer reseed first, original `created_at` preserved →
+  missing-chunk gossip (0x09, Sphinx-wrapped) → shard fetch via the standard
+  retrieval protocol → `erasure_decode` reconstruction → capacity-gated store)
+- Redistribution to new nodes rides the existing rotation barter loop
+- Known limit: copy counts are local estimates (holder + swap registry), not
+  network-wide quorum queries
 
-### 4. Sybil Resistance for Seed-Only Nodes ✅ DONE
+### 4. Sybil Resistance for Seed-Only Nodes ⚠️ PARTIAL (Phase 0)
 - Seed-only nodes must stake or prove reputation to prevent network flooding
 - Stake = prepaid bytes to sponsor node
 - Sponsor node validates stake before accepting hosting commitment
 - Rate limit seed-only nodes to only sending seed packages (heartbeats/funding) when requested
+- Phase 0 DONE: real Ed25519 prepay sigs + sender binding + 1h rate-limit + 5-slot cap + excess-capacity gate
+- NOT DONE: stake >= content-size verification (sponsor never sees chunks to verify)
 
 ### 5. Network Partition Handling for Accounting ✅ DONE
 - Local accounting may diverge during partitions
@@ -61,13 +74,13 @@
 - Each transport handles its own connection management
 - Cover traffic rate enforcement stays in the trait
 
-### 9. Seed-Only Node Mode with Prepayment ✅ DONE
-- Node mode: Full, SeedOnly, BackupOnly
+### 9. Seed-Only Node Mode with Prepayment ⚠️ PARTIAL (Phase 0)
+- Node mode: Full, SeedOnly, BackupOnly, Client (NEW: relay-only, reduced cover)
 - Seed-only node pays ONE sponsor node (avoids double-spend)
-- Sponsor distributes chunks across its existing peer relationships
+- Sponsor distributes chunks across its existing peer relationships — NOT DONE (sponsor stores nothing)
 - 1:1 rule: `stored_bytes <= local_hosted + prepaid_hosted`
 - Sponsor must have excess capacity (its own 1:1 satisfied with surplus)
-- Prepayment recorded in accounting as `prepaid_bytes`
+- Prepayment recorded in accounting as `prepaid_bytes` (real sigs DONE)
 - Seed-only nodes only send seed packages when requested (rate limited)
 
 ### 10. Backup-Only Node Mode with Health Checks ✅ DONE
@@ -104,10 +117,13 @@
   (bounded by published content); leaf/node hashes are not
   domain-separated yet (future hardening: 0x00/0x01 tag bytes).
 
-### 13. Withdrawal/Exit Protocol for Seed-Only Nodes
+### 13. Withdrawal/Exit Protocol for Seed-Only Nodes (Phase 2)
 - When seed-only node stops funding, content retires via lease expiry
 - Or content transfers to another sponsor
 - Clear lifecycle: fund → host → withdraw/transfer → retire
+- Phase 1 note: local lease refresh + remote heartbeat propagation (0x0A) are
+  live; a full exit/transfer protocol (sponsor hand-off, signed release) is
+  Phase 2
 
 ### 14. Chunk Integrity Verification ✅ DONE
 - Implementation: segment-based challenge/response. Each 1 MiB chunk is
@@ -191,3 +207,91 @@
   surfaces `payment_required`/`payment_currency`/`payment_address`/
   `payment_amount` while awaiting payment; new `compute_confirm` action
   and CLI `compute-confirm` / `compute-result` subcommands.
+
+### 18. Privacy-Preserving Content Discovery (Research — EXTERNAL, do not implement)
+- Current: Ask all known peers (Sphinx-wrapped, no cache)
+- Problem: Doesn't scale past ~100 nodes efficiently
+- Research needed: Find a discovery mechanism that:
+  - Does NOT store chunk locations in memory (anti-seizure)
+  - Does NOT leak timing information (constant-time)
+  - Does NOT allow cache poisoning
+  - Does NOT reveal network topology
+  - Preserves the anonymity properties of the Sphinx mixnet
+- Possible approaches: Oblivious RAM, private information retrieval,
+  blind storage, or a novel protocol designed specifically for Static
+- This is an open research problem — do NOT implement until solved
+
+## Phase 0 Audit Notes (2026-09-18)
+
+External blockers only (waiting outside codebase):
+- Darkfi watcher: blocked on `darkfid` wallet RPC stabilization (`payment.rs` stubs)
+- Navio watcher: blocked on `navcoind` RPC access/stabilization
+- Bluetooth transport (Item 11): needs radio env + privacy-model change
+- TEE/HE compute confidentiality: trust-based MVP intentional
+- Item 18 discovery research above
+
+Internal stubs fixed in Phase 0 (not external):
+- Ed25519 handshake/prepay/swap/reconcile/gossip auth, tier removed from wire
+- Per-node TokenBucket cover shaper, hybrid-only + HYBRID_MAX padding
+- Publish erasure + manifest master/nonce, heartbeat sender, try-all retrieval
+- Strict 1:1 real-chunk swaps, 0600 config, API token, Client mode, bounds
+
+## Phase 1 Notes (2026-09-18) — Lifecycle Completeness & Scale Hardening
+
+Implemented (all Sphinx-wrapped, no clear JSON, no new dependencies):
+- Repair reconstruction (Item 3 ✅): health from holder + swap registry +
+  HostBuffer; HostBuffer reseed first (original `created_at`, no barter clock
+  reset); missing shards gossiped + fetched via the standard retrieval
+  protocol; `erasure_decode` reconstruction; capacity-gated local store;
+  redistribution rides rotation barter.
+- Missing-chunk gossip (type 0x09, `static-storage/src/gossip.rs`): sent on
+  `found:false` responses and by the repair loop; source-side dedup
+  (10 min TTL, 1024 entries); host reseeds from HostBuffer and answers with
+  a hybrid `ChunkResponse` via the reporter's return route.
+- Heartbeat propagation (type 0x0A, `MSG_HEARTBEAT` wire framing): every
+  30 min the owner sends heartbeats to swap-registered holders; holders
+  refresh via token-checked `process_heartbeat_upsert` (bounded expiry,
+  held-chunks-only). Known trade-off (approved): upsert trusts the
+  Sphinx-wrapped heartbeat for chunks already held; future hardening =
+  Ed25519 signature by the content owner.
+- HostBuffer: already LRU-evicting (Phase 0); reseed/repair store helper
+  preserves original `created_at`; buffer copies count toward repair
+  recoverability.
+- `fetch_shards()` extracted from `fetch_and_assemble` — returns
+  `Vec<Option<EncryptedChunk>>` in manifest order (direct `erasure_decode`
+  input); repair processes ≤1 content per 60s tick and skips while a user
+  retrieval is in flight (shared ContentRetriever).
+
+Phase 2 (deferred, per plan):
+- True atomic 2-phase swap commit
+- Withdrawal/exit + sponsor hand-off protocol (Item 13)
+- Darkfi/Navio watchers (external blockers unchanged)
+- Signed heartbeats (Ed25519 content-owner signature closing the upsert
+  trade-off)
+- Network-wide health quorum queries (current copy counts are local estimates)
+
+## Phase 2 Hotfix Notes (2026-09-18) — Hybrid Packet Migration
+
+All five Sphinx-body paths (retrieval, compute, verification, payment,
+gossip/heartbeat) now emit hybrid (v1) packets only — the last classical
+emitters are gone:
+- `build_fragment_packets` (runner.rs) deleted; its 4 call sites migrated to
+  `create_hybrid_payload_packets`: verification challenge + response,
+  payment request, payment confirmation.
+- Two additional classical emitters the audit missed, both in the compute
+  path, also migrated: `build_request_packets`/`build_response_packets`
+  (compute.rs) now delegate to the mesh hybrid helper with a `kem_lookup`
+  param. Without them compute REQUESTS and RESPONSES were dropped too.
+- Missing-KEM policy: hybrid builds fail at the source (the helper returns
+  an error, no classical fallback). `submit_compute_request` and
+  `confirm_compute_payment` bail with a clear error; responder paths warn
+  and drop. Never send a packet known to be dropped in transit.
+- Dead classical code removed: `create_anonymous_request` (retrieval.rs,
+  zero callers) and `provider_mix_key` (replaced by a routing-table lookup
+  that errors instead of defaulting to `[0u8; 32]`).
+- Shared helpers: `NodeRunner::hybrid_kem_map` (routing-table KEM snapshot)
+  and `single_peer_kem_lookup`; all 9 hybrid send paths use them.
+- 3 new loopback-TCP tests through `handle_inbound` prove the migrated
+  paths end to end: compute request/response (echo module),
+  verification challenge/response (accounting credit), payment quote
+  (pending_payment). Suite: 372 tests, release build zero warnings.

@@ -2,13 +2,13 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
-use static_node::{NodeConfig, runner::NodeRunner};
+use serde::{Deserialize, Serialize};
 use static_node::config::PersistentConfig;
+use static_node::{runner::NodeRunner, NodeConfig};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use serde::{Serialize, Deserialize};
 
 /// Static - A privacy network where traffic is indistinguishable from noise
 #[derive(Parser, Debug)]
@@ -25,10 +25,6 @@ struct Cli {
     /// Cover traffic interval in milliseconds
     #[arg(long, default_value_t = 100)]
     cover_interval: u64,
-
-    /// Disable cover traffic (NOT RECOMMENDED - removes deniability)
-    #[arg(long)]
-    no_cover: bool,
 
     /// Bandwidth tier for cover traffic and priority (low, standard, high)
     #[arg(long, default_value = "standard")]
@@ -50,7 +46,7 @@ struct Cli {
     #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024)]
     max_storage: u64,
 
-    /// Node mode (full, seed, backup)
+    /// Node mode (full, seed, backup, client)
     #[arg(long, default_value = "full")]
     mode: String,
 
@@ -65,21 +61,6 @@ struct Cli {
     /// Heartbeat timeout in seconds (default: 5400 = 3x 30-min cadence)
     #[arg(long, default_value_t = 5400)]
     backup_timeout: u64,
-
-    /// Use post-quantum hybrid Sphinx packets (default: true)
-    ///
-    /// Bare `--hybrid-crypto` means true; pass `--hybrid-crypto=false`
-    /// to force classical-only (v0) packets.
-    #[arg(
-        long,
-        default_value_t = true,
-        default_missing_value = "true",
-        require_equals = true,
-        num_args = 0..=1,
-        action = clap::ArgAction::Set,
-        value_parser = clap::builder::BoolishValueParser::new()
-    )]
-    hybrid_crypto: bool,
 
     /// Disable hot storage rotation
     #[arg(long)]
@@ -133,6 +114,15 @@ struct Cli {
     /// Verification challenge interval in seconds (default: 1800 = 30 minutes)
     #[arg(long, default_value_t = 1800)]
     verification_interval: u64,
+
+    /// Suppress non-error output (tracing level ERROR instead of INFO)
+    #[arg(long)]
+    quiet: bool,
+
+    /// Bearer token required by the local API (never logged).
+    /// Must match the running node's `--api-token` for CLI commands.
+    #[arg(long)]
+    api_token: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -203,6 +193,8 @@ struct ApiRequest {
     request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tx_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -229,12 +221,20 @@ struct ApiResponse {
     payment_amount: Option<u64>,
 }
 
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-
     let cli = Cli::parse();
+
+    // `--quiet` suppresses non-error output: ERROR instead of INFO.
+    if cli.quiet {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::ERROR)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .init();
+    }
 
     let tier = match cli.tier.to_lowercase().as_str() {
         "low" => static_mesh::BandwidthTier::Low,
@@ -252,6 +252,7 @@ async fn main() -> Result<()> {
     let mode = match cli.mode.to_lowercase().as_str() {
         "seed" => static_node::NodeMode::SeedOnly,
         "backup" => static_node::NodeMode::BackupOnly,
+        "client" => static_node::NodeMode::Client,
         _ => static_node::NodeMode::Full,
     };
 
@@ -291,7 +292,10 @@ async fn main() -> Result<()> {
         .filter(|ticker| !ticker.is_empty())
         .map(|ticker| {
             static_node::payment::Currency::from_str(ticker).ok_or_else(|| {
-                anyhow::anyhow!("Unsupported compute currency '{}' (accepted: xmr, dark, nav)", ticker)
+                anyhow::anyhow!(
+                    "Unsupported compute currency '{}' (accepted: xmr, dark, nav)",
+                    ticker
+                )
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -299,11 +303,14 @@ async fn main() -> Result<()> {
         anyhow::bail!("--compute-currencies must name at least one currency (xmr, dark, nav)");
     }
 
+    // Cover traffic is mandatory for Full/Client nodes; hybrid crypto is
+    // mandatory for all modes. Seed-only nodes run reduced cover via the
+    // runner (which forces a minimal rate), as a documented trade-off.
     let config = NodeConfig {
         data_dir: cli.data_dir.clone(),
         cover_traffic_rate_bps: cover_rate,
         cover_traffic_interval_ms: cli.cover_interval,
-        cover_traffic_enabled: !cli.no_cover,
+        cover_traffic_enabled: true,
         listen_addr: cli.listen.clone(),
         api_addr: cli.api_addr.clone(),
         bootstrap_peers: cli.peer.clone(),
@@ -311,7 +318,7 @@ async fn main() -> Result<()> {
         tier,
         mode,
         sponsor: cli.sponsor.clone(),
-        use_hybrid_crypto: cli.hybrid_crypto,
+        use_hybrid_crypto: true,
         rotation_config,
         backup_config,
         compute_config: static_node::ComputeConfig {
@@ -331,6 +338,7 @@ async fn main() -> Result<()> {
         },
         verification_enabled: cli.verification_enabled,
         verification_interval_secs: cli.verification_interval,
+        api_token: cli.api_token.clone(),
     };
 
     match cli.command {
@@ -347,17 +355,15 @@ async fn main() -> Result<()> {
             if let Some(sponsor) = &config.sponsor {
                 tracing::info!("Sponsor: {}", sponsor);
             }
-            tracing::info!(
-                "Hybrid crypto: {}",
-                if config.use_hybrid_crypto { "enabled (v1 preferred)" } else { "disabled (v0 only)" }
-            );
+            // Hybrid crypto is mandatory (v1 preferred, v0 fallback).
+            tracing::info!("Hybrid crypto: enabled (v1 preferred)");
             tracing::info!("Bandwidth tier: {:?}", config.tier);
             tracing::info!("Cover traffic: {} bps", config.cover_traffic_rate_bps);
             tracing::info!("Storage contribution: {} bytes", config.max_storage_bytes);
 
             let runner = Arc::new(NodeRunner::new(config, node_id, mix_node));
             let runner_clone = runner.clone();
-            
+
             let node_handle = tokio::spawn(async move {
                 if let Err(e) = runner_clone.run().await {
                     tracing::error!("Node runner error: {}", e);
@@ -382,27 +388,66 @@ async fn main() -> Result<()> {
                 println!("Sponsor: {}", sponsor);
             }
             println!("Bandwidth tier: {:?}", config.tier);
-            println!("Cover traffic: {}", if config.cover_traffic_enabled { "enabled" } else { "disabled" });
+            println!(
+                "Cover traffic: {}",
+                if config.cover_traffic_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
             println!("Cover rate: {} bps", config.cover_traffic_rate_bps);
             println!("Max storage: {} bytes", config.max_storage_bytes);
             println!("Bootstrap peers: {:?}", config.bootstrap_peers);
-            println!("Rotation: {}", if config.rotation_config.enabled { "enabled" } else { "disabled" });
-            println!("Rotation percentage: {}%", config.rotation_config.rotation_percentage);
-            println!("Caching: {}", if config.rotation_config.enable_caching { "enabled" } else { "disabled" });
+            println!(
+                "Rotation: {}",
+                if config.rotation_config.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            println!(
+                "Rotation percentage: {}%",
+                config.rotation_config.rotation_percentage
+            );
+            println!(
+                "Caching: {}",
+                if config.rotation_config.enable_caching {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
             if matches!(config.mode, static_node::NodeMode::BackupOnly) {
                 println!(
                     "Backup primary: {}",
-                    config.backup_config.primary_address.as_deref().unwrap_or("<unconfigured>")
+                    config
+                        .backup_config
+                        .primary_address
+                        .as_deref()
+                        .unwrap_or("<unconfigured>")
                 );
-                println!("Backup heartbeat timeout: {}s", config.backup_config.heartbeat_timeout_secs);
-                println!("Backup permanent takeover: {}", config.backup_config.permanent_takeover);
+                println!(
+                    "Backup heartbeat timeout: {}s",
+                    config.backup_config.heartbeat_timeout_secs
+                );
+                println!(
+                    "Backup permanent takeover: {}",
+                    config.backup_config.permanent_takeover
+                );
             }
         }
         Commands::GenId => {
+            // Never print private key material: Node ID + identity public
+            // key only.
             let persistent_config = PersistentConfig::new();
             println!("Generated new node identity:");
-            println!("  Node ID: {:02x?}", persistent_config.node_id);
-            println!("  Mix private key: {:02x?}", persistent_config.mix_private_key);
+            println!("  Node ID: {}", hex::encode(persistent_config.node_id));
+            println!(
+                "  Identity public key: {}",
+                hex::encode(persistent_config.identity_public_key)
+            );
             println!("\nRun 'static-node start' to save this to config.json and start the node.");
         }
         Commands::Info => {
@@ -430,20 +475,30 @@ async fn main() -> Result<()> {
                 compute_currency: None,
                 request_id: None,
                 tx_hash: None,
+                token: cli.api_token.clone(),
             };
-            
+
             let response = send_api_request(&config.api_addr, &request).await?;
-            
+
             if response.status == "ok" {
                 println!("Successfully published file: {:?}", file_path);
                 println!("Content ID: {}", response.content_id.unwrap_or_default());
-                println!("Content Public Key: {}", response.content_pub_key.unwrap_or_default());
+                println!(
+                    "Content Public Key: {}",
+                    response.content_pub_key.unwrap_or_default()
+                );
                 if let Some(manifest) = response.manifest {
                     let manifest_json = serde_json::to_string_pretty(&manifest)?;
                     // Append .manifest.json to the original filename
                     let manifest_path = {
                         let mut path = file_path.clone();
-                        path.set_extension(format!("{}.manifest.json", path.extension().unwrap_or_default().to_string_lossy().to_string()));
+                        path.set_extension(format!(
+                            "{}.manifest.json",
+                            path.extension()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string()
+                        ));
                         path
                     };
                     std::fs::write(&manifest_path, manifest_json)?;
@@ -453,7 +508,10 @@ async fn main() -> Result<()> {
                 eprintln!("Publish failed: {}", response.message);
             }
         }
-        Commands::Retrieve { content_pub_key, output_path } => {
+        Commands::Retrieve {
+            content_pub_key,
+            output_path,
+        } => {
             let request = ApiRequest {
                 action: "retrieve".into(),
                 data: None,
@@ -461,10 +519,11 @@ async fn main() -> Result<()> {
                 compute_currency: None,
                 request_id: None,
                 tx_hash: None,
+                token: cli.api_token.clone(),
             };
-            
+
             let response = send_api_request(&config.api_addr, &request).await?;
-            
+
             if response.status == "ok" {
                 if let Some(data_hex) = response.data {
                     let file_data = hex::decode(&data_hex)?;
@@ -477,7 +536,12 @@ async fn main() -> Result<()> {
                 eprintln!("Retrieve failed: {}", response.message);
             }
         }
-        Commands::Compute { module_key, input, currency, wait } => {
+        Commands::Compute {
+            module_key,
+            input,
+            currency,
+            wait,
+        } => {
             let request = ApiRequest {
                 action: "compute".into(),
                 data: Some(input),
@@ -485,6 +549,7 @@ async fn main() -> Result<()> {
                 compute_currency: Some(currency),
                 request_id: None,
                 tx_hash: None,
+                token: cli.api_token.clone(),
             };
 
             let response = send_api_request(&config.api_addr, &request).await?;
@@ -500,12 +565,19 @@ async fn main() -> Result<()> {
             println!("Compute request submitted. Request ID: {}", request_id);
 
             if wait > 0 {
-                poll_compute_result(&config.api_addr, &request_id, wait).await;
+                poll_compute_result(&config.api_addr, &request_id, wait, cli.api_token.clone())
+                    .await;
             } else {
-                println!("Poll for the result: static-node compute-result {} --wait", request_id);
+                println!(
+                    "Poll for the result: static-node compute-result {} --wait",
+                    request_id
+                );
             }
         }
-        Commands::ComputeConfirm { request_id, tx_hash } => {
+        Commands::ComputeConfirm {
+            request_id,
+            tx_hash,
+        } => {
             let request = ApiRequest {
                 action: "compute_confirm".into(),
                 data: None,
@@ -513,18 +585,22 @@ async fn main() -> Result<()> {
                 compute_currency: None,
                 request_id: Some(request_id.clone()),
                 tx_hash: Some(tx_hash),
+                token: cli.api_token.clone(),
             };
 
             let response = send_api_request(&config.api_addr, &request).await?;
             if response.status == "ok" {
                 println!("{}", response.message);
-                println!("Poll for the result: static-node compute-result {} --wait 600", request_id);
+                println!(
+                    "Poll for the result: static-node compute-result {} --wait 600",
+                    request_id
+                );
             } else {
                 eprintln!("Compute confirm failed: {}", response.message);
             }
         }
         Commands::ComputeResult { request_id, wait } => {
-            poll_compute_result(&config.api_addr, &request_id, wait).await;
+            poll_compute_result(&config.api_addr, &request_id, wait, cli.api_token.clone()).await;
         }
     }
 
@@ -535,7 +611,12 @@ async fn main() -> Result<()> {
 /// is exhausted. When the provider quotes a payment the user pays from
 /// their own wallet, then confirms via `static-node compute-confirm`;
 /// polling keeps running in case the payment confirms within the budget.
-async fn poll_compute_result(api_addr: &str, request_id: &str, wait_secs: u64) {
+async fn poll_compute_result(
+    api_addr: &str,
+    request_id: &str,
+    wait_secs: u64,
+    api_token: Option<String>,
+) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
     let mut payment_announced = false;
     while std::time::Instant::now() < deadline {
@@ -548,6 +629,7 @@ async fn poll_compute_result(api_addr: &str, request_id: &str, wait_secs: u64) {
             compute_currency: None,
             request_id: None,
             tx_hash: None,
+            token: api_token.clone(),
         };
         let poll_response = match send_api_request(api_addr, &poll).await {
             Ok(response) => response,
@@ -606,10 +688,10 @@ async fn send_api_request(api_addr: &str, request: &ApiRequest) -> Result<ApiRes
     let mut stream = TcpStream::connect(api_addr).await?;
     let request_bytes = serde_json::to_vec(request)?;
     stream.write_all(&request_bytes).await?;
-    
+
     let mut buf = vec![0u8; 1024 * 1024 * 10]; // 10MB buffer for large files
     let n = stream.read(&mut buf).await?;
-    
+
     let response: ApiResponse = serde_json::from_slice(&buf[..n])?;
     Ok(response)
 }

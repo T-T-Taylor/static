@@ -47,6 +47,18 @@ pub const MAX_SPONSORED_SEEDS: usize = 5;
 /// Minimum interval between prepayments for the same content (1 hour)
 pub const PREPAY_RATE_LIMIT_SECS: u64 = 3600;
 
+/// Maximum clock-skew tolerated in reconciliation timestamps (5 minutes).
+///
+/// Entries with `last_interaction` further than this beyond `now` are
+/// ignored as future-dated (faulty clock or forgery attempt).
+pub const RECONCILE_FUTURE_SKEW_SECS: u64 = 300;
+
+/// Sanity bound for reconciled byte counters (2^60 ≈ 1 EiB).
+///
+/// Entries claiming more than this in any byte field are ignored as
+/// corrupt or malicious.
+pub const MAX_ACCOUNTING_BYTES: u64 = 1 << 60;
+
 /// Per-peer credit state
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PeerCredit {
@@ -215,7 +227,7 @@ impl AccountingState {
             total_bytes_received: 0,
             peers: HashMap::new(),
             min_ratio: 0.5,
-            initial_credit: 10 * 1024 * 1024, // 10 MiB goodwill
+            initial_credit: 1024 * 1024, // 1 MiB goodwill (new-ID cost)
             sponsored_seeds: HashMap::new(),
             prepayment_attempts: HashMap::new(),
         }
@@ -391,60 +403,54 @@ impl AccountingState {
             .unwrap_or(false)
     }
 
-    /// Check if a peer should be allowed to receive service
+    /// Check if a peer should be allowed to receive service (C5 AND-gate).
     ///
-    /// A peer is allowed if:
-    /// 1. They have sufficient net credit, OR
-    /// 2. Their ratio is above the minimum, OR
-    /// 3. They are new (get initial credit), OR
-    /// 4. They have sufficient prepaid bytes (seed-only 1:1 via prepayment)
+    /// All three gates must pass:
+    /// 1. Credit gate: `has_credit(requested)` OR `has_prepaid(requested)`
+    ///    OR `effective_credit() > 0` OR new peer within goodwill.
+    /// 2. Ratio gate: `ratio() >= min_ratio` OR new peer within goodwill
+    ///    (goodwill = never served and
+    ///    `bytes_received + requested <= initial_credit + prepaid_bytes`;
+    ///    prepayments extend goodwill so seed-only nodes that prepaid stay
+    ///    servable after exhausting the base 1 MiB).
+    /// 3. Challenge gate: NOT (`total_challenges > 10` AND
+    ///    `success_rate < 0.5`). Peers with a meaningful failure history
+    ///    are denied even with credit (item 14 freeloader gate; the >10
+    ///    threshold damps network-glitch false positives).
+    ///
+    /// Unknown peers get `initial_credit` (1 MiB) goodwill, bounding the
+    /// new-ID (Sybil) cost. `initial_credit` is 1 MiB.
     pub fn should_serve(&self, peer: &NodeId, requested_bytes: u64) -> bool {
         let credit = self.peers.get(peer);
 
         match credit {
             None => {
-                // New peer: allow if within initial credit
+                // New peer: allow if within 1 MiB goodwill.
                 requested_bytes <= self.initial_credit
             }
             Some(c) => {
-                // Deprioritize proven freeloaders (item 14): a peer with a
-                // meaningful challenge history (more than 10 challenges)
-                // and under 50% success rate is denied regardless of
-                // credit. This is a hard gate placed before the
-                // early-return checks below — appended after them it
-                // would be dead code for credit-rich peers, which is
-                // exactly the freeloading profile it targets. The >10
-                // threshold damps network-glitch false positives.
+                // Gate 3: challenge gate (hard deny before anything else).
                 let total_challenges = c.successful_challenges + c.failed_challenges;
                 if total_challenges > 10 && c.challenge_success_rate() < 0.5 {
                     return false;
                 }
 
-                // Check net credit first
-                if c.has_credit(requested_bytes) {
-                    return true;
-                }
+                // Goodwill: never served and within base credit plus any
+                // prepaid extension.
+                let goodwill = c.bytes_served == 0
+                    && c.bytes_received.saturating_add(requested_bytes)
+                        <= self.initial_credit.saturating_add(c.prepaid_bytes);
 
-                // Check prepaid bytes (seed-only 1:1 via prepayment).
-                // Additive path: does not alter existing credit/ratio logic.
-                if c.has_prepaid(requested_bytes) {
-                    return true;
-                }
-                if c.effective_credit() >= requested_bytes as i64 {
-                    return true;
-                }
+                // Gate 1: credit gate.
+                let credit_ok = c.has_credit(requested_bytes)
+                    || c.has_prepaid(requested_bytes)
+                    || c.effective_credit() > 0
+                    || goodwill;
 
-                // Check ratio
-                if c.ratio() >= self.min_ratio {
-                    return true;
-                }
+                // Gate 2: ratio gate.
+                let ratio_ok = c.ratio() >= self.min_ratio || goodwill;
 
-                // Check if they're new enough for initial credit
-                if c.bytes_served == 0 && c.bytes_received < self.initial_credit {
-                    return requested_bytes <= self.initial_credit - c.bytes_received;
-                }
-
-                false
+                credit_ok && ratio_ok
             }
         }
     }
@@ -520,16 +526,32 @@ impl AccountingState {
     /// Reconcile with a peer's exported accounting state (last-write-wins)
     ///
     /// For each incoming `(peer_id, credit)` entry:
-    /// 1. Unknown peer → adopt the incoming entry.
-    /// 2. Known peer with newer `last_interaction` → adopt incoming.
-    /// 3. Known peer with newer-or-equal local entry → keep ours.
+    /// 1. Future-dated (`last_interaction > now + 300`) → ignore.
+    /// 2. Absurd (`bytes_served`, `bytes_received`, or `prepaid_bytes`
+    ///    `> 2^60`) → ignore as corrupt/malicious.
+    /// 3. Unknown peer → adopt the incoming entry.
+    /// 4. Known peer with newer `last_interaction` → adopt incoming.
+    /// 5. Known peer with newer-or-equal local entry → keep ours.
     ///
     /// Idempotent: processing the same batch twice yields the same state,
     /// so multi-message batched exchanges converge. Sender totals are
     /// informational only — no global consistency is enforced (accounting
     /// stays purely local, peer-to-peer).
     pub fn reconcile(&mut self, incoming: &[(NodeId, PeerCredit)]) {
+        let now = current_timestamp();
+        let future_bound = now.saturating_add(RECONCILE_FUTURE_SKEW_SECS);
         for (peer_id, remote) in incoming {
+            // Bound 1: ignore future timestamps beyond clock-skew tolerance.
+            if remote.last_interaction > future_bound {
+                continue;
+            }
+            // Bound 2: sanity — ignore absurd byte counts.
+            if remote.bytes_served > MAX_ACCOUNTING_BYTES
+                || remote.bytes_received > MAX_ACCOUNTING_BYTES
+                || remote.prepaid_bytes > MAX_ACCOUNTING_BYTES
+            {
+                continue;
+            }
             match self.peers.get_mut(peer_id) {
                 Some(ours) => {
                     if remote.last_interaction > ours.last_interaction {
@@ -854,6 +876,8 @@ mod tests {
         assert_eq!(state.total_bytes_received, 0);
         assert_eq!(state.peers.len(), 0);
         assert_eq!(state.min_ratio, 0.5);
+        // Goodwill hardened to 1 MiB (new-ID cost).
+        assert_eq!(state.initial_credit, 1024 * 1024);
     }
 
     #[test]
@@ -879,10 +903,45 @@ mod tests {
     #[test]
     fn test_should_serve_new_peer() {
         let state = AccountingState::new();
+        // Goodwill is exactly 1 MiB (new-ID cost).
+        assert_eq!(state.initial_credit, 1024 * 1024);
         let peer = random_node_id();
         // New peer gets initial credit
         assert!(state.should_serve(&peer, state.initial_credit));
         assert!(!state.should_serve(&peer, state.initial_credit + 1));
+    }
+
+    #[test]
+    fn test_new_peers_get_1mib() {
+        // C5: unknown peers get 1 MiB goodwill, bounding Sybil new-ID cost.
+        let state = AccountingState::new();
+        assert_eq!(state.initial_credit, 1024 * 1024);
+        let peer = random_node_id();
+        assert!(state.should_serve(&peer, 1024 * 1024));
+        assert!(!state.should_serve(&peer, 1024 * 1024 + 1));
+        // Known new peer within goodwill (served==0, small received) passes.
+        let mut state2 = AccountingState::new();
+        let peer2 = random_node_id();
+        state2.record_received(peer2, 1000);
+        // 1000 received + 1000 requested <= 1 MiB goodwill.
+        assert!(state2.should_serve(&peer2, 1000));
+        // Exhausting goodwill denies.
+        state2.record_received(peer2, 1024 * 1024);
+        assert!(!state2.should_serve(&peer2, 1));
+    }
+
+    #[test]
+    fn test_freeloader_negative_net_denied() {
+        // C5 AND-gate: negative net + bad ratio => denied even for tiny asks.
+        let mut state = AccountingState::new();
+        let peer = random_node_id();
+        state.record_served(peer, 100);
+        state.record_received(peer, 10_000);
+        let credit = &state.peers[&peer];
+        assert!(credit.net_credit < 0);
+        assert!(credit.ratio() < state.min_ratio);
+        assert!(!state.should_serve(&peer, 1));
+        assert!(!state.should_serve(&peer, 100));
     }
 
     #[test]
@@ -956,6 +1015,30 @@ mod tests {
         }
 
         assert!(!state.should_serve(&peer, 100));
+    }
+
+    #[test]
+    fn test_challenge_gate_denies_even_with_credit() {
+        // C5: challenge gate is ANDed — large credit + good ratio still
+        // denied when total>10 and success<50%.
+        let mut state = AccountingState::new();
+        let peer = random_node_id();
+        // Large credit and perfect ratio (served >> received).
+        state.record_served(peer, 10 * 1024 * 1024);
+        state.record_received(peer, 1000);
+        assert!(state.peers[&peer].net_credit > 0);
+        assert!(state.peers[&peer].ratio() >= state.min_ratio);
+        // Sanity: allowed before challenge history.
+        assert!(state.should_serve(&peer, 1000));
+        // Poison challenge history: 4/12 (~33%) success.
+        for _ in 0..4 {
+            state.record_challenge_success(&peer);
+        }
+        for _ in 0..8 {
+            state.record_challenge_failure(&peer);
+        }
+        assert!(!state.should_serve(&peer, 1));
+        assert!(!state.should_serve(&peer, 1000));
     }
 
     #[test]
@@ -1329,5 +1412,67 @@ mod tests {
         let exported = state.export_for_reconciliation();
         assert_eq!(exported.len(), 1);
         assert_eq!(exported[0].1.prepaid_bytes, 12345);
+    }
+
+    #[test]
+    fn test_reconciliation_rejects_future_timestamp() {
+        // Entries more than 300s in the future are ignored (clock-skew bound).
+        let mut state = AccountingState::new();
+        let peer = random_node_id();
+        let now = current_timestamp();
+
+        // New peer with future timestamp → not adopted.
+        let future = make_remote_credit(1000, 200, now + RECONCILE_FUTURE_SKEW_SECS + 1000);
+        state.reconcile(&[(peer, future)]);
+        assert!(!state.peers.contains_key(&peer));
+
+        // Known peer: future-dated newer entry does not overwrite.
+        let ours = make_remote_credit(5000, 1000, now);
+        state.peers.insert(peer, ours.clone());
+        let mut evil = make_remote_credit(9999, 1, now + 10_000);
+        evil.prepaid_bytes = 777;
+        state.reconcile(&[(peer, evil)]);
+        let kept = &state.peers[&peer];
+        assert_eq!(kept.bytes_served, 5000);
+        assert_eq!(kept.bytes_received, 1000);
+        assert_eq!(kept.last_interaction, now);
+
+        // Boundary: exactly now+300 is accepted (not > bound).
+        let fresh = random_node_id();
+        let edge = make_remote_credit(111, 22, now + RECONCILE_FUTURE_SKEW_SECS);
+        state.reconcile(&[(fresh, edge)]);
+        assert!(state.peers.contains_key(&fresh));
+        assert_eq!(state.peers[&fresh].bytes_served, 111);
+    }
+
+    #[test]
+    fn test_reconciliation_rejects_absurd_bytes() {
+        // Entries with any byte field > 2^60 are ignored as corrupt/malicious.
+        let mut state = AccountingState::new();
+        let now = current_timestamp();
+
+        let bad_served = {
+            let c = make_remote_credit(1 << 61, 0, now);
+            c
+        };
+        let peer1 = random_node_id();
+        state.reconcile(&[(peer1, bad_served)]);
+        assert!(!state.peers.contains_key(&peer1));
+
+        let bad_received = make_remote_credit(0, (1 << 60) + 1, now);
+        let peer2 = random_node_id();
+        state.reconcile(&[(peer2, bad_received)]);
+        assert!(!state.peers.contains_key(&peer2));
+
+        let mut bad_prepaid = make_remote_credit(100, 100, now);
+        bad_prepaid.prepaid_bytes = 1 << 61;
+        let peer3 = random_node_id();
+        state.reconcile(&[(peer3, bad_prepaid)]);
+        assert!(!state.peers.contains_key(&peer3));
+
+        // Sane values still adopted.
+        let peer4 = random_node_id();
+        state.reconcile(&[(peer4, make_remote_credit(100, 100, now))]);
+        assert!(state.peers.contains_key(&peer4));
     }
 }

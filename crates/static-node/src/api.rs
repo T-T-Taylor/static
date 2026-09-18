@@ -3,12 +3,12 @@
 //! Provides a simple JSON API over TCP for the CLI to interact
 //! with the running node (e.g., publishing and retrieving content).
 
-use anyhow::Result;
-use serde::{Serialize, Deserialize};
-use std::sync::Arc;
-use tokio::net::TcpListener;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::runner::NodeRunner;
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 /// A request to the local API
 #[derive(Serialize, Deserialize, Debug)]
@@ -27,6 +27,10 @@ pub struct ApiRequest {
     pub request_id: Option<String>,
     /// Transaction hash proving on-chain payment (for compute_confirm)
     pub tx_hash: Option<String>,
+    /// Bearer token for optional local-API auth (serde default for
+    /// backwards compatibility with old clients that send no token).
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 /// A response from the local API
@@ -65,16 +69,62 @@ pub struct ApiResponse {
     pub payment_amount: Option<u64>,
 }
 
-/// Start the local API server
+/// Serialize an API response without panicking.
+///
+/// `ApiResponse` serialization is infallible in practice, but a panic in
+/// a spawned connection task would kill that connection silently. Fall
+/// back to a minimal static error payload instead.
+fn serialize_response(resp: &ApiResponse) -> Vec<u8> {
+    serde_json::to_vec(resp).unwrap_or_else(|_| {
+        b"{\"status\":\"error\",\"message\":\"response serialization failed\"}".to_vec()
+    })
+}
+
+/// Check an incoming request's bearer token against the expected value.
+///
+/// - `None` expected: auth disabled, any request (with or without a token)
+///   is accepted.
+/// - `Some(expected)`: the request must carry `token == expected`,
+///   otherwise it is rejected. Comparison is a plain equality check on
+///   short bearer strings; the token is never logged.
+pub fn verify_token(request_token: Option<&str>, expected_token: Option<&str>) -> bool {
+    match expected_token {
+        None => true,
+        Some(expected) => request_token == Some(expected),
+    }
+}
+
+/// Start the local API server without token auth (backwards-compatible
+/// wrapper for existing callers such as `runner.rs`).
 pub async fn start_api_server(runner: Arc<NodeRunner>, addr: String) -> Result<()> {
+    start_api_server_with_token(runner, addr, None).await
+}
+
+/// Start the local API server, optionally requiring a bearer token.
+///
+/// When `expected_token` is `Some`, every [`ApiRequest`] must carry a
+/// matching `token` field or it is rejected with an `"error"` response
+/// before any action is performed.
+pub async fn start_api_server_with_token(
+    runner: Arc<NodeRunner>,
+    addr: String,
+    expected_token: Option<String>,
+) -> Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("Local API listening on {}", addr);
 
     loop {
         let (mut socket, _) = listener.accept().await?;
         let runner = runner.clone();
+        let expected_token = expected_token.clone();
 
         tokio::spawn(async move {
+            // 1MB single-read framing: the local CLI sends one JSON
+            // request per TCP connection and the server reads it in a
+            // single `read` call into a 1MB buffer. Requests larger than
+            // 1MB are truncated to the buffer (truncate-safe: JSON parse
+            // fails and an error response is returned rather than acting
+            // on a partial request).
             let mut buf = vec![0u8; 1024 * 1024]; // 1MB buffer for file data
             let n = match socket.read(&mut buf).await {
                 Ok(n) if n > 0 => n,
@@ -89,18 +139,27 @@ pub async fn start_api_server(runner: Arc<NodeRunner>, addr: String) -> Result<(
                         message: format!("Invalid request: {}", e),
                         ..Default::default()
                     };
-                    let _ = socket.write_all(&serde_json::to_vec(&resp).unwrap()).await;
+                    let _ = socket.write_all(&serialize_response(&resp)).await;
                     return;
                 }
             };
 
-            let response = handle_request(&runner, request).await;
-            let _ = socket.write_all(&serde_json::to_vec(&response).unwrap()).await;
+            let response = handle_request(&runner, request, expected_token.as_deref()).await;
+            let _ = socket.write_all(&serialize_response(&response)).await;
         });
     }
 }
 
-async fn handle_request(runner: &NodeRunner, request: ApiRequest) -> ApiResponse {
+async fn handle_request(
+    runner: &NodeRunner,
+    request: ApiRequest,
+    expected_token: Option<&str>,
+) -> ApiResponse {
+    // Token check comes first: reject unauthenticated requests before
+    // touching any node state.
+    if !verify_token(request.token.as_deref(), expected_token) {
+        return api_error("unauthorized: invalid or missing API token".into());
+    }
     match request.action.as_str() {
         "publish" => {
             let data_hex = request.data.unwrap_or_default();
@@ -156,17 +215,15 @@ async fn handle_request(runner: &NodeRunner, request: ApiRequest) -> ApiResponse
             };
             let currency = match request.compute_currency.as_deref() {
                 None => static_storage::compute::Currency::Monero,
-                Some(ticker) => {
-                    match static_storage::compute::Currency::from_str(ticker) {
-                        Some(c) => c,
-                        None => {
-                            return api_error(format!(
-                                "Unsupported currency '{}' (accepted: xmr, dark, nav)",
-                                ticker
-                            ))
-                        }
+                Some(ticker) => match static_storage::compute::Currency::from_str(ticker) {
+                    Some(c) => c,
+                    None => {
+                        return api_error(format!(
+                            "Unsupported currency '{}' (accepted: xmr, dark, nav)",
+                            ticker
+                        ))
                     }
-                }
+                },
             };
 
             match runner
@@ -253,7 +310,8 @@ async fn handle_request(runner: &NodeRunner, request: ApiRequest) -> ApiResponse
             match runner.confirm_compute_payment(&id_arr, tx_hash).await {
                 Ok(()) => ApiResponse {
                     status: "ok".into(),
-                    message: "Payment confirmation sent; waiting for blockchain confirmation".into(),
+                    message: "Payment confirmation sent; waiting for blockchain confirmation"
+                        .into(),
                     request_id: Some(hex_encode(&id_arr)),
                     ..Default::default()
                 },
@@ -291,8 +349,133 @@ fn hex_encode(data: &[u8]) -> String {
 }
 
 fn hex_decode(data: &str) -> Result<Vec<u8>> {
+    // Reject odd-length input up front: slicing `data[i..i+2]` below
+    // would panic on the trailing nibble.
+    if data.len() % 2 != 0 {
+        return Err(anyhow::anyhow!("Hex decode error: odd length"));
+    }
     (0..data.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&data[i..i+2], 16).map_err(|e| anyhow::anyhow!("Hex decode error: {}", e)))
+        .map(|i| {
+            u8::from_str_radix(&data[i..i + 2], 16)
+                .map_err(|e| anyhow::anyhow!("Hex decode error: {}", e))
+        })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hex_decode_odd_length_returns_err() {
+        assert!(hex_decode("abc").is_err());
+        assert!(hex_decode("0").is_err());
+        assert!(hex_decode("12345").is_err());
+        // Even-length inputs still work.
+        assert_eq!(hex_decode("").unwrap(), Vec::<u8>::new());
+        assert_eq!(hex_decode("00ff").unwrap(), vec![0x00, 0xff]);
+    }
+
+    #[test]
+    fn test_hex_decode_invalid_chars_returns_err() {
+        assert!(hex_decode("zz").is_err());
+        assert!(hex_decode("0g").is_err());
+    }
+
+    #[test]
+    fn test_verify_token_disabled_accepts_all() {
+        assert!(verify_token(None, None));
+        assert!(verify_token(Some("anything"), None));
+    }
+
+    #[test]
+    fn test_verify_token_bad_token_rejected() {
+        assert!(!verify_token(None, Some("secret")));
+        assert!(!verify_token(Some("wrong"), Some("secret")));
+        assert!(!verify_token(Some(""), Some("secret")));
+    }
+
+    #[test]
+    fn test_verify_token_good_token_accepted() {
+        assert!(verify_token(Some("secret"), Some("secret")));
+    }
+
+    #[test]
+    fn test_api_request_token_serde_default() {
+        // Old clients send no `token` field; it must default to None.
+        let req: ApiRequest = serde_json::from_str(r#"{"action":"retrieve"}"#).unwrap();
+        assert_eq!(req.token, None);
+        let req: ApiRequest =
+            serde_json::from_str(r#"{"action":"retrieve","token":"abc"}"#).unwrap();
+        assert_eq!(req.token.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn test_serialize_response_never_panics() {
+        let resp = ApiResponse {
+            status: "ok".into(),
+            message: "hi".into(),
+            ..Default::default()
+        };
+        let bytes = serialize_response(&resp);
+        let back: ApiResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.status, "ok");
+    }
+
+    async fn test_runner() -> NodeRunner {
+        let config = crate::NodeConfig::default();
+        NodeRunner::new(config, [0x42u8; 16], static_sphinx::MixNode::new())
+    }
+
+    fn req_with_token(action: &str, token: Option<&str>) -> ApiRequest {
+        ApiRequest {
+            action: action.to_string(),
+            data: None,
+            content_pub_key: None,
+            compute_currency: None,
+            request_id: None,
+            tx_hash: None,
+            token: token.map(|s| s.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_bad_token_rejected_before_action() {
+        let runner = test_runner().await;
+        // Unknown action would return "Unknown action" if auth passed;
+        // with a bad token it must return unauthorized instead.
+        let resp = handle_request(&runner, req_with_token("nope", None), Some("secret")).await;
+        assert_eq!(resp.status, "error");
+        assert!(resp.message.contains("unauthorized"));
+
+        let resp = handle_request(
+            &runner,
+            req_with_token("nope", Some("wrong")),
+            Some("secret"),
+        )
+        .await;
+        assert_eq!(resp.status, "error");
+        assert!(resp.message.contains("unauthorized"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_good_token_passes_auth() {
+        let runner = test_runner().await;
+        let resp = handle_request(
+            &runner,
+            req_with_token("nope", Some("secret")),
+            Some("secret"),
+        )
+        .await;
+        assert_eq!(resp.status, "error");
+        assert_eq!(resp.message, "Unknown action");
+    }
+
+    #[tokio::test]
+    async fn test_handle_request_no_auth_configured() {
+        let runner = test_runner().await;
+        let resp = handle_request(&runner, req_with_token("nope", None), None).await;
+        assert_eq!(resp.message, "Unknown action");
+    }
 }

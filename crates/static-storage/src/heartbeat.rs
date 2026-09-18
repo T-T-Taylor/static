@@ -31,6 +31,9 @@ pub const DEFAULT_LEASE_DURATION_SECS: u64 = 86400;
 /// Lease renewal grace period (2 hours after expiry before repopulation)
 pub const GRACE_PERIOD_SECS: u64 = 7200;
 
+/// Heartbeat message type (Sphinx body dispatch, Phase 1)
+pub const MSG_HEARTBEAT: u8 = 0x0A;
+
 /// Get current unix timestamp
 fn current_timestamp() -> u64 {
     SystemTime::now()
@@ -148,6 +151,25 @@ impl Heartbeat {
             nonce,
         })
     }
+
+    /// Serialize as a Sphinx body payload (type byte + heartbeat fields)
+    pub fn wire_serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + self.serialize().len());
+        buf.push(MSG_HEARTBEAT);
+        buf.extend_from_slice(&self.serialize());
+        buf
+    }
+
+    /// Deserialize a Sphinx body payload (type byte + heartbeat fields)
+    pub fn wire_deserialize(data: &[u8]) -> Result<Self, StorageError> {
+        if data.is_empty() || data[0] != MSG_HEARTBEAT {
+            return Err(StorageError::InvalidChunkSize {
+                expected: MSG_HEARTBEAT as usize,
+                actual: data.first().copied().unwrap_or(0) as usize,
+            });
+        }
+        Self::deserialize(&data[1..])
+    }
 }
 
 /// Lease manager for tracking active leases
@@ -246,6 +268,67 @@ impl LeaseManager {
                 self.leases.insert(*chunk_id, lease);
                 renewed.push(*chunk_id);
             }
+        }
+
+        Ok(renewed)
+    }
+
+    /// Process a heartbeat with upsert semantics (Phase 1)
+    ///
+    /// Token-checked refresh for existing leases; for chunks without a
+    /// lease, creates one capped at `current_time +
+    /// DEFAULT_LEASE_DURATION_SECS`. Callers must gate on chunks the node
+    /// actually holds (pass them via `held_chunks`) so heartbeats cannot
+    /// conjure leases for absent data.
+    ///
+    /// A forged heartbeat can only extend how long the node keeps data it
+    /// already holds, bounded by one lease duration. Future hardening:
+    /// require the content owner's Ed25519 signature on the heartbeat.
+    pub fn process_heartbeat_upsert(
+        &mut self,
+        heartbeat: &Heartbeat,
+        current_time: u64,
+        held_chunks: &std::collections::HashSet<ChunkId>,
+    ) -> Result<Vec<ChunkId>, HeartbeatError> {
+        // Check for replay (shared with process_heartbeat)
+        if let Some(&seen_time) = self.seen_nonces.get(&heartbeat.nonce) {
+            return Err(HeartbeatError::ReplayDetected(seen_time));
+        }
+        self.seen_nonces.insert(heartbeat.nonce, current_time);
+
+        // Expiry sanity: never accept absurd expirations.
+        let max_expires = current_time.saturating_add(DEFAULT_LEASE_DURATION_SECS);
+        let expires_at = heartbeat.new_expires_at.min(max_expires);
+
+        let mut renewed = Vec::new();
+        for chunk_id in &heartbeat.chunk_ids {
+            // Only formalize holdings: no lease for data we don't have.
+            if !held_chunks.contains(chunk_id) {
+                continue;
+            }
+            match self.leases.get_mut(chunk_id) {
+                Some(lease) => {
+                    // Existing lease: token-checked refresh (same as
+                    // process_heartbeat).
+                    if lease.renewal_token != heartbeat.renewal_token {
+                        return Err(HeartbeatError::InvalidToken);
+                    }
+                    lease.expires_at = expires_at;
+                }
+                None => {
+                    // Upsert: first heartbeat for a chunk received via
+                    // swap barter (no lease existed yet).
+                    self.leases.insert(
+                        *chunk_id,
+                        ChunkLease {
+                            chunk_id: *chunk_id,
+                            expires_at,
+                            renewal_token: heartbeat.renewal_token,
+                        },
+                    );
+                }
+            }
+            renewed.push(*chunk_id);
         }
 
         Ok(renewed)
@@ -496,6 +579,107 @@ mod tests {
     fn test_heartbeat_deserialize_too_short() {
         let result = Heartbeat::deserialize(&[0u8; 10]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_heartbeat_wire_roundtrip() {
+        let content_id = random_content_id();
+        let token = [0x7eu8; 32];
+        let chunk_ids = vec![random_chunk_id(), random_chunk_id()];
+
+        let heartbeat = Heartbeat::new(content_id, token, chunk_ids.clone(), 3600);
+        let wire = heartbeat.wire_serialize();
+
+        assert_eq!(wire[0], MSG_HEARTBEAT);
+        let deserialized = Heartbeat::wire_deserialize(&wire).unwrap();
+        assert_eq!(deserialized.content_id, content_id);
+        assert_eq!(deserialized.renewal_token, token);
+        assert_eq!(deserialized.chunk_ids, chunk_ids);
+        assert_eq!(deserialized.new_expires_at, heartbeat.new_expires_at);
+    }
+
+    #[test]
+    fn test_heartbeat_wire_wrong_type() {
+        assert!(Heartbeat::wire_deserialize(&[0x09u8; 40]).is_err());
+        assert!(Heartbeat::wire_deserialize(&[]).is_err());
+    }
+
+    #[test]
+    fn test_heartbeat_upsert_creates_lease_for_held_chunk() {
+        let mut manager = LeaseManager::new();
+        let content_id = random_content_id();
+        let chunk_id = random_chunk_id();
+        let token = [0x11u8; 32];
+
+        let heartbeat = Heartbeat::new(content_id, token, vec![chunk_id], 3600);
+
+        // Chunk held, no lease yet: upsert creates one.
+        let mut held = std::collections::HashSet::new();
+        held.insert(chunk_id);
+        let renewed = manager
+            .process_heartbeat_upsert(&heartbeat, current_timestamp(), &held)
+            .unwrap();
+        assert_eq!(renewed, vec![chunk_id]);
+
+        let lease = manager.leases.get(&chunk_id).unwrap();
+        assert_eq!(lease.renewal_token, token);
+        assert!(lease.expires_at <= current_timestamp() + DEFAULT_LEASE_DURATION_SECS);
+    }
+
+    #[test]
+    fn test_heartbeat_upsert_ignores_unheld_chunks() {
+        let mut manager = LeaseManager::new();
+        let content_id = random_content_id();
+        let chunk_id = random_chunk_id();
+
+        let heartbeat = Heartbeat::new(content_id, [0x22u8; 32], vec![chunk_id], 3600);
+
+        // Chunk NOT held: no lease may be conjured.
+        let renewed = manager
+            .process_heartbeat_upsert(&heartbeat, current_timestamp(), &std::collections::HashSet::new())
+            .unwrap();
+        assert!(renewed.is_empty());
+        assert!(manager.leases.get(&chunk_id).is_none());
+    }
+
+    #[test]
+    fn test_heartbeat_upsert_caps_expiration() {
+        let mut manager = LeaseManager::new();
+        let content_id = random_content_id();
+        let chunk_id = random_chunk_id();
+
+        // Absurd expiry (100 years out) must be capped at now + duration.
+        let mut heartbeat = Heartbeat::new(content_id, [0x33u8; 32], vec![chunk_id], 3600);
+        heartbeat.new_expires_at = current_timestamp() + 100 * 365 * 86400;
+
+        let mut held = std::collections::HashSet::new();
+        held.insert(chunk_id);
+        manager
+            .process_heartbeat_upsert(&heartbeat, current_timestamp(), &held)
+            .unwrap();
+
+        let lease = manager.leases.get(&chunk_id).unwrap();
+        assert!(lease.expires_at <= current_timestamp() + DEFAULT_LEASE_DURATION_SECS);
+    }
+
+    #[test]
+    fn test_heartbeat_upsert_rejects_wrong_token_on_existing_lease() {
+        let mut manager = LeaseManager::new();
+        let content_id = random_content_id();
+        let chunk_id = random_chunk_id();
+        let master = SymmetricKey::random();
+
+        let lease = create_lease(&chunk_id, &master, 3600, current_timestamp());
+        manager.add_lease(chunk_id, lease);
+
+        // Tampered token on an existing lease must be rejected.
+        let mut heartbeat = Heartbeat::new(content_id, [0x44u8; 32], vec![chunk_id], 3600);
+        heartbeat.renewal_token[0] ^= 0xff;
+
+        let mut held = std::collections::HashSet::new();
+        held.insert(chunk_id);
+        let result = manager.process_heartbeat_upsert(&heartbeat, current_timestamp(), &held);
+        assert!(matches!(result, Err(HeartbeatError::InvalidToken)));
     }
 
     #[test]

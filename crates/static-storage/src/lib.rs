@@ -36,6 +36,9 @@ pub mod hidden_service;
 /// Chunk repair protocol
 pub mod repair;
 
+/// Missing-chunk gossip for active reseed (Phase 1)
+pub mod gossip;
+
 /// Hot storage rotation — Freenet-style chunk migration
 pub mod rotation;
 
@@ -500,37 +503,36 @@ pub fn erasure_decode(
 /// The lease includes a renewal token that the owner uses to refresh.
 /// The token is derived from the master key and chunk ID.
 pub fn create_lease(
-    chunk_id: &ChunkId,
+    _chunk_id: &ChunkId,
     master_key: &SymmetricKey,
     duration_secs: u64,
     current_time: u64,
 ) -> ChunkLease {
+    // Phase 0 L4 fix: content-level token (master-derived only, not
+    // per-chunk) so one heartbeat renews all chunks of a content.
+    // `chunk_id` retained in signature for compat, not used in derivation.
     let token_key = master_key.derive("lease_token");
-    let mut input = Vec::with_capacity(CHUNK_ID_SIZE + 32);
-    input.extend_from_slice(chunk_id);
-    input.extend_from_slice(&token_key.bytes);
-    let token_hash = blake3::hash(&input);
+    let token_hash = blake3::hash(&token_key.bytes);
     let mut renewal_token = [0u8; 32];
     renewal_token.copy_from_slice(token_hash.as_bytes());
 
     ChunkLease {
-        chunk_id: *chunk_id,
+        chunk_id: *_chunk_id,
         expires_at: current_time + duration_secs,
         renewal_token,
     }
 }
 
 /// Verify a renewal token for a chunk.
+///
+/// Phase 0 L4: content-level token, chunk-agnostic (matches `create_lease`).
 pub fn verify_renewal_token(
-    chunk_id: &ChunkId,
+    _chunk_id: &ChunkId,
     master_key: &SymmetricKey,
     token: &[u8; 32],
 ) -> bool {
     let token_key = master_key.derive("lease_token");
-    let mut input = Vec::with_capacity(CHUNK_ID_SIZE + 32);
-    input.extend_from_slice(chunk_id);
-    input.extend_from_slice(&token_key.bytes);
-    let expected_hash = blake3::hash(&input);
+    let expected_hash = blake3::hash(&token_key.bytes);
     let mut expected = [0u8; 32];
     expected.copy_from_slice(expected_hash.as_bytes());
     expected == *token

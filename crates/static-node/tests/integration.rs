@@ -7,7 +7,7 @@ use static_mesh::transport::{
     start_listener, connect_to_peer, send_sphinx,
 };
 use static_storage::swap::StorageCapacity;
-use static_mesh::retrieval::{create_anonymous_request, RetrievalManager};
+use static_mesh::retrieval::{create_anonymous_request_hybrid, RetrievalManager};
 use static_mesh::wire::WireMessage;
 use static_mesh::CoverTrafficConfig;
 use static_sphinx::{
@@ -23,13 +23,13 @@ async fn setup_node(port: u16) -> (Arc<TransportState>, mpsc::Receiver<InboundMe
         10 * 1024 * 1024 * 1024,
     )));
     let (state, rx) = create_transport_state(node_id, mix_node, cover_config, capacity);
-    
+
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
     let state_clone = state.clone();
     tokio::spawn(async move {
         let _ = start_listener(addr, state_clone).await;
     });
-    
+
     tokio::time::sleep(Duration::from_millis(100)).await;
     (state, rx)
 }
@@ -54,15 +54,20 @@ async fn test_anonymous_retrieval_over_tcp() {
         holder.add_chunk(chunk_id, chunk_data.clone(), [0u8; 32]);
     }
 
-    // Get node info for routing
+    // Get node info for routing (hybrid-only: A must advertise KEM key)
     let a_pubkey = node_a.mix_node.lock().await.public_key;
+    let a_kem = node_a.kem.lock().await.public_bytes();
     let a_node_id = node_a.node_id;
     let b_node_id = node_b.node_id;
     let b_pubkey = node_b.mix_node.lock().await.public_key;
 
-    // Node B builds forward route to Node A
-    let forward_route = Route {
-        hops: vec![RouteHop { public_key: a_pubkey, node_id: a_node_id }],
+    // Node B builds hybrid forward route to Node A
+    let hybrid_forward = static_sphinx::HybridRoute {
+        hops: vec![static_sphinx::HybridRouteHop {
+            node_id: a_node_id,
+            classical_public_key: a_pubkey,
+            kem_public_key: a_kem,
+        }],
         destination: a_node_id,
     };
 
@@ -72,8 +77,8 @@ async fn test_anonymous_retrieval_over_tcp() {
         destination: b_node_id,
     };
 
-    // Create anonymous request
-    let request_packet = create_anonymous_request(chunk_id, &return_route, &forward_route).unwrap();
+    // Create anonymous request (hybrid v1 — classical rejected since Phase 0)
+    let request_packet = create_anonymous_request_hybrid(chunk_id, &return_route, &hybrid_forward).unwrap();
 
     // Send request to Node A
     send_sphinx(&node_b, a_node_id, request_packet).await.unwrap();

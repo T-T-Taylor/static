@@ -66,24 +66,87 @@ pub const HYBRID_MAX_MESSAGE_SIZE: usize = MAX_MESSAGE_SIZE
     + 4
     + static_sphinx::MAX_HOPS * static_sphinx::HYBRID_KEM_CIPHERTEXT_SIZE;
 
+/// Padded uniform wire size (Phase 0, C3).
+///
+/// After the hybrid-only mandate every outer message is padded to
+/// `HYBRID_MAX_MESSAGE_SIZE` so gossip/swap/prepayment/reconciliation are
+/// indistinguishable by size from Sphinx packets.
+pub const PADDED_MESSAGE_SIZE: usize = HYBRID_MAX_MESSAGE_SIZE;
+
 /// A handshake message exchanged when peers connect
+///
+/// Phase 0 unified format (one wire break): no bandwidth-tier field —
+/// peers infer tier from observed cover rate. Carries an Ed25519
+/// identity key plus nonce/signature proving possession of the identity
+/// private key. `signing_bytes` covers node_id, mix public key, KEM key,
+/// compute flags, identity key and nonce.
 #[derive(Debug, Clone)]
 pub struct Handshake {
     /// The sending node's ID
     pub node_id: NodeId,
-    /// The sending node's public key (Montgomery point bytes)
+    /// The sending node's public key (Montgomery point bytes, Sphinx)
     pub public_key: [u8; 32],
-    /// The sending node's bandwidth tier
-    pub tier: crate::BandwidthTier,
     /// The sending node's ML-KEM-768 public key (for hybrid Sphinx)
     ///
-    /// `None` for legacy (classical-only) peers. Serialized as trailing
-    /// bytes: absent in 49-byte legacy handshakes, present afterwards.
+    /// `None` for legacy (classical-only) peers. Hybrid-only networks
+    /// require `Some`.
     pub kem_public_key: Option<Vec<u8>>,
     /// Whether the sending node accepts compute requests
     pub compute_enabled: bool,
     /// Maximum concurrent compute executions on the sending node
     pub compute_capacity: u8,
+    /// Ed25519 identity public key (authentication, not Sphinx encryption)
+    pub identity_public_key: [u8; 32],
+    /// Random nonce for challenge-response / replay protection
+    pub nonce: [u8; 32],
+    /// Ed25519 signature over [`Handshake::signing_bytes`]
+    pub signature: Vec<u8>,
+}
+
+impl Handshake {
+    /// Bytes covered by the handshake signature.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let kem = self.kem_public_key.as_deref().unwrap_or(&[]);
+        let mut buf = Vec::with_capacity(16 + 32 + 2 + kem.len() + 2 + 32 + 32);
+        buf.extend_from_slice(&self.node_id);
+        buf.extend_from_slice(&self.public_key);
+        buf.extend_from_slice(&(kem.len() as u16).to_be_bytes());
+        buf.extend_from_slice(kem);
+        buf.push(u8::from(self.compute_enabled));
+        buf.push(self.compute_capacity);
+        buf.extend_from_slice(&self.identity_public_key);
+        buf.extend_from_slice(&self.nonce);
+        buf
+    }
+
+    /// Sign this handshake with the node's Ed25519 private key.
+    pub fn sign(&mut self, signing_key: &ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        self.identity_public_key = signing_key.verifying_key().to_bytes();
+        let sig = signing_key.sign(&self.signing_bytes());
+        self.signature = sig.to_bytes().to_vec();
+    }
+
+    /// Verify the handshake signature and basic field sanity.
+    pub fn verify(&self) -> bool {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        if self.signature.len() != 64 {
+            return false;
+        }
+        let Ok(pk) = VerifyingKey::from_bytes(&self.identity_public_key) else {
+            return false;
+        };
+        let mut arr = [0u8; 64];
+        arr.copy_from_slice(&self.signature);
+        let sig = Signature::from_bytes(&arr);
+        // Enforce KEM key size when present (ML-KEM-768 pubkey).
+        if let Some(kem) = &self.kem_public_key {
+            if kem.len() != static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE {
+                return false;
+            }
+        }
+        pk.verify(&self.signing_bytes(), &sig).is_ok()
+    }
 }
 
 /// A wire message
@@ -112,6 +175,7 @@ pub enum WireMessage {
 /// Sent as direct wire maintenance traffic (like gossip), not
 /// Sphinx-wrapped. The sponsored chunks themselves are Sphinx-wrapped
 /// for privacy; the prepayment record is accounting metadata.
+/// Authenticated with Ed25519 over (from_node || bytes || content_id).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Prepayment {
     /// The sending node's ID
@@ -120,19 +184,58 @@ pub struct Prepayment {
     pub bytes: u64,
     /// Content ID this prepayment is for
     pub content_id: [u8; 32],
+    /// Ed25519 identity public key of the seed node
+    pub identity_public_key: [u8; 32],
     /// Signature proving the seed-only node authorized this payment
     pub signature: Vec<u8>,
 }
 
 impl Prepayment {
-    /// Validate the prepayment fields (stub signature check)
-    ///
-    /// Currently checks non-zero bytes and non-empty signature.
-    /// TODO: Add ed25519-dalek for real signature verification
-    /// (deferred until post-quantum signature pass, TODO item 7).
+    /// Bytes covered by the prepayment signature.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(16 + 8 + 32);
+        buf.extend_from_slice(&self.from_node);
+        buf.extend_from_slice(&self.bytes.to_be_bytes());
+        buf.extend_from_slice(&self.content_id);
+        buf
+    }
+
+    /// Create a signed prepayment.
+    pub fn sign(
+        from_node: NodeId,
+        bytes: u64,
+        content_id: [u8; 32],
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Self {
+        use ed25519_dalek::Signer;
+        let identity_public_key = signing_key.verifying_key().to_bytes();
+        let proto = Self {
+            from_node,
+            bytes,
+            content_id,
+            identity_public_key,
+            signature: vec![],
+        };
+        let sig = signing_key.sign(&proto.signing_bytes());
+        Self {
+            signature: sig.to_bytes().to_vec(),
+            ..proto
+        }
+    }
+
+    /// Validate the prepayment fields with real Ed25519 verification.
     pub fn validate(&self) -> bool {
-        // TODO: Add ed25519-dalek for real signature verification
-        self.bytes > 0 && !self.signature.is_empty()
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        if self.bytes == 0 || self.signature.len() != 64 {
+            return false;
+        }
+        let Ok(pk) = VerifyingKey::from_bytes(&self.identity_public_key) else {
+            return false;
+        };
+        let mut arr = [0u8; 64];
+        arr.copy_from_slice(&self.signature);
+        let sig = Signature::from_bytes(&arr);
+        pk.verify(&self.signing_bytes(), &sig).is_ok()
     }
 }
 
@@ -168,6 +271,8 @@ pub struct ReconciliationEntry {
 /// Large peer sets are split into batches of at most
 /// [`MAX_RECONCILIATION_ENTRIES`] entries; receivers process batches
 /// sequentially since reconciliation is idempotent.
+/// Authenticated: `signature` is Ed25519 over (from_node || timestamp ||
+/// blake3(entries_json)) with `identity_public_key`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AccountingReconciliation {
     /// The sending node's ID
@@ -180,6 +285,62 @@ pub struct AccountingReconciliation {
     pub total_bytes_received: u64,
     /// Timestamp of this reconciliation message
     pub timestamp: u64,
+    /// Ed25519 identity public key of the sender
+    #[serde(default)]
+    pub identity_public_key: [u8; 32],
+    /// Ed25519 signature over [`AccountingReconciliation::signing_bytes`]
+    #[serde(default)]
+    pub signature: Vec<u8>,
+}
+
+impl AccountingReconciliation {
+    /// Bytes covered by the reconciliation signature.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let entries_json = serde_json::to_vec(&self.peer_credits).unwrap_or_default();
+        let digest = blake3::hash(&entries_json);
+        let mut buf = Vec::with_capacity(16 + 8 + 32);
+        buf.extend_from_slice(&self.from_node);
+        buf.extend_from_slice(&self.timestamp.to_be_bytes());
+        buf.extend_from_slice(digest.as_bytes());
+        buf
+    }
+
+    /// Sign this reconciliation message.
+    pub fn sign(&mut self, signing_key: &ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        self.identity_public_key = signing_key.verifying_key().to_bytes();
+        let sig = signing_key.sign(&self.signing_bytes());
+        self.signature = sig.to_bytes().to_vec();
+    }
+
+    /// Verify sender signature + basic sanity (timestamp not far future,
+    /// entry count within batch cap).
+    pub fn verify(&self, now_secs: u64) -> bool {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        if self.peer_credits.len() > MAX_RECONCILIATION_ENTRIES {
+            return false;
+        }
+        // Future-timestamp bound: reject >5 minutes in the future (LWW abuse).
+        if self.timestamp > now_secs.saturating_add(300) {
+            return false;
+        }
+        if self.signature.len() != 64 {
+            return false;
+        }
+        let Ok(pk) = VerifyingKey::from_bytes(&self.identity_public_key) else {
+            return false;
+        };
+        let mut arr = [0u8; 64];
+        arr.copy_from_slice(&self.signature);
+        let sig = Signature::from_bytes(&arr);
+        // Sanity: per-entry values must be plausible (no u64::MAX inflation).
+        for e in &self.peer_credits {
+            if e.bytes_served > (1u64 << 60) || e.bytes_received > (1u64 << 60) || e.prepaid_bytes > (1u64 << 60) {
+                return false;
+            }
+        }
+        pk.verify(&self.signing_bytes(), &sig).is_ok()
+    }
 }
 
 /// Errors that can occur during wire protocol operations
@@ -214,84 +375,86 @@ pub enum WireError {
 
 /// Serialize a handshake message into a bytes buffer
 ///
-/// Layout: `[16 node_id][32 public_key][1 tier][kem bytes?][2 compute]`.
-/// The final two bytes are always `compute_enabled` and `compute_capacity`;
-/// everything between the fixed 49-byte prefix and those two bytes is the
-/// KEM public key (empty for classical-only peers).
+/// Layout: `[16 node_id][32 mix_pub][2 kem_len][kem][1 compute_en]
+/// [1 compute_cap][32 identity_pub][32 nonce][64 signature]`.
 fn serialize_handshake(handshake: &Handshake) -> Vec<u8> {
     let kem_len = handshake.kem_public_key.as_ref().map(|k| k.len()).unwrap_or(0);
-    let mut buf = Vec::with_capacity(16 + 32 + 1 + kem_len + 2);
+    let mut buf = Vec::with_capacity(16 + 32 + 2 + kem_len + 2 + 32 + 32 + 64);
     buf.extend_from_slice(&handshake.node_id);
     buf.extend_from_slice(&handshake.public_key);
-    buf.push(handshake.tier as u8);
+    buf.extend_from_slice(&(kem_len as u16).to_be_bytes());
     if let Some(kem) = &handshake.kem_public_key {
         buf.extend_from_slice(kem);
     }
     buf.push(u8::from(handshake.compute_enabled));
     buf.push(handshake.compute_capacity);
+    buf.extend_from_slice(&handshake.identity_public_key);
+    buf.extend_from_slice(&handshake.nonce);
+    // Signature must be exactly 64 bytes; pad/truncate defensively (sign
+    // always produces 64, this only affects malformed in-memory values).
+    let mut sig = [0u8; 64];
+    let n = handshake.signature.len().min(64);
+    sig[..n].copy_from_slice(&handshake.signature[..n]);
+    buf.extend_from_slice(&sig);
     buf
 }
 
-/// Deserialize a handshake message from a bytes buffer
-///
-/// Accepts legacy layouts (49-byte classical, 49+kem-byte hybrid) and maps
-/// them to compute-disabled defaults; handshakes of at least 51 bytes carry
-/// the two compute capability bytes at the end.
+/// Deserialize a handshake message from a bytes buffer (unified format only).
 fn deserialize_handshake(data: &[u8]) -> Result<Handshake, WireError> {
-    if data.len() < 16 + 32 + 1 {
+    const MIN: usize = 16 + 32 + 2 + 2 + 32 + 32 + 64;
+    if data.len() < MIN {
         return Err(WireError::BufferTooShort {
-            needed: 49,
+            needed: MIN,
             have: data.len(),
         });
     }
-
+    let mut offset = 0;
     let mut node_id = [0u8; 16];
-    node_id.copy_from_slice(&data[..16]);
-
+    node_id.copy_from_slice(&data[offset..offset + 16]);
+    offset += 16;
     let mut public_key = [0u8; 32];
-    public_key.copy_from_slice(&data[16..48]);
-
-    let tier = match data[48] {
-        0 => crate::BandwidthTier::Low,
-        1 => crate::BandwidthTier::Standard,
-        2 => crate::BandwidthTier::High,
-        _ => return Err(WireError::InvalidMessageType(data[48])), // Reusing error type for simplicity
-    };
-
-    // Compute capability (2 trailing bytes) and KEM key (everything between
-    // the fixed prefix and the compute bytes) are disambiguated by length.
-    // The exact legacy hybrid length is matched first so pre-compute peers'
-    // KEM keys are never mistaken for compute bytes.
-    const KEM_SIZE: usize = static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE;
-    let (kem_public_key, compute_enabled, compute_capacity) = if data.len() == 49 {
-        (None, false, 0)
-    } else if data.len() == 49 + KEM_SIZE {
-        // Legacy hybrid peer: KEM key only, no compute capability.
-        (Some(data[49..].to_vec()), false, 0)
-    } else if data.len() >= 51 {
-        let compute_enabled = data[data.len() - 2] == 1;
-        let compute_capacity = data[data.len() - 1];
-        let kem = &data[49..data.len() - 2];
-        (
-            if kem.is_empty() {
-                None
-            } else {
-                Some(kem.to_vec())
-            },
-            compute_enabled,
-            compute_capacity,
-        )
+    public_key.copy_from_slice(&data[offset..offset + 32]);
+    offset += 32;
+    let kem_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+    offset += 2;
+    if kem_len > 4096 || data.len() < offset + kem_len + 2 + 32 + 32 + 64 {
+        return Err(WireError::BufferTooShort {
+            needed: offset + kem_len + 2 + 32 + 32 + 64,
+            have: data.len(),
+        });
+    }
+    let kem_public_key = if kem_len == 0 {
+        None
     } else {
-        (None, false, 0)
+        Some(data[offset..offset + kem_len].to_vec())
     };
+    offset += kem_len;
+    let compute_enabled = data[offset] == 1;
+    let compute_capacity = data[offset + 1];
+    offset += 2;
+    let mut identity_public_key = [0u8; 32];
+    identity_public_key.copy_from_slice(&data[offset..offset + 32]);
+    offset += 32;
+    let mut nonce = [0u8; 32];
+    nonce.copy_from_slice(&data[offset..offset + 32]);
+    offset += 32;
+    if data.len() < offset + 64 {
+        return Err(WireError::BufferTooShort {
+            needed: offset + 64,
+            have: data.len(),
+        });
+    }
+    let signature = data[offset..offset + 64].to_vec();
 
     Ok(Handshake {
         node_id,
         public_key,
-        tier,
         kem_public_key,
         compute_enabled,
         compute_capacity,
+        identity_public_key,
+        nonce,
+        signature,
     })
 }
 
@@ -420,8 +583,9 @@ fn deserialize_sphinx(data: &[u8]) -> Result<SphinxPacket, WireError> {
 /// Serialize a wire message into a framed byte buffer
 ///
 /// Format: [1 byte type] [4 bytes payload length] [N bytes payload]
+/// (+ zero padding to uniform size for maintenance messages).
 pub fn serialize_message(msg: &WireMessage) -> Result<Vec<u8>, WireError> {
-    let (msg_type, payload) = match msg {
+    let (msg_type, mut payload) = match msg {
         WireMessage::Handshake(hs) => (MSG_HANDSHAKE, serialize_handshake(hs)),
         WireMessage::Sphinx(pkt) => (MSG_SPHINX, serialize_sphinx(pkt)),
         WireMessage::Gossip(g) => (MSG_GOSSIP, serde_json::to_vec(g).map_err(|_| WireError::InvalidMessageType(0))?),
@@ -432,12 +596,28 @@ pub fn serialize_message(msg: &WireMessage) -> Result<Vec<u8>, WireError> {
         WireMessage::AccountingReconciliation(r) => (MSG_ACCOUNTING_RECONCILIATION, serde_json::to_vec(r).map_err(|_| WireError::InvalidMessageType(0))?),
     };
 
+    // Pad maintenance messages to the uniform hybrid size (C3) so an
+    // observer cannot distinguish gossip/swap/prepay/reconcile by length.
+    // Sphinx payloads are left as-is (already size-realistic). Handshakes
+    // are left unpadded (variable KEM length is inherent to the handshake;
+    // tier no longer leaks, KEM presence is required post-mandate).
+    if !matches!(msg, WireMessage::Sphinx(_) | WireMessage::Handshake(_)) {
+        if payload.len() > PADDED_MESSAGE_SIZE {
+            return Err(WireError::MessageTooLarge {
+                size: 1 + 4 + payload.len(),
+                max: 1 + 4 + PADDED_MESSAGE_SIZE,
+            });
+        }
+        payload.resize(PADDED_MESSAGE_SIZE, 0);
+    }
+
     let total_len = 1 + 4 + payload.len();
     // Sphinx packets have their own (larger, version-aware) cap since
     // hybrid packets carry ML-KEM ciphertexts.
     let max = match msg {
         WireMessage::Sphinx(_) => HYBRID_MAX_MESSAGE_SIZE,
-        _ => MAX_MESSAGE_SIZE,
+        WireMessage::Handshake(_) => HYBRID_MAX_MESSAGE_SIZE,
+        _ => 1 + 4 + PADDED_MESSAGE_SIZE,
     };
     if total_len > max {
         return Err(WireError::MessageTooLarge {
@@ -481,6 +661,16 @@ pub fn deserialize_message(data: &[u8]) -> Result<(WireMessage, usize), WireErro
 
     let payload = &data[5..total_len];
 
+    // Maintenance messages are zero-padded to PADDED_MESSAGE_SIZE; strip
+    // trailing zeros before JSON parsing. Sphinx/handshake are binary.
+    fn trim_padded(p: &[u8]) -> &[u8] {
+        let mut end = p.len();
+        while end > 0 && p[end - 1] == 0 {
+            end -= 1;
+        }
+        &p[..end]
+    }
+
     let message = match msg_type {
         MSG_HANDSHAKE => {
             WireMessage::Handshake(deserialize_handshake(payload)?)
@@ -489,22 +679,22 @@ pub fn deserialize_message(data: &[u8]) -> Result<(WireMessage, usize), WireErro
             WireMessage::Sphinx(deserialize_sphinx(payload)?)
         }
         MSG_GOSSIP => {
-            WireMessage::Gossip(serde_json::from_slice(payload).map_err(|_| WireError::InvalidMessageType(msg_type))?)
+            WireMessage::Gossip(serde_json::from_slice(trim_padded(payload)).map_err(|_| WireError::InvalidMessageType(msg_type))?)
         }
         MSG_SWAP_PROPOSAL => {
-            WireMessage::SwapProposal(serde_json::from_slice(payload).map_err(|_| WireError::InvalidMessageType(msg_type))?)
+            WireMessage::SwapProposal(serde_json::from_slice(trim_padded(payload)).map_err(|_| WireError::InvalidMessageType(msg_type))?)
         }
         MSG_SWAP_ACCEPT => {
-            WireMessage::SwapAccept(serde_json::from_slice(payload).map_err(|_| WireError::InvalidMessageType(msg_type))?)
+            WireMessage::SwapAccept(serde_json::from_slice(trim_padded(payload)).map_err(|_| WireError::InvalidMessageType(msg_type))?)
         }
         MSG_SWAP_REJECT => {
-            WireMessage::SwapReject(serde_json::from_slice(payload).map_err(|_| WireError::InvalidMessageType(msg_type))?)
+            WireMessage::SwapReject(serde_json::from_slice(trim_padded(payload)).map_err(|_| WireError::InvalidMessageType(msg_type))?)
         }
         MSG_PREPAYMENT => {
-            WireMessage::Prepayment(serde_json::from_slice(payload).map_err(|_| WireError::InvalidMessageType(msg_type))?)
+            WireMessage::Prepayment(serde_json::from_slice(trim_padded(payload)).map_err(|_| WireError::InvalidMessageType(msg_type))?)
         }
         MSG_ACCOUNTING_RECONCILIATION => {
-            WireMessage::AccountingReconciliation(serde_json::from_slice(payload).map_err(|_| WireError::InvalidMessageType(msg_type))?)
+            WireMessage::AccountingReconciliation(serde_json::from_slice(trim_padded(payload)).map_err(|_| WireError::InvalidMessageType(msg_type))?)
         }
         _ => return Err(WireError::InvalidMessageType(msg_type)),
     };
@@ -517,6 +707,9 @@ pub fn deserialize_message(data: &[u8]) -> Result<(WireMessage, usize), WireErro
 /// This is used by the async transport to parse incoming data.
 /// Returns Ok(Some(message)) if a complete message is available,
 /// Ok(None) if more data is needed, or Err on protocol error.
+/// Enforces a length cap before buffering (DoS bound, C5): any
+/// payload length exceeding PADDED_MESSAGE_SIZE is rejected immediately
+/// instead of waiting for gigabytes.
 pub fn try_read_message(buf: &mut BytesMut) -> Result<Option<WireMessage>, WireError> {
     if buf.len() < 5 {
         return Ok(None);
@@ -526,6 +719,13 @@ pub fn try_read_message(buf: &mut BytesMut) -> Result<Option<WireMessage>, WireE
     let payload_len = u32::from_be_bytes([
         buf[1], buf[2], buf[3], buf[4],
     ]) as usize;
+
+    if payload_len > PADDED_MESSAGE_SIZE {
+        return Err(WireError::MessageTooLarge {
+            size: 5 + payload_len,
+            max: 5 + PADDED_MESSAGE_SIZE,
+        });
+    }
 
     let total_len = 5 + payload_len;
     if buf.len() < total_len {
@@ -576,19 +776,41 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
         (nodes, route)
     }
 
+    fn signed_test_handshake(
+        node_id: NodeId,
+        public_key: [u8; 32],
+        kem: Option<Vec<u8>>,
+        compute_enabled: bool,
+        compute_capacity: u8,
+    ) -> Handshake {
+        use ed25519_dalek::SigningKey;
+        use rand::RngCore;
+        let mut sk_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut sk_bytes);
+        let sk = SigningKey::from_bytes(&sk_bytes);
+        let mut nonce = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let mut hs = Handshake {
+            node_id,
+            public_key,
+            kem_public_key: kem,
+            compute_enabled,
+            compute_capacity,
+            identity_public_key: [0u8; 32],
+            nonce,
+            signature: vec![],
+        };
+        hs.sign(&sk);
+        hs
+    }
+
     #[test]
     fn test_handshake_serialization() {
-        let hs = Handshake {
-            node_id: [0x42u8; 16],
-            public_key: [0xABu8; 32],
-            tier: crate::BandwidthTier::Standard,
-            kem_public_key: None,
-            compute_enabled: false,
-            compute_capacity: 0,
-        };
+        let hs = signed_test_handshake([0x42u8; 16], [0xABu8; 32], None, false, 0);
 
         let serialized = serialize_handshake(&hs);
-        assert_eq!(serialized.len(), 51);
+        // 16+32+2+0+2+32+32+64 = 180
+        assert_eq!(serialized.len(), 180);
 
         let deserialized = deserialize_handshake(&serialized).unwrap();
         assert_eq!(deserialized.node_id, hs.node_id);
@@ -596,6 +818,18 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
         assert!(deserialized.kem_public_key.is_none());
         assert!(!deserialized.compute_enabled);
         assert_eq!(deserialized.compute_capacity, 0);
+        assert!(deserialized.verify());
+    }
+
+    #[test]
+    fn test_handshake_bad_signature_rejected() {
+        let mut hs = signed_test_handshake([0x42u8; 16], [0xABu8; 32], None, false, 0);
+        hs.signature[0] ^= 0xFF;
+        assert!(!hs.verify());
+        // Tampered bytes fail after round-trip too.
+        let serialized = serialize_handshake(&hs);
+        let back = deserialize_handshake(&serialized).unwrap();
+        assert!(!back.verify());
     }
 
     #[test]
@@ -645,14 +879,7 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
 
     #[test]
     fn test_message_serialization_handshake() {
-        let hs = Handshake {
-            node_id: [0x42u8; 16],
-            public_key: [0xABu8; 32],
-            tier: crate::BandwidthTier::Standard,
-            kem_public_key: None,
-            compute_enabled: false,
-            compute_capacity: 0,
-        };
+        let hs = signed_test_handshake([0x42u8; 16], [0xABu8; 32], None, false, 0);
         let msg = WireMessage::Handshake(hs);
 
         let serialized = serialize_message(&msg).unwrap();
@@ -699,14 +926,7 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
 
     #[test]
     fn test_try_read_message_partial() {
-        let hs = Handshake {
-            node_id: [0x42u8; 16],
-            public_key: [0xABu8; 32],
-            tier: crate::BandwidthTier::Standard,
-            kem_public_key: None,
-            compute_enabled: false,
-            compute_capacity: 0,
-        };
+        let hs = signed_test_handshake([0x42u8; 16], [0xABu8; 32], None, false, 0);
         let msg = WireMessage::Handshake(hs);
         let serialized = serialize_message(&msg).unwrap();
 
@@ -718,14 +938,7 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
 
     #[test]
     fn test_try_read_message_complete() {
-        let hs = Handshake {
-            node_id: [0x42u8; 16],
-            public_key: [0xABu8; 32],
-            tier: crate::BandwidthTier::Standard,
-            kem_public_key: None,
-            compute_enabled: false,
-            compute_capacity: 0,
-        };
+        let hs = signed_test_handshake([0x42u8; 16], [0xABu8; 32], None, false, 0);
         let msg = WireMessage::Handshake(hs);
         let serialized = serialize_message(&msg).unwrap();
 
@@ -738,22 +951,8 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
 
     #[test]
     fn test_try_read_message_multiple() {
-        let hs1 = Handshake {
-            node_id: [0x01u8; 16],
-            public_key: [0x01u8; 32],
-            tier: crate::BandwidthTier::Standard,
-            kem_public_key: None,
-            compute_enabled: false,
-            compute_capacity: 0,
-        };
-        let hs2 = Handshake {
-            node_id: [0x02u8; 16],
-            public_key: [0x02u8; 32],
-            tier: crate::BandwidthTier::Standard,
-            kem_public_key: None,
-            compute_enabled: false,
-            compute_capacity: 0,
-        };
+        let hs1 = signed_test_handshake([0x01u8; 16], [0x01u8; 32], None, false, 0);
+        let hs2 = signed_test_handshake([0x02u8; 16], [0x02u8; 32], None, false, 0);
 
         let mut buf = BytesMut::new();
         write_message(&mut buf, &WireMessage::Handshake(hs1)).unwrap();
@@ -861,60 +1060,39 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
     #[test]
     fn test_handshake_kem_roundtrip() {
         let kem = vec![0x55u8; static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE];
-        let hs = Handshake {
-            node_id: [0x42u8; 16],
-            public_key: [0xABu8; 32],
-            tier: crate::BandwidthTier::Standard,
-            kem_public_key: Some(kem.clone()),
-            compute_enabled: false,
-            compute_capacity: 0,
-        };
+        let hs = signed_test_handshake([0x42u8; 16], [0xABu8; 32], Some(kem.clone()), false, 0);
         let serialized = serialize_handshake(&hs);
-        assert_eq!(serialized.len(), 51 + kem.len());
+        assert_eq!(serialized.len(), 180 + kem.len());
         let back = deserialize_handshake(&serialized).unwrap();
         assert_eq!(back.kem_public_key, Some(kem));
+        assert!(back.verify());
     }
 
     #[test]
     fn test_handshake_with_compute() {
         let kem = vec![0x66u8; static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE];
-        let hs = Handshake {
-            node_id: [0x77u8; 16],
-            public_key: [0x88u8; 32],
-            tier: crate::BandwidthTier::High,
-            kem_public_key: Some(kem.clone()),
-            compute_enabled: true,
-            compute_capacity: 4,
-        };
+        let hs = signed_test_handshake([0x77u8; 16], [0x88u8; 32], Some(kem.clone()), true, 4);
 
         let serialized = serialize_handshake(&hs);
-        assert_eq!(serialized.len(), 51 + kem.len());
+        assert_eq!(serialized.len(), 180 + kem.len());
         let back = deserialize_handshake(&serialized).unwrap();
 
         assert_eq!(back.node_id, hs.node_id);
         assert_eq!(back.kem_public_key.as_deref(), Some(kem.as_slice()));
         assert!(back.compute_enabled);
         assert_eq!(back.compute_capacity, 4);
+        assert!(back.verify());
 
-        // Legacy hybrid peer (kem only, no compute bytes) parses with
-        // compute disabled.
-        let mut legacy = vec![0u8; 49];
-        legacy.extend_from_slice(&kem);
-        let legacy_hs = deserialize_handshake(&legacy).unwrap();
-        assert_eq!(legacy_hs.kem_public_key.as_deref(), Some(kem.as_slice()));
-        assert!(!legacy_hs.compute_enabled);
-        assert_eq!(legacy_hs.compute_capacity, 0);
+        // Truncated buffer fails.
+        assert!(deserialize_handshake(&serialized[..20]).is_err());
     }
 
     #[test]
     fn test_prepayment_serialization() {
-        let pre = Prepayment {
-            from_node: [0x42u8; 16],
-            bytes: 1_048_576,
-            content_id: [0xABu8; 32],
-            // TODO: Add ed25519-dalek for real signature verification
-            signature: vec![0x01u8; 64],
-        };
+        use ed25519_dalek::SigningKey;
+        let sk_bytes = [0x77u8; 32];
+        let sk = SigningKey::from_bytes(&sk_bytes);
+        let pre = Prepayment::sign([0x42u8; 16], 1_048_576, [0xABu8; 32], &sk);
         assert!(pre.validate());
         let msg = WireMessage::Prepayment(pre.clone());
         let serialized = serialize_message(&msg).unwrap();
@@ -936,9 +1114,14 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
             from_node: [0u8; 16],
             bytes: 0,
             content_id: [0u8; 32],
+            identity_public_key: [0u8; 32],
             signature: vec![],
         };
         assert!(!bad.validate());
+        // Forged signature fails.
+        let mut forged = pre.clone();
+        forged.bytes = 999_999_999;
+        assert!(!forged.validate());
     }
 
     #[test]
@@ -986,17 +1169,30 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
                 failed_challenges: 2,
             },
         ];
-        let recon = AccountingReconciliation {
+        let mut recon = AccountingReconciliation {
             from_node: [0xAAu8; 16],
             peer_credits: entries,
             total_bytes_served: 10_000,
             total_bytes_received: 8_000,
             timestamp: 1_700_000,
+            identity_public_key: [0u8; 32],
+            signature: vec![],
         };
+        {
+            use ed25519_dalek::SigningKey;
+            let sk = SigningKey::from_bytes(&[0x99u8; 32]);
+            recon.sign(&sk);
+        }
+        assert!(recon.verify(1_700_100));
+        // Future timestamp rejected.
+        let mut future = recon.clone();
+        future.timestamp = 1_700_100 + 10_000;
+        assert!(!future.verify(1_700_100));
         let msg = WireMessage::AccountingReconciliation(recon.clone());
         let serialized = serialize_message(&msg).unwrap();
         assert_eq!(serialized[0], MSG_ACCOUNTING_RECONCILIATION);
-        assert!(serialized.len() <= MAX_MESSAGE_SIZE);
+        // Padded to uniform size.
+        assert_eq!(serialized.len(), 1 + 4 + PADDED_MESSAGE_SIZE);
         let (deserialized, consumed) = deserialize_message(&serialized).unwrap();
         assert_eq!(consumed, serialized.len());
         match deserialized {

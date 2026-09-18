@@ -35,6 +35,7 @@ tracing-subscriber = "0.3"
 thiserror = "1.0"
 anyhow = "1.0"
 zeroize = { version = "1.7", features = ["derive"] }
+ed25519-dalek = "2.0"
 pqc_kyber = "0.7"
 async-trait = "0.1"
 wasmtime = { version = "26", default-features = false, features = ["cranelift", "runtime", "wat"] }

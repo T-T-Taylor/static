@@ -14,7 +14,7 @@ use curve25519_dalek::montgomery::MontgomeryPoint;
 use curve25519_dalek::scalar::Scalar;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 /// Maximum number of hops in a route
 pub const MAX_HOPS: usize = 5;
@@ -27,6 +27,14 @@ pub const FLAG_SIZE: usize = 1;
 
 /// Size of a MAC in bytes
 pub const MAC_SIZE: usize = 16;
+
+/// Maximum number of replay tags retained per mix node.
+///
+/// Bounds the `seen_tags` set to prevent unbounded memory growth from
+/// an attacker flooding distinct packets (DoS). Oldest tags are evicted
+/// first (FIFO). Evicted tags may allow a very old packet to be replayed
+/// again, which is the standard trade-off for a bounded replay cache.
+pub const MAX_SEEN_TAGS: usize = 100_000;
 
 /// Size of a routing slot in bytes
 pub const SLOT_SIZE: usize = NODE_ID_SIZE + FLAG_SIZE + MAC_SIZE;
@@ -162,8 +170,10 @@ pub struct MixNode {
     pub public_key: PubKeyBytes,
     /// The node's ID
     pub node_id: NodeId,
-    /// Set of seen replay tags
+    /// Set of seen replay tags (bounded by [`MAX_SEEN_TAGS`])
     pub seen_tags: HashSet<[u8; MAC_SIZE]>,
+    /// Insertion order of `seen_tags` for FIFO eviction (oldest front)
+    pub seen_order: VecDeque<[u8; MAC_SIZE]>,
 }
 
 /// Errors that can occur during Sphinx operations
@@ -416,13 +426,9 @@ pub fn process_packet(node: &mut MixNode, packet: SphinxPacket) -> Result<Proces
     let shared = SymmetricKey::from_bytes(shared_point.0);
     let keys = derive_hop_keys(&shared);
 
-    // Check replay
-    if node.seen_tags.contains(&keys.tag) {
-        return Err(SphinxError::ReplayDetected);
-    }
-    node.seen_tags.insert(keys.tag);
-
-    // Verify MAC
+    // Verify MAC BEFORE recording the replay tag. Recording first would let
+    // an attacker fill the bounded cache with invalid packets (DoS) and
+    // poison replay state. Invalid packets must not consume cache entries.
     let first_slot: &[u8; SLOT_SIZE] = packet.header.routing_info[..SLOT_SIZE]
         .try_into()
         .map_err(|_| SphinxError::InvalidPacketSize)?;
@@ -430,6 +436,12 @@ pub fn process_packet(node: &mut MixNode, packet: SphinxPacket) -> Result<Proces
     if packet.header.mac != expected_mac {
         return Err(SphinxError::MacVerificationFailed);
     }
+
+    // Check replay (only valid packets reach here)
+    if node.seen_tags.contains(&keys.tag) {
+        return Err(SphinxError::ReplayDetected);
+    }
+    node.insert_seen_tag(keys.tag);
 
     // Decrypt first routing block
     let mut block = *first_slot;
@@ -738,13 +750,7 @@ pub fn process_packet_hybrid_with_keys(
         derive_hybrid_shared_secret(&classical_shared, &kem_shared, HYBRID_HOP_CONTEXT);
     let keys = derive_hop_keys(&hybrid_shared);
 
-    // Check replay (shared tag space with classical path)
-    if classical.seen_tags.contains(&keys.tag) {
-        return Err(SphinxError::ReplayDetected);
-    }
-    classical.seen_tags.insert(keys.tag);
-
-    // Verify MAC
+    // Verify MAC BEFORE recording the replay tag (see `process_packet`).
     let first_slot: &[u8; SLOT_SIZE] = packet.header.routing_info[..SLOT_SIZE]
         .try_into()
         .map_err(|_| SphinxError::InvalidPacketSize)?;
@@ -752,6 +758,12 @@ pub fn process_packet_hybrid_with_keys(
     if packet.header.mac != expected_mac {
         return Err(SphinxError::MacVerificationFailed);
     }
+
+    // Check replay (shared tag space with classical path)
+    if classical.seen_tags.contains(&keys.tag) {
+        return Err(SphinxError::ReplayDetected);
+    }
+    classical.insert_seen_tag(keys.tag);
 
     // Decrypt first routing block
     let mut block = *first_slot;
@@ -822,6 +834,7 @@ impl MixNode {
             public_key,
             node_id,
             seen_tags: HashSet::new(),
+            seen_order: VecDeque::new(),
         }
     }
 
@@ -834,7 +847,30 @@ impl MixNode {
             public_key,
             node_id,
             seen_tags: HashSet::new(),
+            seen_order: VecDeque::new(),
         }
+    }
+
+    /// Number of replay tags currently retained.
+    pub fn seen_count(&self) -> usize {
+        self.seen_tags.len()
+    }
+
+    /// Insert a replay tag with bounded FIFO eviction.
+    ///
+    /// If the cache holds [`MAX_SEEN_TAGS`] entries, the oldest tag is
+    /// evicted first. Duplicate tags are ignored (no order duplication).
+    pub fn insert_seen_tag(&mut self, tag: [u8; MAC_SIZE]) {
+        if self.seen_tags.contains(&tag) {
+            return;
+        }
+        if self.seen_tags.len() >= MAX_SEEN_TAGS {
+            if let Some(oldest) = self.seen_order.pop_front() {
+                self.seen_tags.remove(&oldest);
+            }
+        }
+        self.seen_tags.insert(tag);
+        self.seen_order.push_back(tag);
     }
 }
 
@@ -1215,5 +1251,85 @@ mod tests {
         let cpacket = create_packet(&route, body).unwrap();
         let err = process_packet_hybrid(&mut hnodes[0], cpacket).unwrap_err();
         assert!(matches!(err, SphinxError::UnsupportedVersion(0)));
+    }
+
+    #[test]
+    fn test_seen_tags_bounded_eviction() {
+        let mut node = MixNode::new();
+        assert_eq!(node.seen_count(), 0);
+
+        // Insert MAX_SEEN_TAGS distinct tags.
+        for i in 0..MAX_SEEN_TAGS {
+            let mut tag = [0u8; MAC_SIZE];
+            tag[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            tag[8..].copy_from_slice(&((i as u64).wrapping_mul(0x9E3779B97F4A7C15)).to_be_bytes());
+            node.insert_seen_tag(tag);
+        }
+        assert_eq!(node.seen_count(), MAX_SEEN_TAGS);
+
+        // First tag should be present before eviction.
+        let mut first = [0u8; MAC_SIZE];
+        first[..8].copy_from_slice(&0u64.to_be_bytes());
+        first[8..].copy_from_slice(&0u64.to_be_bytes());
+        assert!(node.seen_tags.contains(&first));
+
+        // One more insert evicts the oldest, staying at the cap.
+        let mut extra = [0xFFu8; MAC_SIZE];
+        extra[0] = 0xAB;
+        node.insert_seen_tag(extra);
+        assert_eq!(node.seen_count(), MAX_SEEN_TAGS);
+        assert_eq!(node.seen_count(), 100_000);
+        assert!(!node.seen_tags.contains(&first));
+        assert!(node.seen_tags.contains(&extra));
+
+        // Duplicate insert does not grow or duplicate order entries.
+        let order_len = node.seen_order.len();
+        node.insert_seen_tag(extra);
+        assert_eq!(node.seen_count(), MAX_SEEN_TAGS);
+        assert_eq!(node.seen_order.len(), order_len);
+    }
+
+    #[test]
+    fn test_invalid_mac_does_not_insert() {
+        let (mut nodes, route) = create_route(1);
+        let body = b"mac must not pollute replay cache";
+        let packet = create_packet(&route, body).unwrap();
+
+        // Corrupt the MAC and verify it is rejected without caching the tag.
+        let mut bad = packet.clone();
+        bad.header.mac[0] ^= 0xff;
+        let err = process_packet(&mut nodes[0], bad).unwrap_err();
+        assert!(matches!(err, SphinxError::MacVerificationFailed));
+        assert_eq!(nodes[0].seen_count(), 0);
+
+        // The original (valid) packet must still process — not flagged replay.
+        let ok = process_packet(&mut nodes[0], packet.clone()).unwrap();
+        assert_eq!(&ok.body.unwrap()[..body.len()], body);
+        assert_eq!(nodes[0].seen_count(), 1);
+
+        // Replaying the valid packet is still detected.
+        let replay = process_packet(&mut nodes[0], packet);
+        assert!(matches!(replay, Err(SphinxError::ReplayDetected)));
+        assert_eq!(nodes[0].seen_count(), 1);
+    }
+
+    #[test]
+    fn test_hybrid_invalid_mac_does_not_insert() {
+        let (mut nodes, route) = create_hybrid_route(1);
+        let body = b"hybrid mac must not pollute replay cache";
+        let packet = create_packet_hybrid(&route, body).unwrap();
+
+        let mut bad = packet.clone();
+        bad.header.mac[0] ^= 0xff;
+        let err = process_packet_hybrid(&mut nodes[0], bad).unwrap_err();
+        assert!(matches!(err, SphinxError::MacVerificationFailed));
+        assert_eq!(nodes[0].classical.seen_count(), 0);
+
+        let ok = process_packet_hybrid(&mut nodes[0], packet.clone()).unwrap();
+        assert_eq!(&ok.body.unwrap()[..body.len()], body);
+        assert_eq!(nodes[0].classical.seen_count(), 1);
+
+        let replay = process_packet_hybrid(&mut nodes[0], packet);
+        assert!(matches!(replay, Err(SphinxError::ReplayDetected)));
     }
 }

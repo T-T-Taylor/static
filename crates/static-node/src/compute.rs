@@ -20,9 +20,10 @@
 //! a future TEE-based provider can attest execution without protocol
 //! changes.
 
-use static_mesh::fragment::{fragment_payload, serialize_fragment};
 use static_sphinx::SphinxPacket;
-use static_storage::compute::{ComputeRequest, ComputeResponse, ReturnRoute, MAX_COMPUTE_OUTPUT_SIZE};
+use static_storage::compute::{
+    ComputeRequest, ComputeResponse, ReturnRoute, MAX_COMPUTE_OUTPUT_SIZE,
+};
 use thiserror::Error;
 use wasmtime::{Config, Engine, Instance, Module, ResourceLimiter, Store, Val};
 
@@ -123,8 +124,8 @@ pub fn execute_wasm(
 
     let mut config = Config::new();
     config.consume_fuel(true);
-    let engine = Engine::new(&config)
-        .map_err(|e| ComputeError::ModuleCompilationFailed(e.to_string()))?;
+    let engine =
+        Engine::new(&config).map_err(|e| ComputeError::ModuleCompilationFailed(e.to_string()))?;
 
     let module = Module::new(&engine, module_bytes)
         .map_err(|e| ComputeError::ModuleCompilationFailed(e.to_string()))?;
@@ -222,46 +223,41 @@ pub fn execute_wasm(
     Ok((output_data, cpu_time_ms.max(1), peak_memory as u64))
 }
 
-/// Build the Sphinx packets carrying a compute request to a provider
+/// Build the hybrid Sphinx packets carrying a compute request to a provider
 ///
 /// The serialized request is fragmented into Sphinx-body-sized pieces; each
-/// fragment becomes one packet routed through `forward_route`.
+/// fragment becomes one hybrid (v1) packet routed through `forward_route`.
+/// `kem_lookup` resolves each hop's KEM public key (typically from the
+/// handshake-learned routing table); an unknown key fails the build so the
+/// packet is dropped at the source, matching the hybrid-only transport.
 pub fn build_request_packets(
     request: &ComputeRequest,
     forward_route: &static_sphinx::Route,
+    kem_lookup: &dyn Fn(&[u8; 16]) -> Option<Vec<u8>>,
 ) -> Result<Vec<SphinxPacket>, ComputeError> {
     let payload = static_storage::compute::serialize_request(request)
         .map_err(|e| ComputeError::Serialization(e.to_string()))?;
 
-    let mut packets = Vec::new();
-    for fragment in fragment_payload(&payload) {
-        let body = serialize_fragment(&fragment);
-        let packet = static_sphinx::create_packet(forward_route, &body)
-            .map_err(|_| ComputeError::SphinxError)?;
-        packets.push(packet);
-    }
-    Ok(packets)
+    static_mesh::retrieval::create_hybrid_payload_packets(&payload, forward_route, kem_lookup)
+        .map_err(|_| ComputeError::SphinxError)
 }
 
-/// Build the Sphinx packets carrying a compute response back to a requester
+/// Build the hybrid Sphinx packets carrying a compute response to a requester
 ///
-/// The serialized response is fragmented; each fragment becomes one packet
-/// routed through the request's return route (reply-block style).
+/// The serialized response is fragmented; each fragment becomes one hybrid
+/// (v1) packet routed through the request's return route (reply-block
+/// style). See [`build_request_packets`] for the `kem_lookup` contract.
 pub fn build_response_packets(
     response: &ComputeResponse,
     return_route: &ReturnRoute,
+    kem_lookup: &dyn Fn(&[u8; 16]) -> Option<Vec<u8>>,
 ) -> Result<Vec<SphinxPacket>, ComputeError> {
     let payload = static_storage::compute::serialize_response(response)
         .map_err(|e| ComputeError::Serialization(e.to_string()))?;
 
-    let mut packets = Vec::new();
-    for fragment in fragment_payload(&payload) {
-        let body = serialize_fragment(&fragment);
-        let packet = static_sphinx::create_packet(&return_route.to_sphinx_route(), &body)
-            .map_err(|_| ComputeError::SphinxError)?;
-        packets.push(packet);
-    }
-    Ok(packets)
+    let route = return_route.to_sphinx_route();
+    static_mesh::retrieval::create_hybrid_payload_packets(&payload, &route, kem_lookup)
+        .map_err(|_| ComputeError::SphinxError)
 }
 
 #[cfg(test)]
@@ -321,7 +317,10 @@ mod tests {
                     msg
                 );
             }
-            other => panic!("expected fuel-exhaustion error, got: {:?}", other.map(|_| ())),
+            other => panic!(
+                "expected fuel-exhaustion error, got: {:?}",
+                other.map(|_| ())
+            ),
         }
     }
 

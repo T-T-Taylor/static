@@ -62,6 +62,79 @@ pub struct SwapProposal {
     pub content_root: MerkleRoot,
     /// Merkle proof verifying this chunk against `content_root`
     pub merkle_proof: MerkleProof,
+    /// Content ID this chunk belongs to (`blake3(content_public_key)`)
+    ///
+    /// Binds the offered chunk to a content identity so receivers can
+    /// attribute garbage-flooding to a stable key.
+    #[serde(default)]
+    pub content_id: [u8; 32],
+    /// Ed25519 public key authorizing this content (`blake3(pub) == content_id`)
+    #[serde(default)]
+    pub content_public_key: [u8; 32],
+    /// Ed25519 signature over [`SwapProposal::signing_bytes`]
+    /// (`content_root || chunk.id || from_node`), 64 bytes when signed.
+    ///
+    /// Empty (`vec![]`) means unsigned — [`validate_swap_proposal`]
+    /// rejects it with [`SwapRejectReason::InvalidSignature`].
+    #[serde(default)]
+    pub content_signature: Vec<u8>,
+}
+
+impl SwapProposal {
+    /// Bytes covered by the content signature.
+    ///
+    /// `content_root (32) || chunk.id (32) || from_node (16)` = 80 bytes.
+    /// Binds the offered chunk and its Merkle root to the sender so a
+    /// captured signature cannot be replayed for a different root/chunk.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + 32 + 16);
+        buf.extend_from_slice(&self.content_root);
+        buf.extend_from_slice(&self.chunk.id);
+        buf.extend_from_slice(&self.from_node);
+        buf
+    }
+
+    /// Sign this proposal with the content signing key.
+    ///
+    /// Sets `content_public_key` from the key, `content_id` to
+    /// `blake3(public_key)` (so the binding check passes), and
+    /// `content_signature` to the Ed25519 signature over
+    /// [`SwapProposal::signing_bytes`].
+    pub fn sign(&mut self, content_signing_key: &ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        let public = content_signing_key.verifying_key().to_bytes();
+        self.content_public_key = public;
+        self.content_id = *blake3::hash(&public).as_bytes();
+        let sig = content_signing_key.sign(&self.signing_bytes());
+        self.content_signature = sig.to_bytes().to_vec();
+    }
+
+    /// Verify the content binding and signature.
+    ///
+    /// Returns `Ok(())` when `blake3(content_public_key) == content_id`
+    /// and the Ed25519 signature over [`SwapProposal::signing_bytes`]
+    /// verifies. Returns `Err(InvalidSignature)` otherwise.
+    pub fn verify_content_signature(&self) -> Result<(), SwapRejectReason> {
+        // Binding: content_id must be blake3(content_public_key).
+        let expected = *blake3::hash(&self.content_public_key).as_bytes();
+        if expected != self.content_id {
+            return Err(SwapRejectReason::InvalidSignature);
+        }
+        // Signature must be 64 bytes.
+        if self.content_signature.len() != 64 {
+            return Err(SwapRejectReason::InvalidSignature);
+        }
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        let Ok(public) = VerifyingKey::from_bytes(&self.content_public_key) else {
+            return Err(SwapRejectReason::InvalidSignature);
+        };
+        let mut arr = [0u8; 64];
+        arr.copy_from_slice(&self.content_signature);
+        let sig = Signature::from_bytes(&arr);
+        public
+            .verify(&self.signing_bytes(), &sig)
+            .map_err(|_| SwapRejectReason::InvalidSignature)
+    }
 }
 
 /// A swap acceptance
@@ -103,6 +176,12 @@ pub enum SwapRejectReason {
     InvalidLease = 3,
     /// Chunk failed Merkle proof verification
     InvalidIntegrityTag = 4,
+    /// Content binding or Ed25519 signature invalid
+    ///
+    /// Covers: `blake3(content_public_key) != content_id`, signature
+    /// length != 64, unparseable public key, or failed verification
+    /// over `content_root || chunk.id || from_node`.
+    InvalidSignature = 5,
 }
 
 impl TryFrom<u8> for SwapRejectReason {
@@ -115,6 +194,7 @@ impl TryFrom<u8> for SwapRejectReason {
             2 => Ok(SwapRejectReason::InvalidChunkSize),
             3 => Ok(SwapRejectReason::InvalidLease),
             4 => Ok(SwapRejectReason::InvalidIntegrityTag),
+            5 => Ok(SwapRejectReason::InvalidSignature),
             _ => Err(StorageError::InvalidChunkSize {
                 expected: 0,
                 actual: value as usize,
@@ -203,12 +283,22 @@ pub struct SwapStats {
     pub rejected_swaps: u64,
 }
 
-/// Compute a proposal ID (blake3 hash of the chunk ID and from_node)
+/// Compute a proposal ID (C2 idempotency).
+///
+/// `blake3(chunk.id || from_node || content_root || lease.expires_at_be)`.
+///
+/// Binding the content root and lease expiry makes the ID unique per
+/// (chunk, sender, content, lease): re-proposals for the same lease
+/// deduplicate to the same ID, while a renewed lease (different
+/// `expires_at`) yields a different ID so stale accepts/rejects cannot
+/// be replayed across leases.
 pub fn proposal_id(proposal: &SwapProposal) -> [u8; 32] {
     use blake3;
-    let mut input = Vec::with_capacity(32 + 16);
+    let mut input = Vec::with_capacity(32 + 16 + 32 + 8);
     input.extend_from_slice(&proposal.chunk.id);
     input.extend_from_slice(&proposal.from_node);
+    input.extend_from_slice(&proposal.content_root);
+    input.extend_from_slice(&proposal.lease.expires_at.to_be_bytes());
     let hash = blake3::hash(&input);
     let mut id = [0u8; 32];
     id.copy_from_slice(hash.as_bytes());
@@ -220,6 +310,13 @@ pub fn proposal_id(proposal: &SwapProposal) -> [u8; 32] {
 /// `content_root` and `merkle_proof` come from
 /// [`crate::integrity::generate_proofs`] over the content's chunks; the
 /// receiver verifies them before accepting.
+///
+/// `content_id` must be `blake3(content_public_key)`. If
+/// `content_signing_key` is `Some`, the proposal is signed over
+/// [`SwapProposal::signing_bytes`] (Ed25519 over
+/// `content_root || chunk.id || from_node`); if `None`, the signature
+/// is left empty (unsigned — validation rejects it, useful for tests
+/// that exercise the unsigned path).
 pub fn create_swap_proposal(
     from_node: NodeId,
     chunk: EncryptedChunk,
@@ -227,6 +324,9 @@ pub fn create_swap_proposal(
     lease_duration_secs: u64,
     content_root: MerkleRoot,
     merkle_proof: MerkleProof,
+    content_id: [u8; 32],
+    content_public_key: [u8; 32],
+    content_signing_key: Option<&ed25519_dalek::SigningKey>,
 ) -> SwapProposal {
     let lease = create_lease(
         &chunk.id,
@@ -239,14 +339,28 @@ pub fn create_swap_proposal(
     // The chunk is opaque to the receiver
     // For now, we include an empty encrypted_master_key
     // In a real implementation, this would be encrypted to the receiver's public key
-    SwapProposal {
+    let mut proposal = SwapProposal {
         from_node,
         chunk,
         lease,
         encrypted_master_key: vec![],
         content_root,
         merkle_proof,
+        content_id,
+        content_public_key,
+        content_signature: vec![],
+    };
+
+    // Sign if a key is provided, preserving the caller-supplied
+    // content_id / content_public_key so binding mismatches stay
+    // detectable (validation rejects them with InvalidSignature).
+    if let Some(sk) = content_signing_key {
+        use ed25519_dalek::Signer;
+        let sig = sk.sign(&proposal.signing_bytes());
+        proposal.content_signature = sig.to_bytes().to_vec();
     }
+
+    proposal
 }
 
 /// Create a swap acceptance
@@ -291,7 +405,15 @@ pub fn create_swap_reject(
 /// Checks:
 /// 1. Chunk size is correct (1 MiB + 16 byte tag)
 /// 2. Lease is valid
-/// 3. Chunk verifies against its Merkle proof and content root
+/// 3. Content binding: `blake3(content_public_key) == content_id`
+/// 4. Content signature: 64-byte Ed25519 over
+///    `content_root || chunk.id || from_node` verifies
+/// 5. Chunk verifies against its Merkle proof and content root
+///
+/// Binding/signature failures return [`SwapRejectReason::InvalidSignature`].
+/// The signature is checked before the Merkle proof so a tampered
+/// `content_root` fails as `InvalidSignature` (auth), not
+/// `InvalidIntegrityTag`.
 pub fn validate_swap_proposal(
     proposal: &SwapProposal,
     expected_chunk_size: usize,
@@ -306,6 +428,10 @@ pub fn validate_swap_proposal(
     if !is_lease_valid(&proposal.lease, current_time) {
         return Err(SwapRejectReason::InvalidLease);
     }
+
+    // Check content auth (binding + signature) before Merkle so root
+    // tampering is attributed as an auth failure.
+    proposal.verify_content_signature()?;
 
     // Check integrity: the chunk must hash up the Merkle proof to the
     // content root, proving it is a real shard of some published content
@@ -424,8 +550,10 @@ mod tests {
 
     /// Build a swap proposal carrying a genuine Merkle proof for its chunk
     ///
-    /// Validation now verifies integrity, so every proposal under test
-    /// must carry a real proof generated over the chunk data.
+    /// Validation now verifies integrity and content auth, so every
+    /// proposal under test must carry a real proof generated over the
+    /// chunk data plus a valid Ed25519 content signature with
+    /// `content_id = blake3(content_public_key)`.
     fn make_proposal(
         node_id: NodeId,
         chunk: EncryptedChunk,
@@ -433,6 +561,13 @@ mod tests {
         lease_duration_secs: u64,
     ) -> SwapProposal {
         let (root, proofs) = crate::integrity::generate_proofs(std::slice::from_ref(&chunk));
+        // Fresh content keypair per proposal (random, no rand-version
+        // coupling via from_bytes).
+        let mut sk_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut sk_bytes);
+        let content_signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
+        let content_public_key = content_signing_key.verifying_key().to_bytes();
+        let content_id = *blake3::hash(&content_public_key).as_bytes();
         create_swap_proposal(
             node_id,
             chunk,
@@ -440,6 +575,35 @@ mod tests {
             lease_duration_secs,
             root,
             proofs.into_iter().next().expect("one chunk, one proof"),
+            content_id,
+            content_public_key,
+            Some(&content_signing_key),
+        )
+    }
+
+    /// Build an unsigned proposal (empty signature) for negative tests.
+    fn make_unsigned_proposal(
+        node_id: NodeId,
+        chunk: EncryptedChunk,
+        master: &SymmetricKey,
+        lease_duration_secs: u64,
+    ) -> SwapProposal {
+        let (root, proofs) = crate::integrity::generate_proofs(std::slice::from_ref(&chunk));
+        let mut sk_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut sk_bytes);
+        let sk = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
+        let pk = sk.verifying_key().to_bytes();
+        let cid = *blake3::hash(&pk).as_bytes();
+        create_swap_proposal(
+            node_id,
+            chunk,
+            master,
+            lease_duration_secs,
+            root,
+            proofs.into_iter().next().expect("one chunk, one proof"),
+            cid,
+            pk,
+            None,
         )
     }
 
@@ -459,6 +623,10 @@ mod tests {
         assert_eq!(proposal.from_node, node_id);
         assert_eq!(proposal.chunk.id, chunk.id);
         assert!(is_lease_valid(&proposal.lease, current_timestamp()));
+        // Content auth is bound: blake3(pub) == content_id and signature verifies.
+        assert_eq!(*blake3::hash(&proposal.content_public_key).as_bytes(), proposal.content_id);
+        assert_eq!(proposal.content_signature.len(), 64);
+        assert!(proposal.verify_content_signature().is_ok());
     }
 
     #[test]
@@ -501,12 +669,33 @@ mod tests {
         let master = SymmetricKey::random();
 
         let proposal1 = make_proposal(node_id, chunk.clone(), &master, 3600);
-        let proposal2 = make_proposal(node_id, chunk, &master, 3600);
+        let mut proposal2 = make_proposal(node_id, chunk, &master, 3600);
+        // C2 id includes lease expiry; both minted within the same second
+        // in practice, but normalize to rule out a 1s-boundary flake.
+        proposal2.lease.expires_at = proposal1.lease.expires_at;
 
         let id1 = proposal_id(&proposal1);
         let id2 = proposal_id(&proposal2);
 
         assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_proposal_id_changes_with_lease_expiry() {
+        // C2: same chunk/peer/root but different lease expiry => different ID.
+        let node_id = random_node_id();
+        let chunk = random_chunk();
+        let master = SymmetricKey::random();
+
+        let proposal1 = make_proposal(node_id, chunk.clone(), &master, 3600);
+        let mut proposal2 = make_proposal(node_id, chunk, &master, 3600);
+        // Force identical except expiry, then diverge expiry.
+        proposal2.content_root = proposal1.content_root;
+        proposal2.lease.expires_at = proposal1.lease.expires_at;
+        assert_eq!(proposal_id(&proposal1), proposal_id(&proposal2));
+
+        proposal2.lease.expires_at = proposal1.lease.expires_at.saturating_add(1000);
+        assert_ne!(proposal_id(&proposal1), proposal_id(&proposal2));
     }
 
     #[test]
@@ -590,6 +779,86 @@ mod tests {
 
         let result = validate_swap_proposal(&tampered, CHUNK_SIZE + 16, current_timestamp());
         assert_eq!(result.unwrap_err(), SwapRejectReason::InvalidIntegrityTag);
+    }
+
+    #[test]
+    fn test_validate_tampered_root_fails_signature() {
+        // Tampering with content_root after signing breaks the Ed25519
+        // signature (which covers root||chunk.id||from_node), so it must
+        // fail as InvalidSignature (checked before Merkle).
+        let node_id = random_node_id();
+        let master = SymmetricKey::random();
+
+        let proposal = make_proposal(node_id, random_chunk(), &master, 3600);
+        let mut tampered = proposal;
+        tampered.content_root[0] ^= 0xFF;
+
+        let result = validate_swap_proposal(&tampered, CHUNK_SIZE + 16, current_timestamp());
+        assert_eq!(result.unwrap_err(), SwapRejectReason::InvalidSignature);
+    }
+
+    #[test]
+    fn test_validate_wrong_content_id_binding_fails() {
+        // content_id must equal blake3(content_public_key); a mismatched
+        // binding fails even with an otherwise valid signature.
+        let node_id = random_node_id();
+        let master = SymmetricKey::random();
+
+        let proposal = make_proposal(node_id, random_chunk(), &master, 3600);
+        let mut tampered = proposal;
+        tampered.content_id = [0xFFu8; 32];
+
+        let result = validate_swap_proposal(&tampered, CHUNK_SIZE + 16, current_timestamp());
+        assert_eq!(result.unwrap_err(), SwapRejectReason::InvalidSignature);
+    }
+
+    #[test]
+    fn test_validate_unsigned_proposal_fails() {
+        // Empty signature (created with None key) is rejected.
+        let node_id = random_node_id();
+        let master = SymmetricKey::random();
+
+        let proposal = make_unsigned_proposal(node_id, random_chunk(), &master, 3600);
+        assert!(proposal.content_signature.is_empty());
+
+        let result = validate_swap_proposal(&proposal, CHUNK_SIZE + 16, current_timestamp());
+        assert_eq!(result.unwrap_err(), SwapRejectReason::InvalidSignature);
+    }
+
+    #[test]
+    fn test_validate_tampered_signature_fails() {
+        // Flipping a signature byte breaks verification.
+        let node_id = random_node_id();
+        let master = SymmetricKey::random();
+
+        let proposal = make_proposal(node_id, random_chunk(), &master, 3600);
+        let mut tampered = proposal;
+        tampered.content_signature[0] ^= 0xFF;
+
+        let result = validate_swap_proposal(&tampered, CHUNK_SIZE + 16, current_timestamp());
+        assert_eq!(result.unwrap_err(), SwapRejectReason::InvalidSignature);
+    }
+
+    #[test]
+    fn test_reject_reason_try_from_signature() {
+        assert_eq!(
+            SwapRejectReason::try_from(5).unwrap(),
+            SwapRejectReason::InvalidSignature
+        );
+        assert!(SwapRejectReason::try_from(6).is_err());
+    }
+
+    #[test]
+    fn test_signing_bytes_binds_root_chunk_and_sender() {
+        let node_id = random_node_id();
+        let master = SymmetricKey::random();
+        let proposal = make_proposal(node_id, random_chunk(), &master, 3600);
+
+        let bytes = proposal.signing_bytes();
+        assert_eq!(bytes.len(), 32 + 32 + 16);
+        assert_eq!(&bytes[..32], &proposal.content_root);
+        assert_eq!(&bytes[32..64], &proposal.chunk.id);
+        assert_eq!(&bytes[64..], &proposal.from_node);
     }
 
     #[test]
