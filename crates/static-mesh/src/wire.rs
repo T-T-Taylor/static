@@ -11,10 +11,11 @@
 //!   0x02 - Sphinx packet (real or cover, indistinguishable)
 
 use static_sphinx::{
-    SphinxPacket, SphinxHeader, NodeId,
-    BODY_SIZE, WIRE_BODY_SIZE, KEM_BLOCK_SIZE,
+    SessionReply, SphinxPacket, SphinxHeader, NodeId,
+    BODY_SIZE, WIRE_BODY_SIZE, KEM_BLOCK_SIZE, SESSION_ID_SIZE,
     ROUTING_INFO_SIZE, EPHEMERAL_KEY_SIZE, MAC_SIZE,
     SPHINX_VERSION_CLASSICAL, SPHINX_VERSION_HYBRID,
+    SPHINX_VERSION_SESSION_REPLY, SESSION_REPLY_WIRE_SIZE,
     HYBRID_KEM_CIPHERTEXT_SIZE,
 };
 use bytes::{BufMut, BytesMut};
@@ -82,16 +83,16 @@ pub const MAX_RECONCILIATION_ENTRIES: usize = 50;
 /// Maximum message size (header + body + framing overhead)
 ///
 /// Sized for a versioned classical Sphinx packet with the Phase 7 AEAD
-/// wire body: outer framing plus version, ephemeral key, kem-length
-/// prefix, routing info, MAC, and [`WIRE_BODY_SIZE`] body.
-pub const MAX_MESSAGE_SIZE: usize = 1 + 4 + 1 + 4 + EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE + WIRE_BODY_SIZE;
+/// wire body: outer framing plus version, ephemeral key, session id,
+/// kem-length prefix, routing info, MAC, and [`WIRE_BODY_SIZE`] body.
+pub const MAX_MESSAGE_SIZE: usize = 1 + 4 + 1 + 4 + EPHEMERAL_KEY_SIZE + SESSION_ID_SIZE + ROUTING_INFO_SIZE + MAC_SIZE + WIRE_BODY_SIZE;
 
 /// Maximum hybrid message size
 ///
 /// Hybrid v1 Sphinx packets carry the fixed [`KEM_BLOCK_SIZE`] block:
-/// 1-byte version + u32 kem length + fixed block on top of the classical
-/// layout (Phase 7, Task 4b: no per-hop size leak).
-pub const HYBRID_MAX_MESSAGE_SIZE: usize = 1 + 4 + 1 + 4 + KEM_BLOCK_SIZE + EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE + WIRE_BODY_SIZE;
+/// 1-byte version + 32-byte session id + u32 kem length + fixed block on
+/// top of the classical layout (Phase 7, Task 4b: no per-hop size leak).
+pub const HYBRID_MAX_MESSAGE_SIZE: usize = 1 + 4 + 1 + 4 + SESSION_ID_SIZE + KEM_BLOCK_SIZE + EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE + WIRE_BODY_SIZE;
 
 /// Padded uniform wire size (Phase 0, C3).
 ///
@@ -288,6 +289,12 @@ pub enum WireMessage {
     AuthIdentity(EncryptedIdentity),
     /// Sphinx packet (real, cover, or Sphinx-wrapped maintenance)
     Sphinx(SphinxPacket),
+    /// Lightweight session reply (reply-session fragment)
+    ///
+    /// Serialized as a `MSG_SPHINX`-typed frame with a version-2 payload
+    /// so an observer cannot distinguish session replies from Sphinx
+    /// packets by wire type, framing or size.
+    SessionReply(SessionReply),
 }
 
 /// Prepayment from a seed-only node to a sponsor
@@ -738,6 +745,9 @@ fn serialize_sphinx(packet: &SphinxPacket) -> Vec<u8> {
     // Ephemeral key (32 bytes)
     buf.extend_from_slice(&packet.header.ephemeral_key);
 
+    // Reply-session id (32 bytes)
+    buf.extend_from_slice(&packet.header.session_id);
+
     // ML-KEM block (length-prefixed; empty for classical, fixed for hybrid)
     buf.extend_from_slice(&(packet.kem_ciphertexts.len() as u32).to_be_bytes());
     buf.extend_from_slice(&packet.kem_ciphertexts);
@@ -784,6 +794,7 @@ fn deserialize_sphinx(data: &[u8]) -> Result<SphinxPacket, WireError> {
         let header = SphinxHeader {
             version: SPHINX_VERSION_CLASSICAL,
             ephemeral_key,
+            session_id: [0u8; SESSION_ID_SIZE],
             routing_info,
             mac,
         };
@@ -791,7 +802,7 @@ fn deserialize_sphinx(data: &[u8]) -> Result<SphinxPacket, WireError> {
         return Ok(SphinxPacket { header, kem_ciphertexts: Vec::new(), body });
     }
 
-    let min_len = 1 + EPHEMERAL_KEY_SIZE + 4 + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE;
+    let min_len = 1 + EPHEMERAL_KEY_SIZE + SESSION_ID_SIZE + 4 + ROUTING_INFO_SIZE + MAC_SIZE + BODY_SIZE;
     if data.len() < min_len {
         return Err(WireError::BufferTooShort {
             needed: min_len,
@@ -802,10 +813,13 @@ fn deserialize_sphinx(data: &[u8]) -> Result<SphinxPacket, WireError> {
     let mut offset = 0;
     let version = data[offset];
     offset += 1;
-
     let mut ephemeral_key = [0u8; EPHEMERAL_KEY_SIZE];
     ephemeral_key.copy_from_slice(&data[offset..offset + EPHEMERAL_KEY_SIZE]);
     offset += EPHEMERAL_KEY_SIZE;
+
+    let mut session_id = [0u8; SESSION_ID_SIZE];
+    session_id.copy_from_slice(&data[offset..offset + SESSION_ID_SIZE]);
+    offset += SESSION_ID_SIZE;
 
     let kem_len =
         u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
@@ -855,6 +869,7 @@ fn deserialize_sphinx(data: &[u8]) -> Result<SphinxPacket, WireError> {
     let header = SphinxHeader {
         version,
         ephemeral_key,
+        session_id,
         routing_info,
         mac,
     };
@@ -875,13 +890,16 @@ pub fn serialize_message(msg: &WireMessage) -> Result<Vec<u8>, WireError> {
         WireMessage::Welcome(w) => (MSG_WELCOME, pad_handshake(serialize_welcome(w))),
         WireMessage::AuthIdentity(a) => (MSG_AUTH_IDENTITY, pad_handshake(serialize_auth_identity(a))),
         WireMessage::Sphinx(pkt) => (MSG_SPHINX, serialize_sphinx(pkt)),
+        // Session replies ride the Sphinx wire type byte with a
+        // version-2 payload of identical size (wire uniformity).
+        WireMessage::SessionReply(reply) => (MSG_SPHINX, reply.serialize()),
     };
 
     let total_len = 1 + 4 + payload.len();
-    // Sphinx packets have their own (larger, version-aware) cap since
-    // hybrid packets carry the fixed KEM block.
+    // Sphinx packets and session replies have their own (larger,
+    // version-aware) cap since hybrid packets carry the fixed KEM block.
     let max = match msg {
-        WireMessage::Sphinx(_) => HYBRID_MAX_MESSAGE_SIZE,
+        WireMessage::Sphinx(_) | WireMessage::SessionReply(_) => HYBRID_MAX_MESSAGE_SIZE,
         WireMessage::Handshake(_) => HYBRID_MAX_MESSAGE_SIZE,
         _ => 1 + 4 + PADDED_MESSAGE_SIZE,
     };
@@ -941,7 +959,20 @@ pub fn deserialize_message(data: &[u8]) -> Result<(WireMessage, usize), WireErro
             WireMessage::AuthIdentity(deserialize_auth_identity(payload)?)
         }
         MSG_SPHINX => {
-            WireMessage::Sphinx(deserialize_sphinx(payload)?)
+            // Version-byte discriminator inside the Sphinx payload:
+            // 0/1 = classical/hybrid Sphinx, 2 = session reply. Legacy
+            // (unversioned) packets are matched by exact length first
+            // (their leading byte is random ephemeral key material).
+            if payload.len() == SESSION_REPLY_WIRE_SIZE
+                && payload[0] == SPHINX_VERSION_SESSION_REPLY
+            {
+                WireMessage::SessionReply(
+                    SessionReply::deserialize(payload)
+                        .map_err(|_| WireError::InvalidSphinxPacket)?,
+                )
+            } else {
+                WireMessage::Sphinx(deserialize_sphinx(payload)?)
+            }
         }
         _ => return Err(WireError::InvalidMessageType(msg_type)),
     };
@@ -1409,5 +1440,101 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
         // Round-trips still parse.
         let (back, _) = deserialize_message(&s1).unwrap();
         assert!(matches!(back, WireMessage::Hello(_)));
+    }
+
+    // ---- Session reply wire tests (SURB per-fragment compression) ----
+
+    use static_sphinx::create_packet_hybrid;
+
+    fn test_session_reply() -> static_sphinx::SessionReply {
+        let mut sid = [0u8; 32];
+        let mut nonce = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut sid);
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        static_sphinx::SessionReply {
+            session_id: sid,
+            nonce,
+            body: vec![0x42u8; static_sphinx::WIRE_BODY_SIZE],
+        }
+    }
+
+    #[test]
+    fn test_session_reply_wire_uniformity() {
+        // A session reply's wire frame is byte-for-byte the same size as
+        // a hybrid Sphinx packet's: same MSG type byte, same framing,
+        // same length. An ISP cannot distinguish them.
+        let reply = test_session_reply();
+        let reply_frame = serialize_message(&WireMessage::SessionReply(reply.clone())).unwrap();
+
+        let nodes = test_hybrid_route_for_surb();
+        let route = nodes.iter().map(|n| n.as_hop()).collect::<Vec<_>>();
+        let packet = create_packet_hybrid(
+            &static_sphinx::HybridRoute { hops: route, destination: [0x99u8; 16] },
+            b"payload",
+        )
+        .unwrap();
+        let sphinx_frame = serialize_message(&WireMessage::Sphinx(packet)).unwrap();
+
+        assert_eq!(reply_frame.len(), sphinx_frame.len());
+        assert_eq!(reply_frame[0], sphinx_frame[0]); // same wire type byte (MSG_SPHINX)
+        assert_eq!(reply_frame.len(), 5 + SESSION_REPLY_WIRE_SIZE);
+        // Serialized payload sizes match exactly.
+        assert_eq!(
+            reply.serialize().len(),
+            static_sphinx::SESSION_REPLY_WIRE_SIZE
+        );
+    }
+
+    #[test]
+    fn test_session_reply_distinguishable_from_sphinx() {
+        // Mix nodes distinguish deterministically via the payload
+        // version byte (2 = session reply, 0/1 = Sphinx), while both
+        // ride the identical MSG_SPHINX type byte and framing.
+        let reply = test_session_reply();
+        let frame = serialize_message(&WireMessage::SessionReply(reply)).unwrap();
+        assert_eq!(frame[0], MSG_SPHINX);
+        let (back, consumed) = deserialize_message(&frame).unwrap();
+        assert_eq!(consumed, frame.len());
+        match back {
+            WireMessage::SessionReply(r) => {
+                assert_eq!(r.body, vec![0x42u8; static_sphinx::WIRE_BODY_SIZE]);
+            }
+            _ => panic!("expected session reply"),
+        }
+
+        // A hybrid Sphinx packet with the same total size parses as
+        // Sphinx (version byte 1), never as a session reply.
+        let nodes = test_hybrid_route_for_surb();
+        let route = nodes.iter().map(|n| n.as_hop()).collect::<Vec<_>>();
+        let packet = create_packet_hybrid(
+            &static_sphinx::HybridRoute { hops: route, destination: [0x98u8; 16] },
+            b"payload",
+        )
+        .unwrap();
+        let frame = serialize_message(&WireMessage::Sphinx(packet)).unwrap();
+        assert_eq!(frame[0], MSG_SPHINX);
+        assert!(matches!(
+            deserialize_message(&frame).unwrap().0,
+            WireMessage::Sphinx(_)
+        ));
+
+        // Roundtrip preserves all fields.
+        let reply = test_session_reply();
+        let (back, _) = deserialize_message(&serialize_message(&WireMessage::SessionReply(reply.clone())).unwrap()).unwrap();
+        if let WireMessage::SessionReply(r) = back {
+            assert_eq!(r.session_id, reply.session_id);
+            assert_eq!(r.nonce, reply.nonce);
+        } else {
+            panic!("expected session reply");
+        }
+    }
+
+    /// Small helper: fresh hybrid mix nodes for wire-size comparisons.
+    fn test_hybrid_route_for_surb() -> Vec<static_sphinx::HybridMixNode> {
+        vec![
+            static_sphinx::HybridMixNode::new(),
+            static_sphinx::HybridMixNode::new(),
+            static_sphinx::HybridMixNode::new(),
+        ]
     }
 }

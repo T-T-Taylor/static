@@ -16,7 +16,7 @@
 use crate::{
     Route, SphinxHeader, SphinxPacket, SphinxError,
     NodeId, MAX_HOPS, NODE_ID_SIZE, FLAG_SIZE, MAC_SIZE, SLOT_SIZE, Mac,
-    ROUTING_INFO_SIZE, BODY_SIZE, WIRE_BODY_SIZE,
+    ROUTING_INFO_SIZE, BODY_SIZE, WIRE_BODY_SIZE, SESSION_ID_SIZE,
     RoutingFlag,
     SymmetricKey, derive_hop_keys, compute_mac, xor_slot, xor_body,
     blinding_factor, random_bytes, random_scalar,
@@ -80,6 +80,11 @@ pub fn create_surb(route: &Route) -> Result<(Surb, SurbSecret), SphinxError> {
         return Err(SphinxError::RouteTooLong);
     }
 
+    // Session id for lightweight reply forwarding: embedded in the
+    // pre-built header so every hop caches the session during the first
+    // fragment's traversal.
+    let session_id = crate::random_session_id();
+
     // Generate ephemeral scalar and public key
     let ephemeral_scalar = random_scalar();
     let ephemeral_pub = (&BASE_POINT * &ephemeral_scalar).0;
@@ -136,6 +141,7 @@ pub fn create_surb(route: &Route) -> Result<(Surb, SurbSecret), SphinxError> {
             &hop_keys[i].mac_key,
             SPHINX_VERSION_CLASSICAL,
             &alphas[i],
+            &session_id,
             &enc_blocks[i],
             &placeholder,
         );
@@ -151,6 +157,7 @@ pub fn create_surb(route: &Route) -> Result<(Surb, SurbSecret), SphinxError> {
     let header = SphinxHeader {
         version: SPHINX_VERSION_CLASSICAL,
         ephemeral_key: alphas[0],
+        session_id,
         routing_info,
         mac: macs[0],
     };
@@ -225,6 +232,9 @@ pub fn create_surb_hybrid(route: &HybridRoute) -> Result<(Surb, SurbSecret), Sph
         }
     }
 
+    // Session id (see create_surb)
+    let session_id = crate::random_session_id();
+
     let ephemeral_scalar = random_scalar();
     let ephemeral_pub = (&BASE_POINT * &ephemeral_scalar).0;
 
@@ -290,6 +300,7 @@ pub fn create_surb_hybrid(route: &HybridRoute) -> Result<(Surb, SurbSecret), Sph
             &hop_keys[i].mac_key,
             SPHINX_VERSION_HYBRID,
             &alphas[i],
+            &session_id,
             &enc_blocks[i],
             &placeholder,
         );
@@ -304,6 +315,7 @@ pub fn create_surb_hybrid(route: &HybridRoute) -> Result<(Surb, SurbSecret), Sph
     let header = SphinxHeader {
         version: SPHINX_VERSION_HYBRID,
         ephemeral_key: alphas[0],
+        session_id,
         routing_info,
         mac: macs[0],
     };
@@ -395,6 +407,123 @@ pub fn create_surb_batch_hybrid(
         surbs.push((surb, secret));
     }
     Ok(surbs)
+}
+
+impl Surb {
+    /// The reply-session identifier carried in the pre-built header
+    pub fn session_id(&self) -> [u8; SESSION_ID_SIZE] {
+        self.header.session_id
+    }
+
+    /// Serialize the SURB for transport inside an encrypted Sphinx body.
+    ///
+    /// Layout: `[1 version][32 ephemeral][32 session_id][4 kem_len][kem]
+    /// [routing][16 mac][1 n_keys][n*32 body_keys][32 aead_key]
+    /// [16 aad_destination][16 first_hop]`. The SURB is opaque to anyone
+    /// but the requester (it travels encrypted) and reveals nothing
+    /// about the return route beyond the first hop.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(
+            1 + 32 + 32 + 4 + self.kem_ciphertexts.len()
+                + self.header.routing_info.len() + MAC_SIZE
+                + 1 + self.body_keys.len() * 32 + 32 + 16 + 16,
+        );
+        buf.push(self.header.version);
+        buf.extend_from_slice(&self.header.ephemeral_key);
+        buf.extend_from_slice(&self.header.session_id);
+        buf.extend_from_slice(&(self.kem_ciphertexts.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&self.kem_ciphertexts);
+        buf.extend_from_slice(&self.header.routing_info);
+        buf.extend_from_slice(&self.header.mac);
+        buf.push(self.body_keys.len() as u8);
+        for key in &self.body_keys {
+            buf.extend_from_slice(&key.bytes);
+        }
+        buf.extend_from_slice(&self.body_aead_key.bytes);
+        buf.extend_from_slice(&self.aad_destination);
+        buf.extend_from_slice(&self.first_hop);
+        buf
+    }
+
+    /// Deserialize a SURB from [`Surb::serialize`] bytes (length-bounded).
+    pub fn deserialize(data: &[u8]) -> Result<Surb, SphinxError> {
+        // Minimum: fixed fields with zero KEM bytes and one body key.
+        const MIN: usize = 1 + 32 + 32 + 4 + ROUTING_INFO_SIZE + MAC_SIZE
+            + 1 + 32 + 32 + 16 + 16;
+        if data.len() < MIN {
+            return Err(SphinxError::InvalidPacketSize);
+        }
+        let mut offset = 0;
+        let version = data[offset];
+        offset += 1;
+        if version != SPHINX_VERSION_CLASSICAL && version != SPHINX_VERSION_HYBRID {
+            return Err(SphinxError::UnsupportedVersion(version));
+        }
+        let mut ephemeral_key = [0u8; 32];
+        ephemeral_key.copy_from_slice(&data[offset..offset + 32]);
+        offset += 32;
+        let mut session_id = [0u8; SESSION_ID_SIZE];
+        session_id.copy_from_slice(&data[offset..offset + SESSION_ID_SIZE]);
+        offset += SESSION_ID_SIZE;
+        let kem_len = u32::from_be_bytes([
+            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+        ]) as usize;
+        offset += 4;
+        if kem_len > KEM_BLOCK_SIZE || data.len() < offset + kem_len {
+            return Err(SphinxError::InvalidPacketSize);
+        }
+        let kem_ciphertexts = data[offset..offset + kem_len].to_vec();
+        offset += kem_len;
+        if version == SPHINX_VERSION_HYBRID && kem_len != KEM_BLOCK_SIZE {
+            return Err(SphinxError::InvalidKemCiphertext);
+        }
+        if data.len() < offset + ROUTING_INFO_SIZE + MAC_SIZE {
+            return Err(SphinxError::InvalidPacketSize);
+        }
+        let routing_info = data[offset..offset + ROUTING_INFO_SIZE].to_vec();
+        offset += ROUTING_INFO_SIZE;
+        let mut mac = [0u8; MAC_SIZE];
+        mac.copy_from_slice(&data[offset..offset + MAC_SIZE]);
+        offset += MAC_SIZE;
+        if offset >= data.len() {
+            return Err(SphinxError::InvalidPacketSize);
+        }
+        let n_keys = data[offset] as usize;
+        offset += 1;
+        if n_keys == 0 || n_keys > MAX_HOPS || data.len() < offset + n_keys * 32 + 32 + 16 + 16 {
+            return Err(SphinxError::InvalidPacketSize);
+        }
+        let mut body_keys = Vec::with_capacity(n_keys);
+        for _ in 0..n_keys {
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&data[offset..offset + 32]);
+            body_keys.push(SymmetricKey::from_bytes(bytes));
+            offset += 32;
+        }
+        let mut aead_bytes = [0u8; 32];
+        aead_bytes.copy_from_slice(&data[offset..offset + 32]);
+        let body_aead_key = SymmetricKey::from_bytes(aead_bytes);
+        offset += 32;
+        let mut aad_destination = [0u8; NODE_ID_SIZE];
+        aad_destination.copy_from_slice(&data[offset..offset + NODE_ID_SIZE]);
+        offset += NODE_ID_SIZE;
+        let mut first_hop = [0u8; NODE_ID_SIZE];
+        first_hop.copy_from_slice(&data[offset..offset + NODE_ID_SIZE]);
+        Ok(Surb {
+            header: SphinxHeader {
+                version,
+                ephemeral_key,
+                session_id,
+                routing_info,
+                mac,
+            },
+            kem_ciphertexts,
+            body_keys,
+            body_aead_key,
+            aad_destination,
+            first_hop,
+        })
+    }
 }
 
 #[cfg(test)]

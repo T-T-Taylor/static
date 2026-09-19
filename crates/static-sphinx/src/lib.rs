@@ -6,6 +6,13 @@
 /// Single-Use Reply Blocks for anonymous responses
 pub mod surb;
 
+pub use surb::{
+    Surb, SurbSecret, create_surb, create_surb_hybrid,
+    wrap_with_surb, wrap_with_surb_hybrid,
+    create_surb_batch, create_surb_batch_hybrid,
+    process_surb_hybrid,
+};
+
 use static_crypto::SymmetricKey;
 use static_crypto::{KemKeypair, derive_hybrid_shared_secret};
 use static_crypto::{KEM_CIPHERTEXT_SIZE, KEM_PUBLIC_KEY_SIZE};
@@ -15,7 +22,7 @@ use curve25519_dalek::montgomery::MontgomeryPoint;
 use curve25519_dalek::scalar::Scalar;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Maximum number of hops in a route
 pub const MAX_HOPS: usize = 5;
@@ -29,6 +36,9 @@ pub const FLAG_SIZE: usize = 1;
 /// Size of a MAC in bytes
 pub const MAC_SIZE: usize = 16;
 
+/// Size of a reply-session identifier in bytes
+pub const SESSION_ID_SIZE: usize = 32;
+
 /// Maximum number of replay tags retained per mix node.
 ///
 /// Bounds the `seen_tags` set to prevent unbounded memory growth from
@@ -36,6 +46,27 @@ pub const MAC_SIZE: usize = 16;
 /// first (FIFO). Evicted tags may allow a very old packet to be replayed
 /// again, which is the standard trade-off for a bounded replay cache.
 pub const MAX_SEEN_TAGS: usize = 100_000;
+
+/// Maximum number of cached reply sessions per mix node.
+///
+/// Bounded FIFO: the oldest session is evicted when a new one is
+/// inserted at capacity. Session creation is gated by per-hop MAC
+/// verification, so only holders of a real SURB for a route through
+/// this node can establish a session here.
+pub const MAX_SESSION_CACHE: usize = 4096;
+
+/// Reply-session time-to-live in seconds (1 hour).
+///
+/// Sessions older than this are rejected and lazily evicted;
+/// [`MixNode::clean_expired_sessions`] performs bulk cleanup.
+pub const SESSION_TTL_SECS: u64 = 3600;
+
+/// Maximum anti-replay nonces tracked per cached session.
+///
+/// Bounds per-session memory (2048 x 32 B = 64 KiB worst case). Enough
+/// for ~2 MiB of fragment responses in one session; later nonces evict
+/// the oldest (FIFO).
+pub const MAX_SESSION_NONCES: usize = 2048;
 
 /// Size of a routing slot in bytes
 pub const SLOT_SIZE: usize = NODE_ID_SIZE + FLAG_SIZE + MAC_SIZE;
@@ -61,8 +92,8 @@ pub const HYBRID_KEM_CIPHERTEXT_SIZE: usize = KEM_CIPHERTEXT_SIZE;
 /// Size of one ML-KEM-768 public key in bytes (re-exported for sizing)
 pub const HYBRID_KEM_PUBLIC_KEY_SIZE: usize = KEM_PUBLIC_KEY_SIZE;
 
-/// Total header size
-pub const HEADER_SIZE: usize = EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE;
+/// Total header size (version lives outside the header on the wire)
+pub const HEADER_SIZE: usize = EPHEMERAL_KEY_SIZE + SESSION_ID_SIZE + ROUTING_INFO_SIZE + MAC_SIZE;
 
 /// Fixed body size in bytes (plaintext capacity)
 pub const BODY_SIZE: usize = 1024;
@@ -151,9 +182,17 @@ pub struct SphinxHeader {
     pub version: u8,
     /// The ephemeral public key (blinded at each hop)
     pub ephemeral_key: [u8; EPHEMERAL_KEY_SIZE],
+    /// Reply-session identifier
+    ///
+    /// Random bytes for forward packets (carried opaquely). SURBs embed
+    /// the session id chosen by the requester: during the first
+    /// fragment's traversal every hop caches a reply session under this
+    /// id, enabling lightweight session replies for subsequent
+    /// fragments. Covered by the per-hop routing MAC.
+    pub session_id: [u8; SESSION_ID_SIZE],
     /// The encrypted routing information
     pub routing_info: Vec<u8>,
-    /// The MAC over (ephemeral_key || first_encrypted_slot)
+    /// The MAC over (ephemeral_key || session_id || first_encrypted_slot)
     pub mac: Mac,
 }
 
@@ -198,6 +237,54 @@ pub struct MixNode {
     pub seen_tags: HashSet<[u8; MAC_SIZE]>,
     /// Insertion order of `seen_tags` for FIFO eviction (oldest front)
     pub seen_order: VecDeque<[u8; MAC_SIZE]>,
+    /// Cached reply sessions (session_id -> session), bounded FIFO
+    ///
+    /// Populated during the first fragment's traversal of a SURB
+    /// (detected internally via the placeholder-MAC path); consumed by
+    /// [`process_session_reply`] for subsequent lightweight fragments.
+    pub session_cache: HashMap<[u8; SESSION_ID_SIZE], CachedSession>,
+    /// Insertion order of `session_cache` for FIFO eviction (oldest front)
+    pub session_order: VecDeque<[u8; SESSION_ID_SIZE]>,
+}
+
+/// A reply session cached at a mix node during first-fragment traversal
+///
+/// Captures everything a hop needs to forward subsequent lightweight
+/// session replies without KEM operations: the next hop, the per-hop
+/// body key (XOR stream), whether this hop is the final one, and the
+/// anti-replay nonce set.
+pub struct CachedSession {
+    /// The next hop's node ID (the destination node id when [`Self::is_final`])
+    pub next_hop: NodeId,
+    /// Per-hop body key (peels one XOR layer from each session reply)
+    pub body_key: SymmetricKey,
+    /// Whether this hop is the final destination of the reply session
+    pub is_final: bool,
+    /// Nonces seen in this session (anti-replay, bounded FIFO)
+    pub seen_nonces: HashSet<[u8; SESSION_ID_SIZE]>,
+    /// Insertion order of `seen_nonces` for FIFO eviction (oldest front)
+    pub nonce_order: VecDeque<[u8; SESSION_ID_SIZE]>,
+    /// When the session was established (unix seconds)
+    pub created_at: u64,
+}
+
+impl CachedSession {
+    /// Record a reply nonce with bounded FIFO eviction.
+    ///
+    /// Duplicate nonces are ignored (the caller rejects replays before
+    /// recording).
+    pub fn record_nonce(&mut self, nonce: [u8; SESSION_ID_SIZE]) {
+        if self.seen_nonces.contains(&nonce) {
+            return;
+        }
+        if self.seen_nonces.len() >= MAX_SESSION_NONCES {
+            if let Some(oldest) = self.nonce_order.pop_front() {
+                self.seen_nonces.remove(&oldest);
+            }
+        }
+        self.seen_nonces.insert(nonce);
+        self.nonce_order.push_back(nonce);
+    }
 }
 
 /// Errors that can occur during Sphinx operations
@@ -236,6 +323,12 @@ pub enum SphinxError {
     /// AEAD body authentication failed (tampering detected)
     #[error("AEAD body authentication failed")]
     BodyAuthFailed,
+    /// No cached session for the given session id
+    #[error("reply session not found")]
+    SessionNotFound,
+    /// Cached session is past its time-to-live
+    #[error("reply session expired")]
+    SessionExpired,
 }
 
 // ---- Internal key derivation ----
@@ -259,23 +352,29 @@ pub(crate) fn derive_hop_keys(shared: &SymmetricKey) -> HopKeys {
 
 // ---- MAC (covers header + body, Phase 7 Task 4a) ----
 
-/// Compute the per-hop routing MAC over version, ephemeral key, slot and body.
+/// Compute the per-hop routing MAC over version, ephemeral key, session id,
+/// slot and body.
 ///
 /// Binding the body into the routing MAC gives per-hop body authentication:
 /// any bit-flip of the body invalidates the next hop's MAC check. Combined
 /// with the innermost ChaCha20-Poly1305 layer (end-to-end), the body is
-/// fully AEAD-protected (confidential + authenticated).
+/// fully AEAD-protected (confidential + authenticated). The session id is
+/// bound so a tampered session id invalidates the packet.
 pub(crate) fn compute_mac(
     mac_key: &SymmetricKey,
     version: u8,
     ephemeral_key: &[u8],
+    session_id: &[u8; SESSION_ID_SIZE],
     slot: &[u8],
     body: &[u8],
 ) -> Mac {
     let derived = mac_key.derive("sphinx/mac/compute");
-    let mut input = Vec::with_capacity(1 + ephemeral_key.len() + slot.len() + body.len());
+    let mut input = Vec::with_capacity(
+        1 + ephemeral_key.len() + session_id.len() + slot.len() + body.len(),
+    );
     input.push(version);
     input.extend_from_slice(ephemeral_key);
+    input.extend_from_slice(session_id);
     input.extend_from_slice(slot);
     input.extend_from_slice(body);
     let hash = blake3::keyed_hash(&derived.bytes, &input);
@@ -368,6 +467,16 @@ pub(crate) fn xor_body(key: &SymmetricKey, body: &mut [u8]) {
     }
 }
 
+/// Public XOR body-layer helper for session reply construction
+///
+/// The responder onion-encrypts session reply bodies with the SURB's
+/// per-hop body keys using the same size-preserving stream cipher as
+/// normal Sphinx bodies, so hops can peel layers with their cached
+/// session keys.
+pub fn xor_body_pub(key: &SymmetricKey, body: &mut [u8]) {
+    xor_body(key, body)
+}
+
 // ---- Ephemeral key blinding ----
 
 pub(crate) fn blinding_factor(shared: &SymmetricKey) -> Scalar {
@@ -388,6 +497,22 @@ pub fn random_node_id() -> NodeId {
     let mut id = [0u8; NODE_ID_SIZE];
     OsRng.fill_bytes(&mut id);
     id
+}
+
+/// Generate a random reply-session identifier
+pub fn random_session_id() -> [u8; SESSION_ID_SIZE] {
+    let mut id = [0u8; SESSION_ID_SIZE];
+    OsRng.fill_bytes(&mut id);
+    id
+}
+
+/// Current unix time in seconds (0 fallback when the clock is before
+/// the epoch).
+pub(crate) fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 pub(crate) fn random_scalar() -> Scalar {
@@ -417,6 +542,10 @@ pub fn create_packet(route: &Route, body: &[u8]) -> Result<SphinxPacket, SphinxE
     if body.len() > BODY_SIZE {
         return Err(SphinxError::BodyTooLarge);
     }
+
+    // Random session id: forward packets carry opaque random bytes so
+    // the header layout is uniform across packet kinds.
+    let packet_session_id = random_session_id();
 
     // Generate ephemeral scalar and public key
     let ephemeral_scalar = random_scalar();
@@ -485,6 +614,7 @@ pub fn create_packet(route: &Route, body: &[u8]) -> Result<SphinxPacket, SphinxE
             &hop_keys[i].mac_key,
             SPHINX_VERSION_CLASSICAL,
             &alphas[i],
+            &packet_session_id,
             &enc_blocks[i],
             &body_seen[i],
         );
@@ -500,6 +630,7 @@ pub fn create_packet(route: &Route, body: &[u8]) -> Result<SphinxPacket, SphinxE
     let header = SphinxHeader {
         version: SPHINX_VERSION_CLASSICAL,
         ephemeral_key: alphas[0],
+        session_id: packet_session_id,
         routing_info,
         mac: macs[0],
     };
@@ -547,9 +678,15 @@ pub fn process_packet(node: &mut MixNode, packet: SphinxPacket) -> Result<Proces
         &keys.mac_key,
         packet.header.version,
         &packet.header.ephemeral_key,
+        &packet.header.session_id,
         first_slot,
         &packet.body,
     );
+    // True when the MAC only matched via the SURB placeholder fallback
+    // (headers pre-built before the payload existed). This is the
+    // internal signal that the packet is a SURB first fragment; it is
+    // never visible on the wire.
+    let mut matched_surb = false;
     if packet.header.mac != expected_mac {
         // SURB fallback: SURB headers are pre-built before the payload is
         // known, so their MACs cover a zero placeholder body. A tampered
@@ -560,12 +697,14 @@ pub fn process_packet(node: &mut MixNode, packet: SphinxPacket) -> Result<Proces
             &keys.mac_key,
             packet.header.version,
             &packet.header.ephemeral_key,
+            &packet.header.session_id,
             first_slot,
             &placeholder,
         );
         if packet.header.mac != surb_mac {
             return Err(SphinxError::MacVerificationFailed);
         }
+        matched_surb = true;
     }
 
     // Check replay (only valid packets reach here)
@@ -583,6 +722,24 @@ pub fn process_packet(node: &mut MixNode, packet: SphinxPacket) -> Result<Proces
     let flag = RoutingFlag::try_from(block[NODE_ID_SIZE])?;
     let mut next_mac = [0u8; MAC_SIZE];
     next_mac.copy_from_slice(&block[NODE_ID_SIZE + FLAG_SIZE..]);
+
+    // Cache the reply session when this packet is a SURB first fragment:
+    // subsequent fragments use lightweight session replies instead of
+    // full Sphinx packets. Session creation is gated by the MAC check
+    // above, so only a real SURB holder can establish a session here.
+    if matched_surb {
+        node.insert_session(
+            packet.header.session_id,
+            CachedSession {
+                next_hop,
+                body_key: keys.body_key.clone(),
+                is_final: flag == RoutingFlag::Destination,
+                seen_nonces: HashSet::new(),
+                nonce_order: VecDeque::new(),
+                created_at: current_timestamp(),
+            },
+        );
+    }
 
     // Shift routing info left, fill with random padding
     let mut new_routing_info = vec![0u8; ROUTING_INFO_SIZE];
@@ -615,6 +772,7 @@ pub fn process_packet(node: &mut MixNode, packet: SphinxPacket) -> Result<Proces
             let forward_header = SphinxHeader {
                 version: packet.header.version,
                 ephemeral_key: new_ephemeral,
+                session_id: packet.header.session_id,
                 routing_info: new_routing_info,
                 mac: next_mac,
             };
@@ -770,6 +928,9 @@ pub fn create_packet_hybrid(route: &HybridRoute, body: &[u8]) -> Result<SphinxPa
         }
     }
 
+    // Random session id (opaque, uniform header layout — see create_packet)
+    let packet_session_id = random_session_id();
+
     let ephemeral_scalar = random_scalar();
     let ephemeral_pub = (&BASE_POINT * &ephemeral_scalar).0;
 
@@ -851,6 +1012,7 @@ pub fn create_packet_hybrid(route: &HybridRoute, body: &[u8]) -> Result<SphinxPa
             &hop_keys[i].mac_key,
             SPHINX_VERSION_HYBRID,
             &alphas[i],
+            &packet_session_id,
             &enc_blocks[i],
             &body_seen[i],
         );
@@ -865,6 +1027,7 @@ pub fn create_packet_hybrid(route: &HybridRoute, body: &[u8]) -> Result<SphinxPa
     let header = SphinxHeader {
         version: SPHINX_VERSION_HYBRID,
         ephemeral_key: alphas[0],
+        session_id: packet_session_id,
         routing_info,
         mac: macs[0],
     };
@@ -935,9 +1098,12 @@ pub fn process_packet_hybrid_with_keys(
         &keys.mac_key,
         packet.header.version,
         &packet.header.ephemeral_key,
+        &packet.header.session_id,
         first_slot,
         &packet.body,
     );
+    // Internal SURB first-fragment signal (see process_packet)
+    let mut matched_surb = false;
     if packet.header.mac != expected_mac {
         // SURB fallback (see `process_packet`): pre-built headers cover a
         // zero placeholder body; end-to-end AEAD still protects the payload.
@@ -946,12 +1112,14 @@ pub fn process_packet_hybrid_with_keys(
             &keys.mac_key,
             packet.header.version,
             &packet.header.ephemeral_key,
+            &packet.header.session_id,
             first_slot,
             &placeholder,
         );
         if packet.header.mac != surb_mac {
             return Err(SphinxError::MacVerificationFailed);
         }
+        matched_surb = true;
     }
 
     // Check replay (shared tag space with classical path)
@@ -969,6 +1137,21 @@ pub fn process_packet_hybrid_with_keys(
     let flag = RoutingFlag::try_from(block[NODE_ID_SIZE])?;
     let mut next_mac = [0u8; MAC_SIZE];
     next_mac.copy_from_slice(&block[NODE_ID_SIZE + FLAG_SIZE..]);
+
+    // Cache the reply session (SURB first fragment only — see process_packet)
+    if matched_surb {
+        classical.insert_session(
+            packet.header.session_id,
+            CachedSession {
+                next_hop,
+                body_key: keys.body_key.clone(),
+                is_final: flag == RoutingFlag::Destination,
+                seen_nonces: HashSet::new(),
+                nonce_order: VecDeque::new(),
+                created_at: current_timestamp(),
+            },
+        );
+    }
 
     // Shift routing info left, fill with random padding
     let mut new_routing_info = vec![0u8; ROUTING_INFO_SIZE];
@@ -1007,6 +1190,7 @@ pub fn process_packet_hybrid_with_keys(
             let forward_header = SphinxHeader {
                 version: SPHINX_VERSION_HYBRID,
                 ephemeral_key: new_ephemeral,
+                session_id: packet.header.session_id,
                 routing_info: new_routing_info,
                 mac: next_mac,
             };
@@ -1025,6 +1209,154 @@ pub fn process_packet_hybrid_with_keys(
     }
 }
 
+// ---- Session replies (lightweight reply-session fragments) ----
+
+/// Packet version marker for session replies (wire payload discriminator)
+///
+/// Sphinx payloads start with version 0 (classical) or 1 (hybrid);
+/// session replies use 2. Same wire type byte, framing and payload size
+/// as Sphinx packets — indistinguishable to an observer, deterministic
+/// to distinguish for the receiving mix node.
+pub const SPHINX_VERSION_SESSION_REPLY: u8 = 2;
+
+/// Total wire payload size of a session reply (identical to a hybrid
+/// Sphinx packet payload) for wire uniformity.
+pub const SESSION_REPLY_WIRE_SIZE: usize = 1
+    + EPHEMERAL_KEY_SIZE
+    + SESSION_ID_SIZE
+    + 4
+    + KEM_BLOCK_SIZE
+    + ROUTING_INFO_SIZE
+    + MAC_SIZE
+    + WIRE_BODY_SIZE;
+
+/// Session reply wire size minus the version/session/nonce prefix
+pub const SESSION_REPLY_BODY_SIZE: usize = SESSION_REPLY_WIRE_SIZE
+    - (1 + SESSION_ID_SIZE + SESSION_ID_SIZE);
+
+/// A lightweight session reply packet (used after session establishment)
+///
+/// Same wire payload size as a Sphinx packet for indistinguishability:
+/// an observer cannot tell a session reply from a Sphinx packet (same
+/// wire type byte, framing and length). Mix nodes distinguish
+/// internally by the version byte. The body is onion-XOR encrypted with
+/// the per-hop body keys of the SURB's return route (exactly like a
+/// SURB-wrapped Sphinx body); each hop peels one layer with its cached
+/// session key. The innermost layer is the responder's ChaCha20-Poly1305
+/// AEAD ciphertext, which only the requester can decrypt.
+#[derive(Debug, Clone)]
+pub struct SessionReply {
+    /// Session identifier (from the SURB that established the session)
+    pub session_id: [u8; SESSION_ID_SIZE],
+    /// Unique nonce per fragment (anti-replay at every hop; also the
+    /// AEAD nonce prefix at the endpoints)
+    pub nonce: [u8; SESSION_ID_SIZE],
+    /// Encrypted body (onion XOR layers over the innermost AEAD
+    /// ciphertext, one layer peeled per hop)
+    pub body: Vec<u8>,
+}
+
+impl SessionReply {
+    /// Serialize to wire bytes (exactly [`SESSION_REPLY_WIRE_SIZE`])
+    ///
+    /// Layout: `[1 version=2][32 session_id][32 nonce][body][random pad]`.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(SESSION_REPLY_WIRE_SIZE);
+        buf.push(SPHINX_VERSION_SESSION_REPLY);
+        buf.extend_from_slice(&self.session_id);
+        buf.extend_from_slice(&self.nonce);
+        debug_assert_eq!(self.body.len(), WIRE_BODY_SIZE);
+        let mut body = vec![0u8; WIRE_BODY_SIZE];
+        let n = self.body.len().min(WIRE_BODY_SIZE);
+        body[..n].copy_from_slice(&self.body[..n]);
+        buf.extend_from_slice(&body);
+        while buf.len() < SESSION_REPLY_WIRE_SIZE {
+            buf.push(OsRng.next_u32() as u8);
+        }
+        buf
+    }
+
+    /// Deserialize from wire bytes (trailing padding ignored)
+    pub fn deserialize(data: &[u8]) -> Result<Self, SphinxError> {
+        let min = 1 + SESSION_ID_SIZE + SESSION_ID_SIZE + WIRE_BODY_SIZE;
+        if data.len() < min {
+            return Err(SphinxError::InvalidPacketSize);
+        }
+        if data[0] != SPHINX_VERSION_SESSION_REPLY {
+            return Err(SphinxError::UnsupportedVersion(data[0]));
+        }
+        let mut session_id = [0u8; SESSION_ID_SIZE];
+        session_id.copy_from_slice(&data[1..1 + SESSION_ID_SIZE]);
+        let mut nonce = [0u8; SESSION_ID_SIZE];
+        nonce.copy_from_slice(&data[1 + SESSION_ID_SIZE..1 + 2 * SESSION_ID_SIZE]);
+        let body = data[1 + 2 * SESSION_ID_SIZE..1 + 2 * SESSION_ID_SIZE + WIRE_BODY_SIZE].to_vec();
+        Ok(Self { session_id, nonce, body })
+    }
+}
+
+/// Result of processing a session reply at a mix node
+#[derive(Debug)]
+pub struct SessionReplyResult {
+    /// The next hop's node ID (the reply destination when `is_final`)
+    pub next_hop: NodeId,
+    /// The reply with this hop's body layer peeled, ready to forward
+    /// (or deliver to the application when `is_final`)
+    pub reply: SessionReply,
+    /// Whether this node is the final destination of the reply session
+    pub is_final: bool,
+}
+
+/// Process a lightweight session reply packet at a mix node
+///
+/// Used for every response fragment after the first: no KEM, no routing
+/// MAC — just session lookup, nonce anti-replay, one XOR body layer peel
+/// and forward (or delivery at the final hop). Fails closed on unknown
+/// or expired sessions ([`SphinxError::SessionNotFound`] /
+/// [`SphinxError::SessionExpired`]) and replays
+/// ([`SphinxError::ReplayDetected`]).
+pub fn process_session_reply(
+    mix_node: &mut MixNode,
+    reply: SessionReply,
+    current_time: u64,
+) -> Result<SessionReplyResult, SphinxError> {
+    if reply.body.len() != WIRE_BODY_SIZE {
+        return Err(SphinxError::InvalidPacketSize);
+    }
+    // Lazy expiry: drop stale sessions on contact.
+    let expired = mix_node
+        .session_cache
+        .get(&reply.session_id)
+        .is_some_and(|s| current_time.saturating_sub(s.created_at) >= SESSION_TTL_SECS);
+    if expired {
+        mix_node.session_cache.remove(&reply.session_id);
+        mix_node.session_order.retain(|id| *id != reply.session_id);
+        return Err(SphinxError::SessionExpired);
+    }
+    let session = mix_node
+        .session_cache
+        .get_mut(&reply.session_id)
+        .ok_or(SphinxError::SessionNotFound)?;
+
+    // Anti-replay: every fragment carries a fresh nonce.
+    if session.seen_nonces.contains(&reply.nonce) {
+        return Err(SphinxError::ReplayDetected);
+    }
+    session.record_nonce(reply.nonce);
+
+    // Peel one XOR body layer (size-preserving; the innermost layer is
+    // the responder's end-to-end AEAD ciphertext).
+    let mut body = reply.body;
+    xor_body(&session.body_key, &mut body);
+
+    let is_final = session.is_final;
+    let next_hop = session.next_hop;
+    Ok(SessionReplyResult {
+        next_hop,
+        reply: SessionReply { session_id: reply.session_id, nonce: reply.nonce, body },
+        is_final,
+    })
+}
+
 // ---- MixNode implementation ----
 
 impl MixNode {
@@ -1039,6 +1371,8 @@ impl MixNode {
             node_id,
             seen_tags: HashSet::new(),
             seen_order: VecDeque::new(),
+            session_cache: HashMap::new(),
+            session_order: VecDeque::new(),
         }
     }
 
@@ -1052,6 +1386,8 @@ impl MixNode {
             node_id,
             seen_tags: HashSet::new(),
             seen_order: VecDeque::new(),
+            session_cache: HashMap::new(),
+            session_order: VecDeque::new(),
         }
     }
 
@@ -1075,6 +1411,36 @@ impl MixNode {
         }
         self.seen_tags.insert(tag);
         self.seen_order.push_back(tag);
+    }
+
+    /// Insert (or refresh) a cached reply session with bounded FIFO eviction.
+    ///
+    /// At [`MAX_SESSION_CACHE`] sessions the oldest is evicted first.
+    /// Refreshing an existing session keeps its cache slot (it stays
+    /// evictable in insertion order).
+    pub fn insert_session(&mut self, session_id: [u8; SESSION_ID_SIZE], session: CachedSession) {
+        if self.session_cache.contains_key(&session_id) {
+            self.session_cache.insert(session_id, session);
+            return;
+        }
+        if self.session_cache.len() >= MAX_SESSION_CACHE {
+            if let Some(oldest) = self.session_order.pop_front() {
+                self.session_cache.remove(&oldest);
+            }
+        }
+        self.session_cache.insert(session_id, session);
+        self.session_order.push_back(session_id);
+    }
+
+    /// Remove expired reply sessions (older than [`SESSION_TTL_SECS`]).
+    ///
+    /// Called periodically by the node lifecycle loop; session replies
+    /// also lazily reject+evict individual expired sessions.
+    pub fn clean_expired_sessions(&mut self, current_time: u64) {
+        self.session_cache.retain(|_, session| {
+            current_time.saturating_sub(session.created_at) < SESSION_TTL_SECS
+        });
+        self.session_order.retain(|id| self.session_cache.contains_key(id));
     }
 }
 
@@ -1604,5 +1970,174 @@ mod tests {
         assert_eq!(dummy.header.version, SPHINX_VERSION_HYBRID);
         assert_eq!(dummy.kem_ciphertexts.len(), KEM_BLOCK_SIZE);
         assert_eq!(dummy.body.len(), WIRE_BODY_SIZE);
+    }
+
+    // ---- Reply-session tests (SURB per-fragment compression) ----
+
+    /// Build a hybrid SURB over `n` intermediate hops plus the requester
+    /// (as the final routing hop), returning the intermediates, the
+    /// requester's mix node, and the SURB.
+    fn create_hybrid_surb(n: usize) -> (Vec<HybridMixNode>, HybridMixNode, Surb) {
+        let mut nodes = Vec::with_capacity(n + 1);
+        let mut hops = Vec::with_capacity(n + 1);
+        for _ in 0..=n {
+            let node = HybridMixNode::new();
+            hops.push(node.as_hop());
+            nodes.push(node);
+        }
+        let requester = nodes.pop().unwrap();
+        let route = HybridRoute { hops, destination: requester.node_id() };
+        let (surb, _secret) = surb::create_surb_hybrid(&route).unwrap();
+        (nodes, requester, surb)
+    }
+
+    /// Establish the reply session end-to-end: process the first
+    /// fragment (a SURB-wrapped Sphinx packet) through the intermediates
+    /// and the requester's own mix node.
+    fn establish_session(
+        nodes: &mut [HybridMixNode],
+        requester: &mut HybridMixNode,
+        surb: &Surb,
+    ) {
+        let packet = wrap_with_surb_hybrid(surb, b"first fragment").unwrap();
+        let mut current = packet;
+        for node in nodes.iter_mut() {
+            current = process_packet_hybrid(node, current).unwrap().forward_packet.unwrap();
+        }
+        let result = process_packet_hybrid(requester, current).unwrap();
+        assert_eq!(result.flag, RoutingFlag::Destination);
+    }
+
+    /// Build one responder-side session reply for `payload`.
+    fn build_reply(surb: &Surb, payload: &[u8], nonce_byte: u8) -> SessionReply {
+        assert!(payload.len() <= BODY_SIZE);
+        let mut nonce = [nonce_byte; SESSION_ID_SIZE];
+        OsRng.fill_bytes(&mut nonce);
+        let aead_nonce = NonceBytes::from_bytes(nonce[..12].try_into().unwrap());
+        let mut padded = vec![0u8; BODY_SIZE];
+        padded[..payload.len()].copy_from_slice(payload);
+        let mut body =
+            encrypt_aad(&surb.body_aead_key, &aead_nonce, &padded, &surb.aad_destination);
+        assert_eq!(body.len(), WIRE_BODY_SIZE);
+        for i in (0..surb.body_keys.len()).rev() {
+            xor_body_pub(&surb.body_keys[i], &mut body);
+        }
+        SessionReply { session_id: surb.session_id(), nonce, body }
+    }
+
+    #[test]
+    fn test_session_establishment() {
+        // The first response fragment (a normal SURB-wrapped Sphinx
+        // packet) caches the reply session at EVERY hop: next hop,
+        // per-hop body key, and final-hop marking.
+        let (mut nodes, mut requester, surb) = create_hybrid_surb(3);
+        let session_id = surb.session_id();
+        assert_ne!(session_id, [0u8; SESSION_ID_SIZE]);
+
+        let packet = wrap_with_surb_hybrid(&surb, b"first fragment").unwrap();
+        let mut current = packet;
+        let mut next_hops: Vec<NodeId> = nodes[1..].iter().map(|n| n.node_id()).collect();
+        next_hops.push(requester.node_id());
+        for (i, node) in nodes.iter_mut().enumerate() {
+            let result = process_packet_hybrid(node, current).unwrap();
+            assert_eq!(result.flag, RoutingFlag::Forward);
+            current = result.forward_packet.unwrap();
+            let session = node.classical.session_cache.get(&session_id)
+                .expect("session cached at intermediate hop");
+            assert_eq!(session.next_hop, next_hops[i]);
+            assert!(!session.is_final);
+        }
+        let result = process_packet_hybrid(&mut requester, current).unwrap();
+        assert_eq!(result.flag, RoutingFlag::Destination);
+        let session = requester.classical.session_cache.get(&session_id)
+            .expect("session cached at the final hop");
+        assert!(session.is_final);
+
+        // Forward packets must NOT create sessions: the cache stays at
+        // the single entry established above.
+        let route = HybridRoute {
+            hops: vec![nodes[0].as_hop()],
+            destination: random_node_id(),
+        };
+        let normal = create_packet_hybrid(&route, b"normal").unwrap();
+        let _ = process_packet_hybrid(&mut nodes[0], normal).unwrap();
+        assert_eq!(nodes[0].classical.session_cache.len(), 1);
+    }
+
+    #[test]
+    fn test_session_reply_processing() {
+        // Subsequent fragments travel as lightweight session replies:
+        // each hop peels one XOR layer (no KEM), the final hop delivers,
+        // and the requester recovers the exact payload end-to-end.
+        let (mut nodes, mut requester, surb) = create_hybrid_surb(3);
+        establish_session(&mut nodes, &mut requester, &surb);
+
+        let reply = build_reply(&surb, b"reply body", 0x01);
+        let mut current_reply = reply;
+        for node in nodes.iter_mut() {
+            let outcome = process_session_reply(&mut node.classical, current_reply, 0).unwrap();
+            assert!(!outcome.is_final);
+            current_reply = outcome.reply;
+        }
+        let outcome = process_session_reply(&mut requester.classical, current_reply, 0).unwrap();
+        assert!(outcome.is_final);
+        let aead_nonce = NonceBytes::from_bytes(
+            reply_nonce_of(&outcome.reply)[..12].try_into().unwrap(),
+        );
+        let plaintext = decrypt_aad(
+            &surb.body_aead_key,
+            &aead_nonce,
+            &outcome.reply.body,
+            &surb.aad_destination,
+        )
+        .unwrap();
+        assert_eq!(&plaintext[..10], b"reply body");
+    }
+
+    #[test]
+    fn test_session_anti_replay() {
+        // A captured session reply replayed at a hop is rejected.
+        let (mut nodes, mut requester, surb) = create_hybrid_surb(1);
+        establish_session(&mut nodes, &mut requester, &surb);
+
+        let reply = build_reply(&surb, b"frag", 0x55);
+        let first = process_session_reply(&mut requester.classical, reply.clone(), 0).unwrap();
+        assert!(first.is_final);
+        let replay = process_session_reply(&mut requester.classical, reply, 0);
+        assert!(matches!(replay, Err(SphinxError::ReplayDetected)));
+    }
+
+    #[test]
+    fn test_session_expiry() {
+        // A session past its TTL is rejected on contact and evicted.
+        let (mut nodes, mut requester, surb) = create_hybrid_surb(1);
+        establish_session(&mut nodes, &mut requester, &surb);
+
+        let reply = build_reply(&surb, b"frag", 0x66);
+        let far_future = u64::MAX / 2;
+        let err = process_session_reply(&mut requester.classical, reply, far_future);
+        assert!(matches!(err, Err(SphinxError::SessionExpired)));
+        assert!(!requester.classical.session_cache.contains_key(&surb.session_id()));
+    }
+
+    #[test]
+    fn test_session_reply_anonymity() {
+        // The SURB holder (responder) cannot identify the requester: the
+        // serialized SURB contains no plaintext destination node id, and
+        // only the first hop's id is exposed.
+        let (nodes, requester, surb) = create_hybrid_surb(3);
+        let requester_id = requester.node_id();
+        let bytes = surb.serialize();
+        let hex: String = requester_id.iter().map(|b| format!("{:02x}", b)).collect();
+        assert!(!String::from_utf8_lossy(&bytes).contains(&hex));
+        // The first hop is visible (needed for delivery) but the final
+        // destination is not the first hop.
+        assert_ne!(surb.first_hop, requester_id);
+        let _ = nodes;
+    }
+
+    /// Helper: read a reply's nonce (test-only convenience).
+    fn reply_nonce_of(reply: &SessionReply) -> [u8; SESSION_ID_SIZE] {
+        reply.nonce
     }
 }

@@ -19,7 +19,10 @@
 //! multiplexing real traffic in with the cover traffic.
 
 use crate::routing::{RoutingTable, KnownNode, PeerGossip};
-use crate::retrieval::{handle_retrieval_request, create_hybrid_payload_packets};
+use crate::retrieval::{
+    handle_retrieval_request, create_hybrid_payload_packets,
+    handle_retrieval_request_with_surb, MSG_SURB_CHUNK_REQUEST,
+};
 use static_storage::swap::{
     SwapState, StorageCapacity, PendingSwap, decide_on_swap,
     create_swap_accept, create_swap_reject, create_swap_commit, create_swap_abort,
@@ -40,7 +43,7 @@ use crate::wire::{
 };
 use static_sphinx::{
     SphinxPacket, MixNode, RoutingFlag,
-    NodeId,
+    NodeId, SESSION_ID_SIZE,
 };
 use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
@@ -52,6 +55,12 @@ use tokio::sync::{mpsc, RwLock, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time;
 use tracing::{info, warn, error, debug};
+
+/// Timeout for reassembly of fragmented SURB chunk requests (seconds).
+///
+/// Requests are a handful of back-to-back fragments; anything older is
+/// junk or a stalled peer.
+pub const SURB_REQUEST_TIMEOUT_SECS: u64 = 120;
 
 /// A connection to a peer (transport-agnostic)
 ///
@@ -431,6 +440,13 @@ pub struct TransportState {
     /// Recently seen maintenance nonces (swap accept/commit/abort replay
     /// cache, nonce -> unix secs). Same bounds as handshakes.
     pub maintenance_nonces: Arc<std::sync::Mutex<HashMap<[u8; 32], u64>>>,
+    /// Reassembly sessions for fragmented SURB chunk requests
+    ///
+    /// Session-based chunk requests embed a full SURB (~5.7 KiB) and do
+    /// not fit a single Sphinx body, so they arrive as fragments keyed
+    /// by the request's session id. Bounded: the manager caps at 64
+    /// concurrent sessions with FIFO eviction and TTL cleanup.
+    pub pending_requests: Arc<Mutex<crate::fragment::ReassemblyManager>>,
 }
 
 impl TransportState {
@@ -1348,92 +1364,48 @@ pub async fn handle_message(
                 RoutingFlag::Destination => {
                     // We are the destination - try to handle as chunk request
                     if let Some(body) = outcome.body {
-                        // Try to parse as a chunk request
-                        match static_storage::retrieval::deserialize_request(&body) {
-                            Ok(request) => {
-                                // Dormant backup nodes hold chunks but do
-                                // not serve them. All other traffic keeps
-                                // flowing, so a dormant backup remains
-                                // indistinguishable from any other peer.
-                                if !state
-                                    .serve_enabled
-                                    .load(std::sync::atomic::Ordering::Relaxed)
-                                {
-                                    return Ok(());
+                        // Try to parse as a single-body chunk request
+                        if static_storage::retrieval::deserialize_request(&body).is_ok() {
+                            // Building and sending the response runs in a
+                            // detached task: this handler executes INLINE
+                            // in the peer connection's read loop, and
+                            // blocking here on the node's own outbound
+                            // channel would deadlock (the connection loop
+                            // is the only drainer).
+                            let state_for_serve = state.clone();
+                            tokio::spawn(async move {
+                                serve_chunk_request(state_for_serve, body).await;
+                            });
+                        } else {
+                            match try_feed_surb_request_fragment(state, &body).await {
+                                // Not a fragmented SURB request: app channel.
+                                None => {
+                                    let _ = state.inbound_tx.send(InboundMessage {
+                                        from,
+                                        message: WireMessage::Sphinx(SphinxPacket {
+                                            header: static_sphinx::SphinxHeader {
+                                                version: static_sphinx::SPHINX_VERSION_HYBRID,
+                                                ephemeral_key: [0u8; 32],
+                                                session_id: [0u8; SESSION_ID_SIZE],
+                                                routing_info: vec![],
+                                                mac: [0u8; 16],
+                                            },
+                                            kem_ciphertexts: Vec::new(),
+                                            body,
+                                        }),
+                                        is_reconnection: false,
+                                    }).await;
                                 }
-
-                                // Look up the chunk in our holder
-                                let chunk_data = {
-                                    let holder = state.chunk_holder.lock().await;
-                                    holder.get_chunk(&request.chunk_id).map(|d| d.clone())
-                                };
-                                
-                                // Hybrid response (Phase 0): resolve KEM keys
-                                // for the return route from our routing table.
-                                let kem_map: HashMap<NodeId, Vec<u8>> = {
-                                    let table = state.routing_table.read().await;
-                                    table
-                                        .nodes
-                                        .iter()
-                                        .filter_map(|(id, n)| {
-                                            n.kem_public_key
-                                                .as_ref()
-                                                .map(|k| (*id, k.clone()))
-                                        })
-                                        .collect()
-                                };
-                                let kem_lookup = move |id: &NodeId| kem_map.get(id).cloned();
-
-                                // Handle the retrieval request. The response
-                                // for a full-size chunk is ~1038 fragment
-                                // packets — more than the outbound channel
-                                // buffer — so building and sending runs in
-                                // a detached task: this handler executes
-                                // INLINE in the peer connection's read loop,
-                                // and blocking here on the node's own
-                                // outbound channel would deadlock (the
-                                // connection loop is the only drainer).
-                                let state_for_serve = state.clone();
-                                let body_for_serve = body.clone();
-                                tokio::spawn(async move {
-                                    match handle_retrieval_request(
-                                        &body_for_serve,
-                                        chunk_data.as_deref(),
-                                        &kem_lookup,
-                                    ) {
-                                        Ok(response_packets) => {
-                                            if request.return_route.hops.is_empty() {
-                                                return;
-                                            }
-                                            // Send each response packet to the first hop of the return route
-                                            let first_hop = request.return_route.hops[0].node_id;
-                                            for resp_packet in response_packets {
-                                                let connections = state_for_serve.connections.read().await;
-                                                if let Some(sender) = connections.get(&first_hop) {
-                                                    let _ = sender.send(WireMessage::Sphinx(resp_packet)).await;
-                                                }
-                                            }
-                                        }
-                                        Err(_) => {}
-                                    }
-                                });
-                            }
-                            Err(_) => {
-                                // Not a chunk request - send to inbound channel
-                                let _ = state.inbound_tx.send(InboundMessage {
-                                    from,
-                                    message: WireMessage::Sphinx(SphinxPacket {
-                                        header: static_sphinx::SphinxHeader {
-                                            version: static_sphinx::SPHINX_VERSION_HYBRID,
-                                            ephemeral_key: [0u8; 32],
-                                            routing_info: vec![],
-                                            mac: [0u8; 16],
-                                        },
-                                        kem_ciphertexts: Vec::new(),
-                                        body,
-                                    }),
-                                    is_reconnection: false,
-                                }).await;
+                                // Consumed; request still incomplete.
+                                Some(None) => {}
+                                Some(Some(request_bytes)) => {
+                                    // Completed fragmented SURB chunk
+                                    // request — serve it (detached task).
+                                    let state_for_serve = state.clone();
+                                    tokio::spawn(async move {
+                                        serve_chunk_request(state_for_serve, request_bytes).await;
+                                    });
+                                }
                             }
                         }
                     }
@@ -1453,8 +1425,167 @@ pub async fn handle_message(
                 }
             }
         }
+        WireMessage::SessionReply(reply) => {
+            // Lightweight reply-session processing (no KEM, no routing
+            // MAC): session lookup, nonce anti-replay, one XOR body
+            // layer peel, forward or deliver. Single mix-node lock, no
+            // nesting.
+            let result = {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let mut mix_node = state.mix_node.lock().await;
+                static_sphinx::process_session_reply(&mut mix_node, reply, now)
+            };
+            match result {
+                Ok(outcome) => {
+                    if outcome.is_final {
+                        // We are the reply destination: deliver the
+                        // end-to-end AEAD ciphertext to the application.
+                        let _ = state.inbound_tx.send(InboundMessage {
+                            from: outcome.next_hop,
+                            message: WireMessage::SessionReply(outcome.reply),
+                            is_reconnection: false,
+                        }).await;
+                    } else {
+                        // Intermediate hop: forward to the cached next hop.
+                        let connections = state.connections.read().await;
+                        if let Some(sender) = connections.get(&outcome.next_hop) {
+                            if sender
+                                .send(WireMessage::SessionReply(outcome.reply))
+                                .await
+                                .is_err()
+                            {
+                                debug!("Session reply forward failed: channel closed");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("Session reply dropped: {}", e);
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Serve a chunk request at this node (holder side)
+///
+/// Handles both return-path kinds:
+/// - SURB-based: the request embeds a serialized SURB; the first
+///   response fragment travels as a normal Sphinx packet wrapped with
+///   the full SURB (establishing the session at every hop), subsequent
+///   fragments travel as lightweight session replies. All are sent to
+///   the SURB's first hop.
+/// - Return-route (legacy): every fragment is a full Sphinx packet over
+///   the plaintext return route.
+///
+/// Dormant backup nodes (serve_enabled false) do not serve.
+async fn serve_chunk_request(state: Arc<TransportState>, request_body: Vec<u8>) {
+    // Dormant backup nodes hold chunks but do not serve them. All other
+    // traffic keeps flowing, so a dormant backup remains
+    // indistinguishable from any other peer.
+    if !state.serve_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Ok(request) = static_storage::retrieval::deserialize_request(&request_body) else {
+        return;
+    };
+
+    // Look up the chunk in our holder
+    let chunk_data = {
+        let holder = state.chunk_holder.lock().await;
+        holder.get_chunk(&request.chunk_id).map(|d| d.clone())
+    };
+
+    if request.surb.is_some() {
+        // Session-based response path (no return route needed).
+        match handle_retrieval_request_with_surb(&request_body, chunk_data.as_deref()) {
+            Ok(packets) => {
+                let connections = state.connections.read().await;
+                if let Some(sender) = connections.get(&packets.first_hop) {
+                    let _ = sender.send(WireMessage::Sphinx(packets.first_packet)).await;
+                    for reply in packets.session_replies {
+                        let _ = sender.send(WireMessage::SessionReply(reply)).await;
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+        return;
+    }
+
+    // Return-route path (Phase 0 hybrid mandate): resolve KEM keys for
+    // the return route from our routing table.
+    let kem_map: HashMap<NodeId, Vec<u8>> = {
+        let table = state.routing_table.read().await;
+        table
+            .nodes
+            .iter()
+            .filter_map(|(id, n)| n.kem_public_key.as_ref().map(|k| (*id, k.clone())))
+            .collect()
+    };
+    let kem_lookup = move |id: &NodeId| kem_map.get(id).cloned();
+    if let Ok(response_packets) = handle_retrieval_request(
+        &request_body,
+        chunk_data.as_deref(),
+        &kem_lookup,
+    ) {
+        if request.return_route.hops.is_empty() {
+            return;
+        }
+        let first_hop = request.return_route.hops[0].node_id;
+        for resp_packet in response_packets {
+            let connections = state.connections.read().await;
+            if let Some(sender) = connections.get(&first_hop) {
+                let _ = sender.send(WireMessage::Sphinx(resp_packet)).await;
+            }
+        }
+    }
+}
+
+/// Feed a Sphinx destination body into the SURB chunk-request reassembler
+///
+/// Bodies in the fragmented SURB chunk-request format
+/// (`[MSG_SURB_CHUNK_REQUEST][32-byte session id][fragment]`) are keyed
+/// by the request's session id. Returns `None` when the body is not a
+/// fragmented SURB chunk request (the caller falls through to the
+/// application inbound channel); `Some(None)` when the fragment was
+/// buffered but the request is incomplete; `Some(Some(bytes))` when the
+/// full request has been reassembled.
+async fn try_feed_surb_request_fragment(
+    state: &Arc<TransportState>,
+    body: &[u8],
+) -> Option<Option<Vec<u8>>> {
+    // Wrapper layout inside one Sphinx plaintext body: 1 type byte +
+    // 32-byte session id + compact fragment (12-byte header + data).
+    // The plaintext is always BODY_SIZE (zero-padded); only the marker
+    // and minimum length discriminate.
+    if body.len() < 1 + SESSION_ID_SIZE + crate::fragment::FRAGMENT_HEADER_SIZE {
+        return None;
+    }
+    if body[0] != MSG_SURB_CHUNK_REQUEST {
+        return None;
+    }
+    let mut session_id = [0u8; SESSION_ID_SIZE];
+    session_id.copy_from_slice(&body[1..1 + SESSION_ID_SIZE]);
+    let fragment =
+        crate::fragment::deserialize_fragment(&body[1 + SESSION_ID_SIZE..]).ok()?;
+    let key = u64::from_be_bytes(session_id[..8].try_into().ok()?);
+    let mut mgr = state.pending_requests.lock().await;
+    mgr.cleanup_expired(SURB_REQUEST_TIMEOUT_SECS);
+    if !mgr.add_fragment(key, fragment) {
+        return Some(None);
+    }
+    let complete = mgr.get(key)?.is_complete();
+    if !complete {
+        return Some(None);
+    }
+    let data = mgr.get(key)?.reassemble().ok()?;
+    mgr.remove(key);
+    Some(Some(data))
 }
 
 /// Check sender key continuity for a maintenance message (Phase 7).
@@ -2018,11 +2149,14 @@ fn dummy_sphinx_message(_use_hybrid: bool, budget: usize) -> WireMessage {
     rand::rngs::OsRng.fill_bytes(&mut dummy);
     let routing_end = 32 + static_sphinx::ROUTING_INFO_SIZE;
     let mac_end = routing_end + 16;
+    let mut session_id = [0u8; SESSION_ID_SIZE];
+    rand::rngs::OsRng.fill_bytes(&mut session_id);
 
     WireMessage::Sphinx(SphinxPacket {
         header: static_sphinx::SphinxHeader {
             version: static_sphinx::SPHINX_VERSION_HYBRID,
             ephemeral_key: dummy[..32].try_into().unwrap_or([0u8; 32]),
+            session_id,
             routing_info: dummy.get(32..routing_end).unwrap_or(&[]).to_vec(),
             mac: dummy.get(routing_end..mac_end).unwrap_or(&[]).try_into().unwrap_or([0u8; 16]),
         },
@@ -2220,6 +2354,7 @@ pub fn create_transport_state(
         transport,
         handshake_nonces: Arc::new(std::sync::Mutex::new(HashMap::new())),
         maintenance_nonces: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        pending_requests: Arc::new(Mutex::new(crate::fragment::ReassemblyManager::new())),
     });
 
     (state, inbound_rx)
@@ -3096,7 +3231,7 @@ mod tests {
         let request = static_storage::retrieval::ChunkRequest {
             chunk_id,
             return_route,
-        };
+            surb: None, };
         let request_bytes = static_storage::retrieval::serialize_request(&request);
 
         // A packet created for us (our public key) with our node ID as

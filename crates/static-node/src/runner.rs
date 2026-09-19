@@ -26,7 +26,10 @@ use static_mesh::wire::{
     AccountingReconciliation, Prepayment, ReconciliationEntry, WireMessage,
     MAX_RECONCILIATION_ENTRIES,
 };
-use static_sphinx::{MixNode, NodeId, Route, RouteHop};
+use static_sphinx::{
+    create_surb_hybrid, MixNode, NodeId, Route, RouteHop, Surb,
+    SESSION_ID_SIZE,
+};
 use static_storage::{
     compute::{
         deserialize_payment_confirmation, deserialize_payment_request,
@@ -348,6 +351,27 @@ pub struct ComputeState {
     pub failed_executions: u64,
 }
 
+/// Decryption key material for one of our reply sessions
+///
+/// Stored by the requester when it creates a SURB: the innermost body
+/// AEAD key and the AAD (our own node id) needed to decrypt the final
+/// layer of every session reply fragment returning through the session.
+#[derive(Clone)]
+pub struct SurbSessionKey {
+    /// The SURB's innermost body AEAD key (end-to-end layer)
+    pub body_aead_key: SymmetricKey,
+    /// AAD bound to the body AEAD (our node ID)
+    pub aad_destination: NodeId,
+    /// When the session was created (unix seconds, for TTL cleanup)
+    pub created_at: u64,
+}
+
+/// Maximum concurrent reply sessions tracked by the requester.
+pub const MAX_SURB_SESSIONS: usize = 256;
+
+/// TTL for tracked reply sessions (matches the hop-side session TTL).
+pub const SURB_SESSION_TTL_SECS: u64 = static_sphinx::SESSION_TTL_SECS;
+
 /// The running Static node
 pub struct NodeRunner {
     /// Transport state (shared across tasks)
@@ -421,6 +445,13 @@ pub struct NodeRunner {
     /// Recently sent missing-chunk gossip, deduped at the source
     /// ((content_id, chunk_id) -> last sent unix secs)
     pub missing_gossip_recent: Arc<Mutex<HashMap<(ContentId, ChunkId), u64>>>,
+    /// Reply sessions this node created as a requester
+    ///
+    /// (session_id -> (body AEAD key, AAD destination)). The key from
+    /// the SURB we embedded in a session-based chunk request decrypts
+    /// the final layer of every [`SessionReply`] fragment that returns
+    /// through the session. Bounded FIFO (256 sessions, TTL cleanup).
+    pub surb_sessions: Arc<Mutex<HashMap<[u8; SESSION_ID_SIZE], SurbSessionKey>>>,
     /// Blockchain watchers for payment verification (currency byte -> watcher)
     ///
     /// Built from the accepted currencies in [`NodeConfig::compute_config`].
@@ -520,6 +551,7 @@ impl NodeRunner {
             lifecycle_state: Arc::new(Mutex::new(LifecycleState::default())),
             maintenance_state: Arc::new(Mutex::new(MaintenanceState::default())),
             missing_gossip_recent: Arc::new(Mutex::new(HashMap::new())),
+            surb_sessions: Arc::new(Mutex::new(HashMap::new())),
             payment_watchers,
             inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
             config,
@@ -870,64 +902,20 @@ impl NodeRunner {
                     inbound.from
                 );
 
-                {
-                    let mut manager = self.retriever.lock().await;
-                    if let Ok(Some(response)) = manager.process_fragment(&packet.body) {
-                        // Swap retrieval phase (S0): a completed response may
-                        // belong to a pending 2-phase swap. Consume it there
-                        // first (Merkle-verify, buffer, commit); only fall
-                        // through to the ordinary retrieval path when no
-                        // swap is waiting for this chunk.
-                        let consumed = response.found && static_mesh::transport::handle_swap_chunk_retrieval(
-                            &self.transport,
-                            &response.chunk_id,
-                            response.chunk_data.clone(),
-                        )
-                        .await;
-                        if consumed {
-                            debug!(
-                                "Chunk {:02x?} routed to pending swap (retrieval phase)",
-                                response.chunk_id
-                            );
-                        } else if response.found {
-                            let chunk = EncryptedChunk {
-                                id: response.chunk_id,
-                                data: response.chunk_data,
-                            };
-                            let mut content_retriever = self.content_retriever.lock().await;
-                            let recorded = content_retriever
-                                .record_chunk(chunk.clone())
-                                .unwrap_or(false);
-                            drop(content_retriever);
-                            if !recorded {
-                                // Not part of a file retrieval: stash as
-                                // single (manifest fetch path, H14 bounded).
-                                let mut singles = self.single_chunks.lock().await;
-                                singles.insert(chunk.id, chunk.data.clone());
-                                while singles.len() > 2048 {
-                                    if let Some(k) = singles.keys().next().copied() {
-                                        singles.remove(&k);
-                                    } else {
-                                        break;
-                                    }
-                                }
-                            } else {
-                                debug!("Successfully retrieved chunk");
-                            }
-                            // Freenet-style: cache what we retrieve so popular
-                            // chunks spread and no holder set stays static.
-                            self.cache_retrieved_chunk(chunk.id, &chunk.data).await;
-                        } else {
-                            // Peer reported the chunk missing (Phase 1):
-                            // report the miss so a HostBuffer holder reseeds.
-                            // The manifest path is the binding here (content
-                            // id == chunk id); the repair loop gossips with
-                            // the true content binding for shards.
-                            self.send_missing_chunk_gossip(response.chunk_id, response.chunk_id)
-                                .await;
-                        }
-                    }
-                }
+                self.handle_chunk_response_body(&packet.body).await;
+
+                // Maintenance dispatch FIRST (Phase 7, Task 1 + SURB
+                // per-fragment compression): reassemble maintenance
+                // fragments (gossip, swap control, prepayment,
+                // reconciliation) and route by body type byte. It runs
+                // before the other reassembly paths and only claims
+                // fragments that start (or continue) a maintenance
+                // message, so single-fragment maintenance messages
+                // (e.g. swap commits) cannot be absorbed by the other
+                // dispatchers' reassemblers — which no longer see the
+                // bulk of reply traffic now that responses travel as
+                // session replies.
+                self.handle_maintenance_fragment(&packet.body).await;
 
                 // Compute dispatch: reassemble compute fragments and route
                 // by message type byte (requests to the provider role,
@@ -946,17 +934,103 @@ impl NodeRunner {
                 // fragments and route by type byte (missing-chunk gossip
                 // to the host role, heartbeats to the holder role).
                 self.handle_lifecycle_fragment(&packet.body, inbound.from).await;
-
-                // Maintenance dispatch (Phase 7, Task 1): reassemble
-                // maintenance fragments (gossip, swap control, prepayment,
-                // reconciliation) and route by body type byte. Gossip is
-                // not parseable as a fragment when it doesn't collide, so
-                // this is best-effort like the other reassembly paths.
-                self.handle_maintenance_fragment(&packet.body).await;
+            }
+            WireMessage::SessionReply(reply) => {
+                // Reply-session fragment (subsequent response fragments of
+                // a session-based chunk retrieval). The mixnet has peeled
+                // every hop XOR layer; decrypt the requester's end-to-end
+                // AEAD layer with the key stored at session creation.
+                if matches!(self.config.mode, NodeMode::BackupOnly) {
+                    debug!("Backup-only node dormant: ignoring session reply");
+                    return Ok(());
+                }
+                let key = {
+                    let sessions = self.surb_sessions.lock().await;
+                    sessions.get(&reply.session_id).cloned()
+                };
+                let Some(key) = key else {
+                    debug!("Session reply for unknown session; dropped");
+                    return Ok(());
+                };
+                match static_mesh::retrieval::decrypt_session_reply_body(
+                    &reply,
+                    &key.body_aead_key,
+                    &key.aad_destination,
+                ) {
+                    Ok(plaintext) => self.handle_chunk_response_body(&plaintext).await,
+                    Err(_) => debug!("Session reply AEAD verification failed; dropped"),
+                }
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Feed a decrypted Sphinx/session-reply body into the chunk
+    /// response retriever
+    ///
+    /// Shared by the Sphinx-destination path (first fragment of a
+    /// session response) and the [`SessionReply`] path (subsequent
+    /// fragments). Handles the swap retrieval phase, content-retriever
+    /// recording, single-chunk stashing (manifest fetch path), and
+    /// missing-chunk reporting.
+    async fn handle_chunk_response_body(self: &Arc<Self>, body: &[u8]) {
+        let mut manager = self.retriever.lock().await;
+        if let Ok(Some(response)) = manager.process_fragment(body) {
+            // Swap retrieval phase (S0): a completed response may
+            // belong to a pending 2-phase swap. Consume it there
+            // first (Merkle-verify, buffer, commit); only fall
+            // through to the ordinary retrieval path when no
+            // swap is waiting for this chunk.
+            let consumed = response.found && static_mesh::transport::handle_swap_chunk_retrieval(
+                &self.transport,
+                &response.chunk_id,
+                response.chunk_data.clone(),
+            )
+            .await;
+            if consumed {
+                debug!(
+                    "Chunk {:02x?} routed to pending swap (retrieval phase)",
+                    response.chunk_id
+                );
+            } else if response.found {
+                let chunk = EncryptedChunk {
+                    id: response.chunk_id,
+                    data: response.chunk_data,
+                };
+                let mut content_retriever = self.content_retriever.lock().await;
+                let recorded = content_retriever
+                    .record_chunk(chunk.clone())
+                    .unwrap_or(false);
+                drop(content_retriever);
+                if !recorded {
+                    // Not part of a file retrieval: stash as
+                    // single (manifest fetch path, H14 bounded).
+                    let mut singles = self.single_chunks.lock().await;
+                    singles.insert(chunk.id, chunk.data.clone());
+                    while singles.len() > 2048 {
+                        if let Some(k) = singles.keys().next().copied() {
+                            singles.remove(&k);
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    debug!("Successfully retrieved chunk");
+                }
+                // Freenet-style: cache what we retrieve so popular
+                // chunks spread and no holder set stays static.
+                self.cache_retrieved_chunk(chunk.id, &chunk.data).await;
+            } else {
+                // Peer reported the chunk missing (Phase 1):
+                // report the miss so a HostBuffer holder reseeds.
+                // The manifest path is the binding here (content
+                // id == chunk id); the repair loop gossips with
+                // the true content binding for shards.
+                self.send_missing_chunk_gossip(response.chunk_id, response.chunk_id)
+                    .await;
+            }
+        }
     }
 
     /// Reassemble a compute/payment fragment and dispatch by message type
@@ -1158,6 +1232,24 @@ impl NodeRunner {
             Ok(fragment) => fragment,
             Err(_) => return,
         };
+
+        // Claim gate: only fragments that START a maintenance message
+        // (fragment 0 carrying a maintenance type byte) or continue a
+        // session already in progress. Everything else belongs to
+        // another dispatcher's namespace.
+        let starts = fragment.fragment_id == 0
+            && fragment
+                .data
+                .first()
+                .is_some_and(|&t| (MSG_BODY_GOSSIP..=MSG_BODY_SWAP_ABORT).contains(&t));
+        let continues = {
+            let state = self.maintenance_state.lock().await;
+            state.reassembler.total_expected().is_some()
+                && state.reassembler.can_accept(&fragment)
+        };
+        if !starts && !continues {
+            return;
+        }
 
         let completed = {
             let mut state = self.maintenance_state.lock().await;
@@ -3056,51 +3148,59 @@ impl NodeRunner {
         Ok((content_id, manifest, content_pub_key))
     }
 
-    /// Build a forward anonymous request (hybrid-only, Phase 0).
+    /// Create a reply-session SURB and register the decryption key
     ///
-    /// Requires the forward peer's ML-KEM key (handshake-learned). No
-    /// classical fallback — mixed-version networks are not supported.
-    /// Classical return route for requests (Phase 7, Task 2).
-    ///
-    /// [`MIN_HOPS`] random intermediates + us as destination (direct
-    /// self-route only on tiny networks), so a responder cannot link the
-    /// response origin to our address.
-    async fn anonymous_return_route(&self) -> Route {
-        let hybrid = self.transport.build_self_return_route().await;
-        Route {
-            hops: hybrid
-                .hops
-                .iter()
-                .map(|h| RouteHop {
-                    public_key: h.classical_public_key,
-                    node_id: h.node_id,
-                })
-                .collect(),
-            destination: hybrid.destination,
+    /// The SURB routes back through [`MIN_HOPS`] random intermediates
+    /// (direct self-route on tiny networks). The session key material is
+    /// stored so inbound [`SessionReply`] fragments can be decrypted
+    /// end-to-end; bounded FIFO with TTL cleanup.
+    async fn new_reply_session(&self) -> anyhow::Result<Surb> {
+        let route = self.transport.build_self_return_route().await;
+        let (surb, _secret) = create_surb_hybrid(&route)
+            .map_err(|e| anyhow::anyhow!("SURB creation failed: {}", e))?;
+        {
+            let mut sessions = self.surb_sessions.lock().await;
+            if sessions.len() >= MAX_SURB_SESSIONS {
+                if let Some(oldest) = sessions.keys().next().copied() {
+                    sessions.remove(&oldest);
+                }
+            }
+            sessions.insert(
+                surb.session_id(),
+                SurbSessionKey {
+                    body_aead_key: surb.body_aead_key.clone(),
+                    aad_destination: surb.aad_destination,
+                    created_at: current_timestamp(),
+                },
+            );
         }
+        Ok(surb)
     }
 
-    /// Build a chunk-retrieval request packet (Phase 7, Task 2).
+    /// Send a session-based chunk request for `chunk_id` to `peer`
     ///
-    /// Forward route: [`MIN_HOPS`] intermediates + the candidate holder
-    /// (direct route only on tiny networks) via
-    /// [`TransportState::build_route_to_destination`].
-    async fn build_forward_request(
+    /// The request embeds the serialized SURB and is fragmented across
+    /// hybrid Sphinx packets routed to the holder over an anonymous
+    /// forward route. Responses return through the reply session
+    /// established by the SURB.
+    async fn send_surb_request(
         &self,
         chunk_id: ChunkId,
         peer: &static_mesh::routing::KnownNode,
-        return_route: &Route,
-    ) -> anyhow::Result<static_sphinx::SphinxPacket> {
+        surb: &Surb,
+    ) -> anyhow::Result<()> {
         let forward = self
             .transport
             .build_route_to_destination(peer.node_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("No route to candidate holder"))?;
-        Ok(static_mesh::retrieval::create_anonymous_request_hybrid(
-            chunk_id,
-            return_route,
-            &forward,
-        )?)
+        let packets =
+            static_mesh::retrieval::create_surb_request_packets(chunk_id, surb, &forward)?;
+        let first_hop = forward.hops[0].node_id;
+        for pkt in packets {
+            static_mesh::transport::send_sphinx(&self.transport, first_hop, pkt).await?;
+        }
+        Ok(())
     }
 
     /// Issue `ChunkRequest`s for pending swaps still waiting for data (S0)
@@ -3135,8 +3235,16 @@ impl NodeRunner {
             return 0;
         }
 
-        // Return route back to ourselves (3 intermediates + us, Phase 7).
-        let return_route = self.anonymous_return_route().await;
+        // One reply session per tick: all swap chunk requests share it
+        // (fragments of different responses interleave safely; the
+        // reassembler keys by proposal ID).
+        let surb = match self.new_reply_session().await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("Swap retrieval tick: cannot create reply session: {}", e);
+                return 0;
+            }
+        };
 
         let mut sent = 0;
         for (pid, peer, chunk_id) in targets {
@@ -3148,28 +3256,13 @@ impl NodeRunner {
                 );
                 continue;
             };
-            let packet = match self.build_forward_request(chunk_id, &peer_node, &return_route).await {
-                Ok(pkt) => pkt,
-                Err(e) => {
-                    debug!("Swap {:02x?}: cannot build retrieval request: {}", pid, e);
-                    continue;
-                }
-            };
-            // Deliver to the route's first hop (a random intermediary).
-            let first_hop = match self
-                .transport
-                .build_route_to_destination(peer)
-                .await
-            {
-                Some(r) => r.hops[0].node_id,
-                None => continue,
-            };
+            if let Err(e) = self.send_surb_request(chunk_id, &peer_node, &surb).await {
+                debug!("Swap {:02x?}: cannot send retrieval request: {}", pid, e);
+                continue;
+            }
             // Open the response session keyed by proposal ID so the
             // returning fragments have a reassembler to land in.
             self.retriever.lock().await.start_retrieval(pid);
-            if static_mesh::transport::send_sphinx(&self.transport, first_hop, packet)
-                .await
-                .is_ok()
             {
                 self.transport
                     .swap_state
@@ -3211,8 +3304,9 @@ impl NodeRunner {
             return Err(anyhow::anyhow!("No known peers to request manifest from"));
         }
 
-        // Return route back to ourselves (3 intermediates + us, Phase 7).
-        let return_route = self.anonymous_return_route().await;
+        // Reply-session SURB back to ourselves (3 intermediates + us, Phase 7):
+        // one session covers the manifest request and all shard responses.
+        let surb = self.new_reply_session().await?;
 
         // Hybrid-capable peers only (hybrid mandate).
         let peers: Vec<_> = known_nodes
@@ -3231,12 +3325,8 @@ impl NodeRunner {
             manager.start_retrieval(content_id);
         }
         for peer in &peers {
-            if let Ok(pkt) = self.build_forward_request(content_id, peer, &return_route).await {
-                // Deliver to the route's first hop (random intermediary).
-                let Some(fwd) = self.transport.build_route_to_destination(peer.node_id).await else {
-                    continue;
-                };
-                let _ = static_mesh::transport::send_sphinx(&self.transport, fwd.hops[0].node_id, pkt).await;
+            if let Err(e) = self.send_surb_request(content_id, peer, &surb).await {
+                debug!("Manifest request to peer failed: {}", e);
             }
         }
 
@@ -3262,7 +3352,7 @@ impl NodeRunner {
         let manifest = Self::decrypt_manifest_response(&manifest_bytes, content_pub_key)?;
 
         // 3. Assemble file from manifest (local + network shards).
-        self.fetch_and_assemble(manifest, &return_route, &peers).await
+        self.fetch_and_assemble(manifest, &surb, &peers).await
     }
 
     /// Decrypt manifest bytes stored locally (EncryptedManifest JSON).
@@ -3340,7 +3430,7 @@ impl NodeRunner {
     async fn fetch_shards(
         &self,
         manifest: &ContentManifest,
-        return_route: &Route,
+        surb: &Surb,
         peers: &[&static_mesh::routing::KnownNode],
         timeout_secs: u64,
     ) -> anyhow::Result<Vec<Option<EncryptedChunk>>> {
@@ -3380,16 +3470,12 @@ impl NodeRunner {
             }
         }
 
-        // Broadcast missing shard requests to all peers.
+        // Broadcast missing shard requests to all peers (reply session).
         let pending_ids: Vec<ChunkId> = self.content_retriever.lock().await.pending.keys().cloned().collect();
         for chunk_id in &pending_ids {
             for peer in peers {
-                if let Ok(pkt) = self.build_forward_request(*chunk_id, peer, return_route).await {
-                    // Deliver to the route's first hop (random intermediary).
-                    let Some(fwd) = self.transport.build_route_to_destination(peer.node_id).await else {
-                        continue;
-                    };
-                    let _ = static_mesh::transport::send_sphinx(&self.transport, fwd.hops[0].node_id, pkt).await;
+                if let Err(e) = self.send_surb_request(*chunk_id, peer, surb).await {
+                    debug!("Shard request to peer failed: {}", e);
                 }
             }
         }
@@ -3425,10 +3511,10 @@ impl NodeRunner {
     async fn fetch_and_assemble(
         &self,
         manifest: ContentManifest,
-        return_route: &Route,
+        surb: &Surb,
         peers: &[&static_mesh::routing::KnownNode],
     ) -> anyhow::Result<Vec<u8>> {
-        let shards = self.fetch_shards(&manifest, return_route, peers, 30).await?;
+        let shards = self.fetch_shards(&manifest, surb, peers, 30).await?;
 
         if manifest.encrypted_master_key.len() != 32 {
             anyhow::bail!("Manifest missing master key");
@@ -3857,6 +3943,21 @@ async fn lease_expiration_and_repair_loop(runner: Arc<NodeRunner>) {
         // 3. Then pending 2-phase swap timeouts: abort + release the
         // reserved capacity so a crashed peer cannot strand barter.
         runner.transport.expire_pending_swaps().await;
+        // 4. Reply-session hygiene (SURB per-fragment compression):
+        // expire hop-side cached sessions, stale SURB-request
+        // reassemblies, and our own tracked session keys. One lock at a
+        // time.
+        let now = current_timestamp();
+        runner.transport.mix_node.lock().await.clean_expired_sessions(now);
+        runner
+            .transport
+            .pending_requests
+            .lock()
+            .await
+            .cleanup_expired(static_mesh::transport::SURB_REQUEST_TIMEOUT_SECS);
+        runner.surb_sessions.lock().await.retain(|_, key| {
+            now.saturating_sub(key.created_at) < SURB_SESSION_TTL_SECS
+        });
     }
 }
 
@@ -4049,10 +4150,16 @@ async fn repair_content_once(
             }
         }
 
-        // Return route (3 intermediates + us, Phase 7).
-        let return_route = runner.anonymous_return_route().await;
+        // Reply-session SURB (3 intermediates + us, Phase 7).
+        let surb = match runner.new_reply_session().await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("Repair fetch: cannot create reply session: {}", e);
+                return Ok(0);
+            }
+        };
         let fetched = runner
-            .fetch_shards(manifest, &return_route, &peers, 30)
+            .fetch_shards(manifest, &surb, &peers, 30)
             .await
             .unwrap_or_default();
         // Merge fetched shards into the availability vector.

@@ -432,11 +432,10 @@ talk to Phase 7 nodes (by design — no backward compatibility).
   Sends target the route's first hop (random intermediary), never the
   destination directly.
 - SURB batch-hybrid added (`create_surb_batch_hybrid`); SURB return routes
-  are proven at the protocol layer (roundtrip + blindness tests). Full
-  per-fragment SURB retrieval remains future work: one hybrid SURB is
-  ~5.6 KB, so embedding 1038 SURBs for a 1 MiB chunk response cannot fit
-  the wire — the 3-intermediate ReturnRoute gives the responder-path
-  anonymity MVP.
+  are proven at the protocol layer (roundtrip + blindness tests).
+- SURB Per-Fragment Compression (reply sessions) ✅ (see below): large
+  retrievals use ONE SURB per retrieval + 64-byte session reply headers —
+  request overhead drops from ~5.7 MiB (1038 SURBs) to one 5.9 KiB SURB.
 - Gossip fan-out capped at 10 random connected peers (was: all).
 
 ### P0-3 ✅ Encrypted, Padded Handshake
@@ -447,6 +446,38 @@ talk to Phase 7 nodes (by design — no backward compatibility).
   ChaCha20-Poly1305, AAD = hello_nonce || welcome_nonce (session binding).
 - All three handshake messages padded (random) to the uniform wire size —
   indistinguishable to an observer.
+
+### P0-4b ✅ SURB Per-Fragment Compression (Reply Sessions)
+- Large anonymous retrievals no longer need per-fragment return info. The
+  requester embeds ONE hybrid SURB (session id included) in a fragmented
+  chunk request; the first response fragment travels as a normal SURB-
+  wrapped Sphinx packet and every hop caches the reply session during its
+  traversal (detected internally via the placeholder-MAC path — no wire
+  leak). Subsequent fragments travel as lightweight session replies:
+  `[version=2][32-byte session_id][32-byte nonce][1040-byte onion body]`,
+  padded to the hybrid Sphinx payload size for wire uniformity.
+- `SphinxHeader.session_id` (32 B, MAC-covered): random bytes on forward
+  packets, requester-chosen id in SURBs; every Sphinx packet grows exactly
+  +32 bytes (uniform wire break, Phase 7 precedent).
+- Session state per hop: bounded FIFO cache (4096 sessions, 1 h TTL),
+  per-session nonce anti-replay (2048 nonces FIFO), `clean_expired_sessions`
+  hooked into the lifecycle loop. Session creation is MAC-gated, so only
+  real SURB holders can establish sessions.
+- Session replies: no KEM, no routing MAC — session lookup + nonce check +
+  one size-preserving XOR body layer peel + forward. The innermost layer
+  stays the requester's ChaCha20-Poly1305 AEAD (AAD = destination), so
+  end-to-end integrity and anonymity are unchanged; the responder never
+  learns anything beyond the SURB's first hop.
+- Wire: session replies ride the `MSG_SPHINX` type byte with a version-2
+  payload (deterministic discriminator; same size/framing as hybrid
+  Sphinx). Requester-side key material tracked in bounded
+  `surb_sessions` (256, TTL). `retrieve_content`, `fetch_shards`, swap
+  retrievals, and repair fetches all use reply sessions.
+- Maintenance dispatch now runs first with a type-byte claim gate, so
+  single-fragment maintenance messages (swap commits) are not absorbed by
+  other dispatchers' reassemblers.
+- Per-fragment overhead: 5.6 KiB → 64 bytes (session id + nonce); per-
+  fragment CPU: KEM encapsulation → one XOR stream pass.
 
 ### P0-4 ✅ Sphinx Body Authentication + Fixed KEM Block
 - Body AEAD (Task 4a): innermost layer is ChaCha20-Poly1305
@@ -484,8 +515,10 @@ talk to Phase 7 nodes (by design — no backward compatibility).
 ### Known trade-offs (documented, intentional)
 - Direct fallback routes on <4-node networks (bootstrap/tests); production
   networks get 3 intermediates + destination on every path.
-- SURB retrieval is protocol-ready but not yet used for multi-fragment
-  responses (size math above).
+- The reply session's first fragment and subsequent replies share one
+  session id on the same connection path — per-hop linkability of a
+  retrieval's own reply stream (inherent to session establishment;
+  outsiders still see uniform 6698-byte payloads).
 - `Handshake` wire variant retained for reconnection signaling + tests only.
 
-Suite: 402 tests, release build zero warnings.
+Suite: 410 tests, release build zero warnings.

@@ -30,6 +30,12 @@ pub const MSG_CHUNK_RESPONSE: u8 = 0x02;
 /// Legit return routes are 1 hop; cap prevents `u32::MAX` pre-alloc.
 pub const MAX_RETRIEVAL_ROUTE_HOPS: usize = 32;
 
+/// Maximum serialized SURB bytes accepted in a chunk request (DoS bound).
+///
+/// A hybrid SURB is ~5.9 KiB; the cap allows hybrid SURBs plus slack
+/// while rejecting absurd allocations.
+pub const MAX_SERIALIZED_SURB_SIZE: usize = 16 * 1024;
+
 /// A chunk request sent through the mixnet
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChunkRequest {
@@ -38,6 +44,15 @@ pub struct ChunkRequest {
     /// A return route for the response (Sphinx reply block)
     /// This is a pre-built route back to the requester
     pub return_route: ReturnRoute,
+    /// Serialized SURB for session-based responses (optional)
+    ///
+    /// When present, responses travel as a reply-session: the first
+    /// fragment wrapped with the full SURB (establishing the cached
+    /// session at every hop), subsequent fragments as lightweight
+    /// session replies. The SURB is opaque to the holder beyond the
+    /// first hop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surb: Option<Vec<u8>>,
 }
 
 /// A chunk response sent through the mixnet
@@ -118,6 +133,14 @@ pub fn serialize_request(req: &ChunkRequest) -> Vec<u8> {
     }
     buf.extend_from_slice(&req.return_route.destination);
 
+    // Optional serialized SURB ([1 present][4 len][bytes]); older
+    // requests end at the destination and parse without it.
+    if let Some(surb) = &req.surb {
+        buf.push(1);
+        buf.extend_from_slice(&(surb.len() as u32).to_be_bytes());
+        buf.extend_from_slice(surb);
+    }
+
     buf
 }
 
@@ -193,10 +216,39 @@ pub fn deserialize_request(data: &[u8]) -> Result<ChunkRequest, StorageError> {
     }
     let mut destination = [0u8; 16];
     destination.copy_from_slice(&data[offset..offset + 16]);
+    offset += 16;
+
+    // Optional serialized SURB suffix (session-based requests). Sphinx
+    // bodies are zero-padded to BODY_SIZE; a genuine suffix always has
+    // non-zero bytes (its present marker is 1), so all-zero tails are
+    // padding.
+    let has_surb = data.len() > offset && data[offset..].iter().any(|&b| b != 0);
+    let surb = if has_surb {
+        if offset + 5 > data.len() || data[offset] != 1 {
+            return Err(StorageError::InvalidChunkSize {
+                expected: offset + 5,
+                actual: data.len(),
+            });
+        }
+        let surb_len = u32::from_be_bytes([
+            data[offset + 1], data[offset + 2], data[offset + 3], data[offset + 4],
+        ]) as usize;
+        if surb_len > MAX_SERIALIZED_SURB_SIZE || data.len() < offset + 5 + surb_len {
+            return Err(StorageError::InvalidChunkSize {
+                expected: MAX_SERIALIZED_SURB_SIZE,
+                actual: surb_len,
+            });
+        }
+        let surb = data[offset + 5..offset + 5 + surb_len].to_vec();
+        Some(surb)
+    } else {
+        None
+    };
 
     Ok(ChunkRequest {
         chunk_id,
         return_route: ReturnRoute { hops, destination },
+        surb,
     })
 }
 
@@ -519,7 +571,7 @@ mod tests {
                 hops: vec![random_route_hop(), random_route_hop()],
                 destination: random_node_id(),
             },
-        };
+            surb: None, };
 
         let serialized = serialize_request(&req);
         let deserialized = deserialize_request(&serialized).unwrap();
@@ -537,7 +589,7 @@ mod tests {
                 hops: vec![],
                 destination: random_node_id(),
             },
-        };
+            surb: None, };
 
         let serialized = serialize_request(&req);
         let deserialized = deserialize_request(&serialized).unwrap();
@@ -606,7 +658,7 @@ mod tests {
                 hops: vec![],
                 destination: random_node_id(),
             },
-        };
+            surb: None, };
 
         let resp = holder.handle_request(&req).unwrap();
         assert!(resp.found);
@@ -623,7 +675,7 @@ mod tests {
                 hops: vec![],
                 destination: random_node_id(),
             },
-        };
+            surb: None, };
 
         let resp = holder.handle_request(&req).unwrap();
         assert!(!resp.found);

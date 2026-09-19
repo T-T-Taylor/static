@@ -22,8 +22,9 @@ use crate::fragment::{
 };
 use static_sphinx::{
     Route, SphinxPacket, process_packet, RoutingFlag,
-    BODY_SIZE, MixNode,
+    BODY_SIZE, MixNode, SessionReply, Surb, NodeId,
 };
+use static_crypto::{encrypt_aad, decrypt_aad, NonceBytes};
 use static_sphinx::{HybridRoute, HybridRouteHop, create_packet_hybrid};
 use static_storage::ChunkId;
 use static_storage::retrieval::{
@@ -33,6 +34,21 @@ use static_storage::retrieval::{
 };
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
+
+/// Body type marker for fragmented SURB chunk requests
+///
+/// Prefixes each Sphinx body carrying one fragment of a session-based
+/// chunk request: `[MSG_SURB_CHUNK_REQUEST][32-byte session id]
+/// [fragment]`. A separate namespace from the wire type bytes (these
+/// markers live inside encrypted Sphinx bodies).
+pub const MSG_SURB_CHUNK_REQUEST: u8 = 0x03;
+
+/// Fragment data chunk size for SURB chunk requests.
+///
+/// The wrapper (`[1 type][32 session id][12-byte fragment header]`) must
+/// fit the Sphinx body together with the data chunk:
+/// 1 + 32 + 12 + [`SURB_REQUEST_CHUNK_SIZE`] = [`BODY_SIZE`].
+pub const SURB_REQUEST_CHUNK_SIZE: usize = BODY_SIZE - 1 - 32 - 12;
 
 /// Maximum concurrent pending chunk retrievals.
 ///
@@ -236,6 +252,7 @@ pub fn create_anonymous_request_hybrid(
     let request = ChunkRequest {
         chunk_id,
         return_route: return_info,
+        surb: None,
     };
 
     // Serialize the request
@@ -333,6 +350,165 @@ pub fn handle_retrieval_request(
     }
 
     Ok(packets)
+}
+
+/// Fragment `request_bytes` into SURB chunk-request Sphinx bodies
+///
+/// Each body: `[MSG_SURB_CHUNK_REQUEST][32-byte session id]
+/// [fragment]` — exactly [`BODY_SIZE`] bytes. The receiving holder keys
+/// reassembly by the session id.
+fn build_surb_request_bodies(request_bytes: &[u8], session_id: &[u8; 32]) -> Vec<Vec<u8>> {
+    // Custom chunk size so type + session id + fragment header + data
+    // fits exactly one Sphinx body.
+    let total = ((request_bytes.len() + SURB_REQUEST_CHUNK_SIZE - 1) / SURB_REQUEST_CHUNK_SIZE).max(1);
+    let mut bodies = Vec::with_capacity(total);
+    for i in 0..total {
+        let start = i * SURB_REQUEST_CHUNK_SIZE;
+        let end = (start + SURB_REQUEST_CHUNK_SIZE).min(request_bytes.len());
+        let data = &request_bytes[start..end];
+        let mut body = Vec::with_capacity(BODY_SIZE);
+        body.push(MSG_SURB_CHUNK_REQUEST);
+        body.extend_from_slice(session_id);
+        // Compact fragment framing (12-byte header + data): the padded
+        // `serialize_fragment` form would not leave room for the type
+        // byte + session id inside one Sphinx body.
+        body.extend_from_slice(&(i as u32).to_be_bytes());
+        body.extend_from_slice(&(total as u32).to_be_bytes());
+        body.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        body.extend_from_slice(data);
+        bodies.push(body);
+    }
+    bodies
+}
+
+/// Build the hybrid Sphinx packets carrying a session-based chunk request
+///
+/// The request embeds the serialized SURB (~5.7 KiB) and is fragmented
+/// across multiple Sphinx packets routed over `forward_route` (3-hop
+/// anonymous path to the holder). The holder reassembles by session id
+/// and responds through the reply session.
+pub fn create_surb_request_packets(
+    chunk_id: ChunkId,
+    surb: &Surb,
+    forward_route: &HybridRoute,
+) -> Result<Vec<SphinxPacket>, RetrievalError> {
+    let request = ChunkRequest {
+        chunk_id,
+        return_route: ReturnRoute { hops: vec![], destination: surb.aad_destination },
+        surb: Some(surb.serialize()),
+    };
+    let request_bytes = serialize_request(&request);
+    let bodies = build_surb_request_bodies(&request_bytes, &surb.session_id());
+    let mut packets = Vec::with_capacity(bodies.len());
+    for body in bodies {
+        let packet = create_packet_hybrid(forward_route, &body)
+            .map_err(|_| RetrievalError::SphinxError)?;
+        packets.push(packet);
+    }
+    Ok(packets)
+}
+
+/// Response packets for a session-based chunk retrieval
+pub struct SurbReplyPackets {
+    /// First fragment: a normal Sphinx packet wrapped with the full
+    /// SURB (its traversal caches the session at every hop)
+    pub first_packet: SphinxPacket,
+    /// Remaining fragments as lightweight session replies
+    pub session_replies: Vec<SessionReply>,
+    /// Where to send everything (the SURB's first hop)
+    pub first_hop: NodeId,
+}
+
+/// Handle a session-based retrieval request at a holding node
+///
+/// The request embeds a serialized SURB. The response is fragmented:
+/// the first fragment is wrapped with the full SURB
+/// ([`Surb::wrap_with_surb_hybrid`] semantics — a normal Sphinx packet
+/// whose traversal establishes the cached reply session at each hop);
+/// every subsequent fragment is a [`SessionReply`] onion-encrypted with
+/// the SURB's per-hop body keys (XOR layers) around the requester's
+/// end-to-end AEAD. Each session reply carries a fresh random 32-byte
+/// nonce (anti-replay at the hops; also the AEAD nonce prefix). All
+/// packets are sent to [`SurbReplyPackets::first_hop`]; the holder
+/// learns nothing about the requester beyond that hop.
+pub fn handle_retrieval_request_with_surb(
+    request_body: &[u8],
+    chunk_data: Option<&[u8]>,
+) -> Result<SurbReplyPackets, RetrievalError> {
+    let request = deserialize_request(request_body)
+        .map_err(|_| RetrievalError::InvalidRequest)?;
+    let surb_bytes = request.surb.as_ref().ok_or(RetrievalError::InvalidRequest)?;
+    let surb = Surb::deserialize(surb_bytes).map_err(|_| RetrievalError::SphinxError)?;
+
+    let response = ChunkResponse {
+        chunk_id: request.chunk_id,
+        chunk_data: chunk_data.map(|d| d.to_vec()).unwrap_or_default(),
+        found: chunk_data.is_some(),
+    };
+    let response_bytes = serialize_response(&response);
+    let fragments = fragment_payload(&response_bytes);
+
+    // First fragment: full SURB (normal Sphinx packet).
+    let first_fragment_body = serialize_fragment(&fragments[0]);
+    let first_packet = static_sphinx::wrap_with_surb_hybrid(&surb, &first_fragment_body)
+        .map_err(|_| RetrievalError::SphinxError)?;
+
+    // Remaining fragments: lightweight session replies (onion-encrypted
+    // with the SURB's per-hop body keys around the end-to-end AEAD;
+    // fresh random nonce per fragment).
+    let session_replies = build_session_replies(&surb, &fragments[1..]);
+
+    Ok(SurbReplyPackets {
+        first_packet,
+        session_replies,
+        first_hop: surb.first_hop,
+    })
+}
+
+/// Onion-encrypt and collect session replies for the given fragments
+///
+/// Body construction mirrors `wrap_with_surb_hybrid`: the fragment is
+/// AEAD-encrypted with the requester's body AEAD key (AAD = return
+/// destination), then XOR-onion-layered with the per-hop body keys,
+/// last hop first. Fresh random 32-byte nonces prevent AEAD nonce
+/// reuse across the session and provide per-hop anti-replay.
+fn build_session_replies(
+    surb: &Surb,
+    fragments: &[crate::fragment::Fragment],
+) -> Vec<SessionReply> {
+    use rand::RngCore;
+    let mut replies = Vec::with_capacity(fragments.len());
+    for fragment in fragments {
+        let plaintext = serialize_fragment(fragment);
+        let mut nonce = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let aead_nonce = NonceBytes::from_bytes(nonce[..12].try_into().expect("12 bytes"));
+        let mut body = encrypt_aad(&surb.body_aead_key, &aead_nonce, &plaintext, &surb.aad_destination);
+        for i in (0..surb.body_keys.len()).rev() {
+            static_sphinx::xor_body_pub(&surb.body_keys[i], &mut body);
+        }
+        replies.push(SessionReply {
+            session_id: surb.session_id(),
+            nonce,
+            body,
+        });
+    }
+    replies
+}
+
+/// Decrypt the final body layer of a session reply at the requester
+///
+/// The reply's body is the requester's end-to-end AEAD ciphertext (all
+/// hop XOR layers already peeled by the mixnet). Returns the 1024-byte
+/// padded plaintext (a serialized response fragment).
+pub fn decrypt_session_reply_body(
+    reply: &SessionReply,
+    body_aead_key: &static_crypto::SymmetricKey,
+    aad_destination: &NodeId,
+) -> Result<Vec<u8>, RetrievalError> {
+    let aead_nonce = NonceBytes::from_bytes(reply.nonce[..12].try_into().expect("12 bytes"));
+    decrypt_aad(body_aead_key, &aead_nonce, &reply.body, aad_destination)
+        .map_err(|_| RetrievalError::SphinxError)
 }
 
 /// Process incoming Sphinx packets at the requester
@@ -631,7 +807,7 @@ mod tests {
         let request = ChunkRequest {
             chunk_id,
             return_route: ReturnRoute::from_sphinx_route(&return_route_route(&return_route)),
-        };
+            surb: None, };
         let request_bytes = serialize_request(&request);
 
         let lookup = kem_lookup_for(&ret_nodes, &requester);
@@ -653,7 +829,7 @@ mod tests {
                 }],
                 destination: [0x01u8; 16],
             },
-        };
+            surb: None, };
         let request_bytes = serialize_request(&request);
         let lookup = |_id: &[u8; 16]| -> Option<Vec<u8>> { None };
         let result = handle_retrieval_request(&request_bytes, None, &lookup);
@@ -868,5 +1044,136 @@ mod tests {
         assert!(response.found);
         assert_eq!(response.chunk_id, chunk_id);
         assert_eq!(response.chunk_data, chunk_data);
+    }
+
+    /// In-process SURB reply-session round trip: the requester creates a
+    /// SURB over a 3-hop return route, the holder serves a full chunk
+    /// (first fragment via the SURB, rest as session replies), every
+    /// hop processes Sphinx packets and session replies, and the
+    /// requester reassembles the response.
+    #[test]
+    fn test_large_retrieval_with_session() {
+        let (mut fwd_nodes, fwd_hybrid, _fc) = hybrid_route(3);
+        let mut forward_route = fwd_hybrid;
+        let mut holder = HybridMixNode::new();
+        forward_route.hops.push(holder.as_hop());
+        forward_route.destination = holder.node_id();
+
+        // Return route: 3 intermediates + requester.
+        let (mut ret_nodes, ret_hybrid, _rc) = hybrid_route(4);
+        let mut requester = HybridMixNode::new();
+        let requester_id = requester.node_id();
+        let return_route = HybridRoute {
+            hops: {
+                let mut h = ret_hybrid.hops;
+                h.push(requester.as_hop());
+                h
+            },
+            destination: requester_id,
+        };
+
+        let (surb, _secret) = static_sphinx::create_surb_hybrid(&return_route).unwrap();
+        let chunk_id = random_chunk_id();
+        let chunk_data = vec![0xA7u8; static_storage::CHUNK_SIZE + 16];
+
+        // Build + deliver the fragmented session-based request.
+        let packets = create_surb_request_packets(chunk_id, &surb, &forward_route).unwrap();
+        let mut request_bytes: Option<Vec<u8>> = None;
+        {
+            let mut mgr = crate::fragment::ReassemblyManager::new();
+            for pkt in packets {
+                let mut current = pkt;
+                for node in fwd_nodes.iter_mut() {
+                    let r = process_packet_hybrid(node, current).unwrap();
+                    assert_eq!(r.flag, RoutingFlag::Forward);
+                    current = r.forward_packet.unwrap();
+                }
+                let r = process_packet_hybrid(&mut holder, current).unwrap();
+                assert_eq!(r.flag, RoutingFlag::Destination);
+                let body = r.body.unwrap();
+                assert_eq!(body.len(), BODY_SIZE);
+                assert_eq!(body[0], MSG_SURB_CHUNK_REQUEST);
+                let mut sid = [0u8; 32];
+                sid.copy_from_slice(&body[1..33]);
+                assert_eq!(sid, surb.session_id());
+                let fragment = deserialize_fragment(&body[33..]).unwrap();
+                let key = u64::from_be_bytes(sid[..8].try_into().unwrap());
+                if !mgr.add_fragment(key, fragment) {
+                    continue;
+                }
+                if mgr.get(key).unwrap().is_complete() {
+                    request_bytes = Some(mgr.get(key).unwrap().reassemble().unwrap());
+                    mgr.remove(key);
+                }
+            }
+        }
+        let request_bytes = request_bytes.expect("request reassembled at holder");
+
+        // Holder serves the request: first Sphinx fragment + session replies.
+        let replies =
+            handle_retrieval_request_with_surb(&request_bytes, Some(&chunk_data)).unwrap();
+        assert_eq!(replies.first_hop, return_route.hops[0].node_id);
+        let fragment_count =
+            crate::fragment::fragment_payload(&serialize_response(&ChunkResponse {
+                chunk_id,
+                chunk_data: chunk_data.clone(),
+                found: true,
+            }))
+            .len();
+        assert_eq!(replies.session_replies.len() + 1, fragment_count);
+
+        // Requester tracks the session for end-to-end decryption.
+        let mut manager = RetrievalManager::new();
+        manager.start_retrieval(chunk_id);
+
+        // 1. First fragment: Sphinx packet through the mixnet.
+        let mut current = replies.first_packet;
+        for node in ret_nodes.iter_mut() {
+            let r = process_packet_hybrid(node, current).unwrap();
+            assert_eq!(r.flag, RoutingFlag::Forward);
+            current = r.forward_packet.unwrap();
+        }
+        let r = process_packet_hybrid(&mut requester, current).unwrap();
+        assert_eq!(r.flag, RoutingFlag::Destination);
+        let first_body = r.body.unwrap();
+        if let Ok(Some(_)) = manager.process_fragment(&first_body) {
+            // complete on the first fragment would be wrong for a large chunk
+        }
+
+        // 2. Session replies through the hops, then decrypted at the requester.
+        let aead_key = surb.body_aead_key.clone();
+        for reply in replies.session_replies {
+            let mut current_reply = reply;
+            for node in ret_nodes.iter_mut() {
+                let outcome = static_sphinx::process_session_reply(
+                    &mut node.classical,
+                    current_reply,
+                    0,
+                )
+                .unwrap();
+                assert!(!outcome.is_final, "intermediate hops must not be final");
+                current_reply = outcome.reply;
+            }
+            let outcome = static_sphinx::process_session_reply(
+                &mut requester.classical,
+                current_reply,
+                0,
+            )
+            .unwrap();
+            assert!(outcome.is_final);
+            let plaintext = decrypt_session_reply_body(
+                &outcome.reply,
+                &surb.body_aead_key,
+                &requester_id,
+            )
+            .unwrap();
+            if let Ok(Some(response)) = manager.process_fragment(&plaintext) {
+                assert!(response.found);
+                assert_eq!(response.chunk_id, chunk_id);
+                assert_eq!(response.chunk_data, chunk_data);
+                return;
+            }
+        }
+        panic!("session replies did not complete the retrieval");
     }
 }
