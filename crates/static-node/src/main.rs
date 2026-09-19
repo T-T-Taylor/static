@@ -688,10 +688,25 @@ async fn send_api_request(api_addr: &str, request: &ApiRequest) -> Result<ApiRes
     let mut stream = TcpStream::connect(api_addr).await?;
     let request_bytes = serde_json::to_vec(request)?;
     stream.write_all(&request_bytes).await?;
+    // Half-close writes so the server sees EOF promptly; then read the
+    // response chunked until EOF (server closes after responding).
+    let _ = stream.shutdown().await;
+    const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+    let mut buf = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if buf.len() + n > MAX_RESPONSE_BYTES {
+                    anyhow::bail!("API response too large");
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) => anyhow::bail!("API read failed: {}", e),
+        }
+    }
 
-    let mut buf = vec![0u8; 1024 * 1024 * 10]; // 10MB buffer for large files
-    let n = stream.read(&mut buf).await?;
-
-    let response: ApiResponse = serde_json::from_slice(&buf[..n])?;
+    let response: ApiResponse = serde_json::from_slice(&buf)?;
     Ok(response)
 }

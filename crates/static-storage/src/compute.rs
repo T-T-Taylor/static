@@ -67,6 +67,9 @@ pub const MAX_TX_HASH_SIZE: usize = 1024;
 /// Maximum embedded [`PaymentRequest`] blob in a [`ComputeResponse`] (bytes)
 pub const MAX_PAYMENT_REQUEST_SIZE: usize = 2048;
 
+/// Maximum return-route hops accepted during deserialization (DoS bound).
+pub const MAX_COMPUTE_ROUTE_HOPS: usize = 32;
+
 /// Supported cryptocurrencies for compute payment
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
@@ -382,6 +385,9 @@ pub fn deserialize_request(data: &[u8]) -> Result<ComputeRequest, StorageError> 
     ]) as usize;
     offset += 4;
 
+    if hop_count > MAX_COMPUTE_ROUTE_HOPS {
+        return Err(short(MAX_COMPUTE_ROUTE_HOPS));
+    }
     if offset + hop_count * 48 + 16 > data.len() {
         return Err(short(offset + hop_count * 48 + 16));
     }

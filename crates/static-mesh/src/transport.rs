@@ -269,7 +269,11 @@ pub struct TokenBucket {
     pub max_tokens: u64,
     /// Refill rate (bytes per second)
     pub refill_rate: u64,
-    /// Last refill timestamp (unix secs)
+    /// Last refill timestamp (unix millis; P1-cover ms granularity).
+    ///
+    /// Historically seconds; now millis so 100 ms cover ticks refill
+    /// smoothly instead of bursting once per second. `new()` still
+    /// accepts seconds for backwards compatibility and converts.
     pub last_refill: u64,
 }
 
@@ -280,25 +284,25 @@ impl TokenBucket {
             tokens: max_tokens,
             max_tokens,
             refill_rate,
-            last_refill: now_secs,
+            last_refill: now_secs.saturating_mul(1000),
         }
     }
 
-    fn now_secs() -> u64 {
+    fn now_millis() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs()
+            .as_millis() as u64
     }
 
-    /// Refill based on elapsed wall time.
+    /// Refill based on elapsed wall time (ms granularity).
     pub fn refill(&mut self) {
-        let now = Self::now_secs();
-        let elapsed = now.saturating_sub(self.last_refill);
-        if elapsed > 0 {
+        let now = Self::now_millis();
+        let elapsed_ms = now.saturating_sub(self.last_refill);
+        if elapsed_ms > 0 {
             self.tokens = self
                 .tokens
-                .saturating_add(elapsed.saturating_mul(self.refill_rate))
+                .saturating_add(elapsed_ms.saturating_mul(self.refill_rate) / 1000)
                 .min(self.max_tokens);
             self.last_refill = now;
         }
@@ -322,6 +326,11 @@ impl TokenBucket {
         self.tokens = self.tokens.min(max_tokens);
     }
 }
+
+/// Handshake nonce replay window (seconds).
+pub const HANDSHAKE_NONCE_TTL_SECS: u64 = 300;
+/// Maximum cached handshake nonces (bounded LRU-ish, FIFO eviction).
+pub const MAX_HANDSHAKE_NONCES: usize = 4096;
 
 /// Shared state for the transport layer
 pub struct TransportState {
@@ -408,6 +417,11 @@ pub struct TransportState {
     pub compute_capacity: u8,
     /// The transport implementation (TCP by default)
     pub transport: Arc<dyn Transport>,
+    /// Recently seen handshake nonces (replay cache, nonce -> unix secs).
+    ///
+    /// Bounded at [`MAX_HANDSHAKE_NONCES`] with [`HANDSHAKE_NONCE_TTL_SECS`]
+    /// TTL; std mutex (never held across await).
+    pub handshake_nonces: Arc<std::sync::Mutex<HashMap<[u8; 32], u64>>>,
 }
 
 impl TransportState {
@@ -548,7 +562,9 @@ impl TransportState {
     /// Verify an inbound handshake + key continuity against routing table.
     ///
     /// Returns true if signature valid and no known-key mismatch.
-    /// New peers are TOFU-pinned on first encounter.
+    /// New peers are TOFU-pinned on first encounter. Handshake nonces
+    /// are replay-cached (bounded, 5-min TTL): a replayed handshake
+    /// byte-string is rejected.
     pub async fn verify_handshake(&self, hs: &Handshake) -> bool {
         if !hs.verify() {
             return false;
@@ -558,6 +574,31 @@ impl TransportState {
             != static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE
         {
             return false;
+        }
+        // Nonce replay cache (H5, non-breaking): reject recently seen
+        // nonces, prune expired, bound memory.
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if let Ok(mut cache) = self.handshake_nonces.lock() {
+                cache.retain(|_, ts| now.saturating_sub(*ts) <= HANDSHAKE_NONCE_TTL_SECS);
+                if cache.contains_key(&hs.nonce) {
+                    return false;
+                }
+                if cache.len() >= MAX_HANDSHAKE_NONCES {
+                    // FIFO-ish eviction: drop one arbitrary oldest entry.
+                    if let Some(oldest) = cache
+                        .iter()
+                        .min_by_key(|(_, ts)| **ts)
+                        .map(|(k, _)| *k)
+                    {
+                        cache.remove(&oldest);
+                    }
+                }
+                cache.insert(hs.nonce, now);
+            }
         }
         // Key continuity: known node_id must present same mix + identity keys.
         if let Some(known) = self.routing_table.read().await.get_node(&hs.node_id) {
@@ -939,7 +980,7 @@ async fn connection_loop(
                 }
             }
 
-            // Cover traffic tick
+            // Cover traffic tick (P1-cover: per-node fair share).
             _ = interval.tick() => {
                 let cfg = state.cover_config.read().await.clone();
                 // Keep bucket rate in sync with config.
@@ -948,7 +989,15 @@ async fn connection_loop(
                     let cap = cfg.target_rate_bps.saturating_mul(2).max(4096);
                     bucket.set_rate(cfg.target_rate_bps, cap);
                 }
-                let target_bytes_per_interval = (cfg.target_rate_bps * cfg.interval_ms) / 1000;
+                // Per-node total stays constant: divide the interval
+                // budget by peer count so C=100 does not send 100x cover.
+                // Single lock, dropped before any send.
+                let peer_count = {
+                    let conns = state.connections.read().await;
+                    conns.len().max(1) as u64
+                };
+                let total_target = (cfg.target_rate_bps * cfg.interval_ms) / 1000;
+                let target_bytes_per_interval = total_target / peer_count.max(1);
                 // Drain queued real traffic first (still rate-limited).
                 flush_pending(&connection, &state, &peer_id, &mut pending_real, &mut bytes_this_interval).await;
                 let remaining = target_bytes_per_interval.saturating_sub(bytes_this_interval);
@@ -1865,6 +1914,7 @@ pub fn create_transport_state(
         compute_enabled: false,
         compute_capacity: 0,
         transport,
+        handshake_nonces: Arc::new(std::sync::Mutex::new(HashMap::new())),
     });
 
     (state, inbound_rx)

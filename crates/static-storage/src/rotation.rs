@@ -52,10 +52,12 @@ impl Default for RotationConfig {
     }
 }
 
+/// Maximum rotation-history entries retained (H14 bound, FIFO eviction).
+pub const MAX_ROTATION_HISTORY: usize = 10_000;
+
 /// State tracking for chunk rotation
 #[derive(Debug, Clone, Default)]
-pub struct RotationState {
-    /// Chunks that have been rotated and when (chunk_id -> unix timestamp)
+pub struct RotationState {    /// Chunks that have been rotated and when (chunk_id -> unix timestamp)
     pub rotation_history: HashMap<ChunkId, u64>,
     /// Cached chunks (chunk_id -> when cached, unix timestamp)
     pub cached_chunks: HashMap<ChunkId, u64>,
@@ -81,8 +83,13 @@ impl RotationState {
         current_time.saturating_sub(self.last_epoch) >= config.epoch_duration_secs
     }
 
-    /// Record a rotation
+    /// Record a rotation (H14: bounded history).
     pub fn record_rotation(&mut self, chunk_id: ChunkId, current_time: u64) {
+        if self.rotation_history.len() >= MAX_ROTATION_HISTORY {
+            if let Some(k) = self.rotation_history.keys().next().copied() {
+                self.rotation_history.remove(&k);
+            }
+        }
         self.rotation_history.insert(chunk_id, current_time);
         self.total_rotations += 1;
     }

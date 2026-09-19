@@ -56,11 +56,17 @@ pub const DEFAULT_PENDING_SWAP_TIMEOUT_SECS: u64 = 300;
 /// proposals can pin.
 pub const MAX_PENDING_SWAPS: usize = 32;
 
-/// Get current unix timestamp
+/// Maximum tracked pending proposals (H14 bound, FIFO eviction).
+pub const MAX_PENDING_PROPOSALS: usize = 128;
+
+/// Maximum retained completed/aborted proposal IDs (H14 bound).
+pub const MAX_COMPLETED_SWAPS: usize = 256;
+
+/// Get current unix timestamp (saturating on clock skew, never panics).
 fn current_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("clock went backwards")
+        .unwrap_or_default()
         .as_secs()
 }
 
@@ -317,8 +323,7 @@ pub struct PendingSwap {
 
 /// Local state for tracking pending and active swaps
 #[derive(Debug, Clone, Default)]
-pub struct SwapState {
-    /// Pending proposals (proposal_id -> proposal)
+pub struct SwapState {    /// Pending proposals (proposal_id -> proposal)
     pub pending_proposals: HashMap<[u8; 32], SwapProposal>,
     /// Pending 2-phase swaps (proposal_id -> pending swap)
     pub pending_swaps: HashMap<[u8; 32], PendingSwap>,
@@ -342,9 +347,14 @@ impl SwapState {
         Self::default()
     }
 
-    /// Record a pending proposal
+    /// Record a pending proposal (H14: bounded, evict arbitrary oldest).
     pub fn record_proposal(&mut self, proposal: &SwapProposal) {
         let id = proposal_id(proposal);
+        if self.pending_proposals.len() >= MAX_PENDING_PROPOSALS {
+            if let Some(k) = self.pending_proposals.keys().next().copied() {
+                self.pending_proposals.remove(&k);
+            }
+        }
         self.pending_proposals.insert(id, proposal.clone());
     }
 
@@ -448,6 +458,9 @@ impl SwapState {
         self.successful_swaps += 1;
         self.total_swapped_bytes += swap.reserved_bytes;
         self.completed_swaps.push(*proposal_id);
+        while self.completed_swaps.len() > MAX_COMPLETED_SWAPS {
+            self.completed_swaps.remove(0);
+        }
         Some(swap)
     }
 
@@ -459,6 +472,9 @@ impl SwapState {
     pub fn abort_swap(&mut self, proposal_id: &[u8; 32]) -> Option<PendingSwap> {
         let swap = self.pending_swaps.remove(proposal_id)?;
         self.aborted_swaps.push(*proposal_id);
+        while self.aborted_swaps.len() > MAX_COMPLETED_SWAPS {
+            self.aborted_swaps.remove(0);
+        }
         Some(swap)
     }
 
@@ -484,6 +500,9 @@ impl SwapState {
             .into_iter()
             .filter_map(|id| {
                 self.aborted_swaps.push(id);
+                while self.aborted_swaps.len() > MAX_COMPLETED_SWAPS {
+                    self.aborted_swaps.remove(0);
+                }
                 self.pending_swaps.remove(&id)
             })
             .collect()

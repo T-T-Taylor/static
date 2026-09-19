@@ -16,6 +16,12 @@ use crate::{ChunkId, ContentId, StorageError, retrieval::ReturnRoute};
 /// Missing-chunk gossip message type (Sphinx body dispatch)
 pub const MSG_MISSING_CHUNK_GOSSIP: u8 = 0x09;
 
+/// Maximum return-route hops accepted during deserialization (DoS bound).
+///
+/// Legit routes use 1 hop (return to reporter); anything above 32 is
+/// attacker-controlled `u32` inflation. Checked before `with_capacity`.
+pub const MAX_GOSSIP_ROUTE_HOPS: usize = 32;
+
 /// A report that a chunk is missing from the network
 ///
 /// Sent by a node that failed to retrieve a chunk; the node that still
@@ -121,6 +127,12 @@ pub fn deserialize_gossip(data: &[u8]) -> Result<MissingChunkGossip, StorageErro
     ]) as usize;
     offset += 4;
 
+    if hop_count > MAX_GOSSIP_ROUTE_HOPS {
+        return Err(StorageError::InvalidChunkSize {
+            expected: MAX_GOSSIP_ROUTE_HOPS,
+            actual: hop_count,
+        });
+    }
     let mut hops = Vec::with_capacity(hop_count);
     for _ in 0..hop_count {
         if offset + 48 > data.len() {

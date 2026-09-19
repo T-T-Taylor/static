@@ -33,11 +33,11 @@ pub type NodeId = [u8; NODE_ID_SIZE];
 /// A chunk ID
 pub type ChunkId = [u8; CHUNK_ID_SIZE];
 
-/// Get the current unix timestamp in seconds
+/// Get the current unix timestamp in seconds (saturating on skew, never panics).
 pub fn current_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("clock went backwards")
+        .unwrap_or_default()
         .as_secs()
 }
 
@@ -58,6 +58,9 @@ pub const RECONCILE_FUTURE_SKEW_SECS: u64 = 300;
 /// Entries claiming more than this in any byte field are ignored as
 /// corrupt or malicious.
 pub const MAX_ACCOUNTING_BYTES: u64 = 1 << 60;
+
+/// Maximum prepayment rate-limit entries retained (H14 bound).
+pub const MAX_PREPAY_ATTEMPTS: usize = 1024;
 
 /// Per-peer credit state
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -316,8 +319,17 @@ impl AccountingState {
         }
     }
 
-    /// Record a prepayment attempt for rate limiting
+    /// Record a prepayment attempt for rate limiting (H14: bounded + TTL prune).
     pub fn record_prepay_attempt(&mut self, from: NodeId, content_id: [u8; 32], now: u64) {
+        // Prune entries older than 24h so the map cannot grow forever;
+        // then enforce a hard cap with arbitrary eviction.
+        self.prepayment_attempts
+            .retain(|_, ts| now.saturating_sub(*ts) <= 86_400);
+        if self.prepayment_attempts.len() >= MAX_PREPAY_ATTEMPTS {
+            if let Some(k) = self.prepayment_attempts.keys().next().copied() {
+                self.prepayment_attempts.remove(&k);
+            }
+        }
         self.prepayment_attempts.insert((from, content_id), now);
     }
 

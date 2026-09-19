@@ -85,13 +85,33 @@ fn serialize_response(resp: &ApiResponse) -> Vec<u8> {
 /// - `None` expected: auth disabled, any request (with or without a token)
 ///   is accepted.
 /// - `Some(expected)`: the request must carry `token == expected`,
-///   otherwise it is rejected. Comparison is a plain equality check on
-///   short bearer strings; the token is never logged.
+///   otherwise it is rejected. Comparison is constant-time over the
+///   token bytes to avoid leaking prefix length via timing; the token
+///   is never logged.
 pub fn verify_token(request_token: Option<&str>, expected_token: Option<&str>) -> bool {
     match expected_token {
         None => true,
-        Some(expected) => request_token == Some(expected),
+        Some(expected) => match request_token {
+            None => false,
+            Some(got) => constant_time_eq(got.as_bytes(), expected.as_bytes()),
+        },
     }
+}
+
+/// Constant-time byte equality (length + content).
+///
+/// Compares up to the longer length, folding length difference into the
+/// accumulator so both length and content mismatches take the same path.
+/// No early exit on first mismatch.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let max_len = a.len().max(b.len());
+    let mut diff = (a.len() ^ b.len()) as u8;
+    for i in 0..max_len {
+        let x = *a.get(i).unwrap_or(&0);
+        let y = *b.get(i).unwrap_or(&0);
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Start the local API server without token auth (backwards-compatible
@@ -110,6 +130,17 @@ pub async fn start_api_server_with_token(
     addr: String,
     expected_token: Option<String>,
 ) -> Result<()> {
+    if addr.starts_with("0.0.0.0") || addr.contains(":0.0.0.0") {
+        tracing::warn!(
+            "Local API bound to {} (all interfaces): ensure --api-token is set; loopback 127.0.0.1 is recommended",
+            addr
+        );
+    }
+    if expected_token.is_none() {
+        tracing::warn!(
+            "Local API auth disabled (no --api-token): any local user can publish/retrieve/compute"
+        );
+    }
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("Local API listening on {}", addr);
 
@@ -119,19 +150,99 @@ pub async fn start_api_server_with_token(
         let expected_token = expected_token.clone();
 
         tokio::spawn(async move {
-            // 1MB single-read framing: the local CLI sends one JSON
-            // request per TCP connection and the server reads it in a
-            // single `read` call into a 1MB buffer. Requests larger than
-            // 1MB are truncated to the buffer (truncate-safe: JSON parse
-            // fails and an error response is returned rather than acting
-            // on a partial request).
-            let mut buf = vec![0u8; 1024 * 1024]; // 1MB buffer for file data
-            let n = match socket.read(&mut buf).await {
-                Ok(n) if n > 0 => n,
-                _ => return,
-            };
+            // Chunked framing (P1-local): accumulate 8 KiB reads up to a
+            // 1 MiB cap so TCP segmentation cannot truncate a request.
+            // The CLI sends one JSON object then waits for a response
+            // (no EOF), so after the buffer parses as JSON we drain with
+            // a short timeout instead of waiting for close.
+            const MAX_API_REQUEST_BYTES: usize = 1024 * 1024;
+            let mut buf = Vec::with_capacity(8192);
+            let mut chunk = [0u8; 8192];
+            // First blocking read (must get data).
+            match socket.read(&mut chunk).await {
+                Ok(0) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => return,
+            }
+            if buf.len() > MAX_API_REQUEST_BYTES {
+                let resp = ApiResponse {
+                    status: "error".into(),
+                    message: "request too large".into(),
+                    ..Default::default()
+                };
+                let _ = socket.write_all(&serialize_response(&resp)).await;
+                return;
+            }
+            // Gather segmentation tail: while the buffer does not yet
+            // parse, keep reading (blocking, data is in flight). Once it
+            // parses, poll briefly for a tail then proceed.
+            loop {
+                if serde_json::from_slice::<ApiRequest>(&buf).is_ok() {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(50),
+                        socket.read(&mut chunk),
+                    )
+                    .await
+                    {
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => {
+                            if buf.len() + n > MAX_API_REQUEST_BYTES {
+                                let resp = ApiResponse {
+                                    status: "error".into(),
+                                    message: "request too large".into(),
+                                    ..Default::default()
+                                };
+                                let _ = socket.write_all(&serialize_response(&resp)).await;
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                            // If the extra bytes break parsing, keep them:
+                            // the final parse below will error safely.
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+                // Incomplete JSON: more segments in flight, read blocking.
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    socket.read(&mut chunk),
+                )
+                .await
+                {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => {
+                        if buf.len() + n > MAX_API_REQUEST_BYTES {
+                            let resp = ApiResponse {
+                                status: "error".into(),
+                                message: "request too large".into(),
+                                ..Default::default()
+                            };
+                            let _ = socket.write_all(&serialize_response(&resp)).await;
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    _ => break,
+                }
+                if buf.len() > MAX_API_REQUEST_BYTES {
+                    break;
+                }
+            }
+            if buf.is_empty() {
+                return;
+            }
+            if buf.len() > MAX_API_REQUEST_BYTES {
+                let resp = ApiResponse {
+                    status: "error".into(),
+                    message: "request too large".into(),
+                    ..Default::default()
+                };
+                let _ = socket.write_all(&serialize_response(&resp)).await;
+                return;
+            }
 
-            let request: ApiRequest = match serde_json::from_slice(&buf[..n]) {
+            let request: ApiRequest = match serde_json::from_slice(&buf) {
                 Ok(r) => r,
                 Err(e) => {
                     let resp = ApiResponse {

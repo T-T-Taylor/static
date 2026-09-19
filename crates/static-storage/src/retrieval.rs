@@ -25,6 +25,11 @@ pub const MSG_CHUNK_REQUEST: u8 = 0x01;
 /// Chunk response message type
 pub const MSG_CHUNK_RESPONSE: u8 = 0x02;
 
+/// Maximum return-route hops accepted during deserialization (DoS bound).
+///
+/// Legit return routes are 1 hop; cap prevents `u32::MAX` pre-alloc.
+pub const MAX_RETRIEVAL_ROUTE_HOPS: usize = 32;
+
 /// A chunk request sent through the mixnet
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChunkRequest {
@@ -155,6 +160,12 @@ pub fn deserialize_request(data: &[u8]) -> Result<ChunkRequest, StorageError> {
     ]) as usize;
     offset += 4;
 
+    if hop_count > MAX_RETRIEVAL_ROUTE_HOPS {
+        return Err(StorageError::InvalidChunkSize {
+            expected: MAX_RETRIEVAL_ROUTE_HOPS,
+            actual: hop_count,
+        });
+    }
     let mut hops = Vec::with_capacity(hop_count);
     for _ in 0..hop_count {
         if offset + 48 > data.len() {

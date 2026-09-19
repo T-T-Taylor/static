@@ -513,11 +513,10 @@ impl NodeRunner {
 
     /// Start the node
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
-        let node_id = self.transport.node_id;
-
-        info!(
-            "Starting Static node: {:02x?} (mode: {:?})",
-            node_id, self.config.mode
+        // P1-local: node ID is never logged at INFO (seizure/log-ship risk).
+        debug!(
+            "Starting Static node (mode: {:?})",
+            self.config.mode
         );
 
         match self.config.mode {
@@ -789,11 +788,26 @@ impl NodeRunner {
             });
         }
 
-        // Start local API server
+        // Start local API server (H1: enforce configured bearer token).
         let api_addr = self.config.api_addr.clone();
+        let api_token = self.config.api_token.clone().or_else(|| {
+            // No token configured: auto-generate an ephemeral token so the
+            // loopback API is not silently open. Logged once (never the
+            // value itself is reused elsewhere); operator should set
+            // --api-token for persistence across restarts.
+            let mut bytes = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut bytes);
+            let token: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+            tracing::warn!(
+                "No --api-token configured: generated ephemeral API token (valid for this run only)"
+            );
+            Some(token)
+        });
         let runner_ref = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::api::start_api_server(runner_ref, api_addr).await {
+            if let Err(e) =
+                crate::api::start_api_server_with_token(runner_ref, api_addr, api_token).await
+            {
                 tracing::error!("API server error: {}", e);
             }
         });
@@ -818,7 +832,7 @@ impl NodeRunner {
         // accounting state now; the message itself (handshake echo)
         // carries no accounting data.
         if inbound.is_reconnection {
-            info!("Partition heal detected with peer {:02x?}", inbound.from);
+            debug!("Partition heal detected");
             if let Err(e) = self.trigger_reconciliation(inbound.from).await {
                 warn!(
                     "Reconciliation trigger failed for {:02x?}: {}",
@@ -872,8 +886,16 @@ impl NodeRunner {
                             drop(content_retriever);
                             if !recorded {
                                 // Not part of a file retrieval: stash as
-                                // single (manifest fetch path).
-                                self.single_chunks.lock().await.insert(chunk.id, chunk.data.clone());
+                                // single (manifest fetch path, H14 bounded).
+                                let mut singles = self.single_chunks.lock().await;
+                                singles.insert(chunk.id, chunk.data.clone());
+                                while singles.len() > 2048 {
+                                    if let Some(k) = singles.keys().next().copied() {
+                                        singles.remove(&k);
+                                    } else {
+                                        break;
+                                    }
+                                }
                             } else {
                                 debug!("Successfully retrieved chunk");
                             }
@@ -915,7 +937,7 @@ impl NodeRunner {
                 debug!("Prepayment handled (accepted={})", accepted);
             }
             WireMessage::AccountingReconciliation(recon) => {
-                self.process_reconciliation(recon).await?;
+                self.process_reconciliation(inbound.from, recon).await?;
             }
             _ => {}
         }
@@ -937,6 +959,9 @@ impl NodeRunner {
 
         let completed = {
             let mut state = self.compute_state.lock().await;
+            // Expire poisoned sessions (H6): a single bad fragment with a
+            // mismatched `total` must not stall the pipeline forever.
+            state.reassembler.cleanup_expired(300);
             if !state.reassembler.add_fragment(fragment) {
                 return;
             }
@@ -1005,6 +1030,7 @@ impl NodeRunner {
 
         let completed = {
             let mut state = self.verification_state.lock().await;
+            state.reassembler.cleanup_expired(300);
             if !state.reassembler.add_fragment(fragment) {
                 return;
             }
@@ -1059,6 +1085,7 @@ impl NodeRunner {
 
         let completed = {
             let mut state = self.lifecycle_state.lock().await;
+            state.reassembler.cleanup_expired(300);
             if !state.reassembler.add_fragment(fragment) {
                 return;
             }
@@ -1105,6 +1132,23 @@ impl NodeRunner {
     /// reset) and send it back to the reporter through the gossip's
     /// return route as a hybrid-wrapped `ChunkResponse`.
     async fn handle_missing_chunk_gossip(self: &Arc<Self>, gossip: MissingChunkGossip, from: NodeId) {
+        // Freshness gate (H6, non-breaking): drop stale (>1h old) or
+        // far-future (>5min ahead) reports so a replay flood cannot
+        // trigger unbounded HostBuffer lookups + Sphinx amplification.
+        {
+            let now = current_timestamp();
+            const MAX_GOSSIP_AGE_SECS: u64 = 3600;
+            const GOSSIP_FUTURE_SKEW_SECS: u64 = 300;
+            if gossip.timestamp > now.saturating_add(GOSSIP_FUTURE_SKEW_SECS)
+                || now.saturating_sub(gossip.timestamp) > MAX_GOSSIP_AGE_SECS
+            {
+                debug!(
+                    "Dropping stale/future missing-chunk gossip for {:02x?}",
+                    gossip.chunk_id
+                );
+                return;
+            }
+        }
         debug!(
             "Missing-chunk gossip for chunk {:02x?} (content {:02x?}) from {:02x?}",
             gossip.chunk_id, gossip.content_id, from
@@ -1124,7 +1168,7 @@ impl NodeRunner {
         {
             return;
         }
-        info!("Reseeded chunk {:02x?} from HostBuffer", gossip.chunk_id);
+        debug!("Reseeded chunk from HostBuffer");
 
         // Return the reseeded chunk via the reporter's return route.
         let response = ChunkResponse {
@@ -1411,10 +1455,7 @@ impl NodeRunner {
             &pending.expected_hash,
         );
         if verified {
-            info!(
-                "Chunk {:02x?} integrity verified for peer {:02x?}",
-                pending.chunk_id, pending.challenged_node
-            );
+            debug!("Chunk integrity verified");
             self.accounting
                 .lock()
                 .await
@@ -1594,13 +1635,8 @@ impl NodeRunner {
                 request.request_id, e
             );
         } else {
-            info!(
-                "Quoted {} {} for compute request {:02x?} (address {})",
-                payment.amount,
-                payment.currency.as_str(),
-                request.request_id,
-                payment.address
-            );
+            // P1-local: quote amount/address never at INFO.
+            debug!("Quoted compute payment (amount/address redacted)");
         }
     }
 
@@ -1675,6 +1711,20 @@ impl NodeRunner {
             .await
             .cached_modules
             .insert(request.module_content_id, module_bytes.clone());
+        // Bound the module cache (H6, non-breaking): evict an arbitrary
+        // entry when exceeding 16 modules so a flood of distinct module
+        // IDs cannot OOM the provider. Single lock, no nesting.
+        {
+            let mut state = self.compute_state.lock().await;
+            const MAX_CACHED_MODULES: usize = 16;
+            while state.cached_modules.len() > MAX_CACHED_MODULES {
+                if let Some(k) = state.cached_modules.keys().next().copied() {
+                    state.cached_modules.remove(&k);
+                } else {
+                    break;
+                }
+            }
+        }
 
         let compute_config = self.config.compute_config.clone();
         let input_data = request.input_data.clone();
@@ -1887,9 +1937,8 @@ impl NodeRunner {
         }
 
         if response.success {
-            info!(
-                "Compute execution {:02x?} succeeded: {} bytes output, {} ms CPU, {} bytes memory",
-                response.request_id,
+            debug!(
+                "Compute execution succeeded: {} bytes output, {} ms CPU, {} bytes memory",
                 response.output_data.len(),
                 response.cpu_time_ms,
                 response.memory_used
@@ -1919,13 +1968,7 @@ impl NodeRunner {
         let mut state = self.compute_state.lock().await;
         match state.pending_requests.get_mut(&quote.request_id) {
             Some(pending) => {
-                info!(
-                    "Payment quote for compute request {:02x?}: {} {} to {}",
-                    quote.request_id,
-                    quote.amount,
-                    quote.currency.as_str(),
-                    quote.address
-                );
+                debug!("Payment quote received (amount/address redacted)");
                 pending.payment = Some(quote);
             }
             None => debug!(
@@ -2228,21 +2271,39 @@ impl NodeRunner {
             batch.sign(&sk);
             static_mesh::transport::send_reconciliation(&self.transport, peer, batch).await?;
         }
-        info!("Sent {} reconciliation batch(es) to {:02x?}", count, peer);
+        debug!("Sent {} reconciliation batch(es)", count);
         Ok(())
     }
 
     /// Process an incoming reconciliation batch (verified LWW merge)
     pub async fn process_reconciliation(
         &self,
+        from: NodeId,
         recon: AccountingReconciliation,
     ) -> anyhow::Result<()> {
         // Phase 0 auth: signature + future-timestamp bound + sanity.
         if !recon.verify(current_timestamp()) {
             anyhow::bail!("Invalid reconciliation signature/timestamp");
         }
-        // Sender binding: must come from its claimant.
-        // (Caller ensures `from == recon.from_node`; double-check here.)
+        // Sender binding (H5, non-breaking): the batch must come from its
+        // claimant over the authenticated connection. This closes the
+        // spoof where an attacker signs with its own key but claims
+        // `from_node == victim`.
+        if recon.from_node != from {
+            anyhow::bail!("Reconciliation sender mismatch");
+        }
+        // Identity continuity: a known peer must present its pinned
+        // identity key; a changed key is rejected (hijack/overwrite).
+        {
+            let table = self.transport.routing_table.read().await;
+            if let Some(known) = table.get_node(&from) {
+                if let Some(stored) = known.identity_public_key {
+                    if stored != recon.identity_public_key {
+                        anyhow::bail!("Reconciliation identity key mismatch");
+                    }
+                }
+            }
+        }
         let incoming: Vec<(NodeId, PeerCredit)> = recon
             .peer_credits
             .iter()
@@ -2260,11 +2321,7 @@ impl NodeRunner {
             .collect();
         // Totals in the message are informational (no global ledger).
         self.accounting.lock().await.reconcile(&incoming);
-        info!(
-            "Reconciled accounting with {:02x?} ({} entries)",
-            recon.from_node,
-            incoming.len()
-        );
+        debug!("Reconciled accounting ({} entries)", incoming.len());
         Ok(())
     }
 
@@ -2475,9 +2532,9 @@ impl NodeRunner {
         match accounting.register_sponsored_seed(from, prepayment.content_id, prepayment.bytes, now)
         {
             Ok(()) => {
-                info!(
-                    "Accepted prepayment from {:02x?}: {} bytes for {:02x?}",
-                    from, prepayment.bytes, prepayment.content_id
+                debug!(
+                    "Accepted prepayment: {} bytes",
+                    prepayment.bytes
                 );
                 Ok(true)
             }
@@ -2488,24 +2545,34 @@ impl NodeRunner {
         }
     }
 
-    /// Get node status
+    /// Get node status (H13: snapshot-then-act, never holds 2+ guards).
     pub async fn status(&self) -> NodeStatus {
         let transport_stats = get_stats(&self.transport).await;
-        let _leases = self.leases.lock().await;
-        let chunks = self.transport.chunk_holder.lock().await;
-        let _swaps = self.swaps.lock().await;
-        let accounting = self.accounting.lock().await;
+        // Each lock is taken sequentially and dropped before the next;
+        // earlier code held leases+holder+swaps+accounting simultaneously.
+        let stored_chunks = {
+            let chunks = self.transport.chunk_holder.lock().await;
+            chunks.chunk_count()
+        };
+        let published_content = { self.storage_keys.lock().await.len() };
+        let (total_bytes_served, total_bytes_received) = {
+            let accounting = self.accounting.lock().await;
+            (
+                accounting.total_bytes_served,
+                accounting.total_bytes_received,
+            )
+        };
 
         NodeStatus {
             running: true,
             node_id: self.transport.node_id,
             peer_count: transport_stats.connected_peers,
             connected_peers: transport_stats.connected_peers,
-            stored_chunks: chunks.chunk_count(),
-            published_content: self.storage_keys.lock().await.len(),
+            stored_chunks,
+            published_content,
             cover_traffic_enabled: self.config.cover_traffic_enabled,
-            total_bytes_served: accounting.total_bytes_served,
-            total_bytes_received: accounting.total_bytes_received,
+            total_bytes_served,
+            total_bytes_received,
         }
     }
 
@@ -2567,10 +2634,18 @@ impl NodeRunner {
         // can challenge. Registered before the mode split so seed-only
         // publishers keep hashes for the chunks their sponsor stores.
         manifest.segment_hashes = static_storage::verification::compute_segment_hashes(&chunks);
-        self.manifests
-            .lock()
-            .await
-            .insert(content_id, manifest.clone());
+        {
+            let mut manifests = self.manifests.lock().await;
+            manifests.insert(content_id, manifest.clone());
+            // H14 bound: cap manifests at 2048, evict arbitrary oldest.
+            while manifests.len() > 2048 {
+                if let Some(k) = manifests.keys().next().copied() {
+                    manifests.remove(&k);
+                } else {
+                    break;
+                }
+            }
+        }
 
         // 5. Encrypt the manifest (needed to compute total prepaid size)
         let (encrypted_manifest, manifest_chunk_id) =
@@ -2604,6 +2679,14 @@ impl NodeRunner {
             let mut proofs = self.merkle_proofs.lock().await;
             for (chunk, proof) in chunks.iter().zip(chunk_proofs) {
                 proofs.insert(chunk.id, (content_root, proof));
+            }
+            // H14 bound: cap proofs at 8192 (chunk-level), evict arbitrary.
+            while proofs.len() > 8192 {
+                if let Some(k) = proofs.keys().next().copied() {
+                    proofs.remove(&k);
+                } else {
+                    break;
+                }
             }
         }
 
@@ -2665,8 +2748,7 @@ impl NodeRunner {
         }
 
         tracing::info!(
-            "Published content: {:02x?} ({} chunks + 1 manifest)",
-            content_id,
+            "Published content ({} chunks + 1 manifest)",
             chunks.len()
         );
 
@@ -2754,8 +2836,8 @@ impl NodeRunner {
         // is maintenance traffic; chunk hand-off to the sponsor follows via
         // the sponsor's swap/distribution relationships.
         info!(
-            "Seed-only publish via sponsor {:02x?}: {:02x?} ({} bytes prepaid)",
-            sponsor_id, content_id, total_bytes
+            "Seed-only publish via sponsor ({} bytes prepaid)",
+            total_bytes
         );
 
         Ok((content_id, manifest, content_pub_key))
@@ -3250,9 +3332,9 @@ pub(crate) async fn run_payment_watch_tick(runner: &Arc<NodeRunner>) {
                     );
                 }
 
-                info!(
-                    "Payment for compute request {:02x?} confirmed ({} confirmations); executing",
-                    staged.request_id, confirmations
+                debug!(
+                    "Payment for compute request confirmed ({} confirmations); executing",
+                    confirmations
                 );
                 let runner_clone = runner.clone();
                 tokio::spawn(async move {
@@ -3329,13 +3411,14 @@ async fn run_verification_tick(runner: &Arc<NodeRunner>) {
     }
 
     // 2. Issue at most one new challenge per tick.
-    let (claims, connected): (Vec<(ChunkId, NodeId)>, HashSet<NodeId>) = {
+    // H13: snapshot-then-act — never hold swaps + connections together.
+    let claims: Vec<(ChunkId, NodeId)> = {
         let swaps = runner.swaps.lock().await;
+        swaps.active_swaps.iter().map(|(c, p)| (*c, *p)).collect()
+    };
+    let connected: HashSet<NodeId> = {
         let conns = runner.transport.connections.read().await;
-        (
-            swaps.active_swaps.iter().map(|(c, p)| (*c, *p)).collect(),
-            conns.keys().copied().collect(),
-        )
+        conns.keys().copied().collect()
     };
     let known_chunks: HashSet<ChunkId> = {
         let manifests = runner.manifests.lock().await;
@@ -3618,14 +3701,14 @@ async fn run_repair_tick(runner: &Arc<NodeRunner>) {
                 runner.repair_state.lock().await.complete_repair(content_id);
                 if repaired > 0 {
                     info!(
-                        "Repaired content {:02x?}: stored {} of {} damaged shards",
-                        content_id, repaired, chunk_count
+                        "Repaired content: stored {} of {} damaged shards",
+                        repaired, chunk_count
                     );
                 }
             }
             Err(e) => {
                 runner.repair_state.lock().await.fail_repair(content_id);
-                warn!("Failed to repair content {:02x?}: {}", content_id, e);
+                warn!("Failed to repair content: {}", e);
             }
         }
     }
@@ -4379,8 +4462,8 @@ async fn run_backup_health_tick(
             newly_activated.push(*content_id);
             extend_lease_ids.extend(entry.chunk_ids.iter().copied());
             info!(
-                "Primary for content {:02x?} silent for {}s (timeout {}s). Activating backup.",
-                content_id, silent_for, backup_config.heartbeat_timeout_secs
+                "Primary silent for {}s (timeout {}s). Activating backup.",
+                silent_for, backup_config.heartbeat_timeout_secs
             );
         }
 

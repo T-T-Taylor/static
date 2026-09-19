@@ -106,6 +106,12 @@ impl ResourceLimiter for ComputeLimiter {
     }
 }
 
+/// Maximum WASM module size accepted for execution (10 MiB, DoS bound).
+///
+/// Compilation of arbitrarily large modules can OOM the provider; modules
+/// are fetched via retrieval so the cap is enforced at execution time.
+pub const MAX_WASM_MODULE_SIZE: usize = 10 * 1024 * 1024;
+
 /// Execute a WASM module with the given input
 ///
 /// Returns `(output_data, cpu_time_ms, memory_used_bytes)`. CPU time is a
@@ -117,6 +123,14 @@ pub fn execute_wasm(
     max_cpu_ms: u64,
     max_memory_mb: u32,
 ) -> Result<(Vec<u8>, u64, u64), ComputeError> {
+    // DoS bound (H6): reject huge modules before compilation.
+    if module_bytes.len() > MAX_WASM_MODULE_SIZE {
+        return Err(ComputeError::ModuleCompilationFailed(format!(
+            "module too large: {} bytes (max {})",
+            module_bytes.len(),
+            MAX_WASM_MODULE_SIZE
+        )));
+    }
     // Fuel budget: ~1 fuel per WASM instruction, budgeted generously at
     // 1M fuel per permitted millisecond. Fuel is a hard cap on executed
     // instructions; wall-clock time additionally bounds host-side work.

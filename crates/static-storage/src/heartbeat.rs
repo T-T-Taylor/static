@@ -31,17 +31,24 @@ pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 1800;
 /// Default lease duration (24 hours - must be > heartbeat interval)
 pub const DEFAULT_LEASE_DURATION_SECS: u64 = 86400;
 
+/// Maximum chunk IDs accepted in one heartbeat deserialization (DoS bound).
+///
+/// Heartbeats batch chunk renewals; without a cap an attacker `u32`
+/// `chunk_count` triggers a multi-GB `with_capacity` before the length
+/// check fails. 4096 chunks (~4 GiB of content) is well above legit use.
+pub const MAX_HEARTBEAT_CHUNKS: usize = 4096;
+
 /// Lease renewal grace period (2 hours after expiry before repopulation)
 pub const GRACE_PERIOD_SECS: u64 = 7200;
 
 /// Heartbeat message type (Sphinx body dispatch, Phase 1)
 pub const MSG_HEARTBEAT: u8 = 0x0A;
 
-/// Get current unix timestamp
+/// Get current unix timestamp (saturating on clock skew, never panics).
 fn current_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("clock went backwards")
+        .unwrap_or_default()
         .as_secs()
 }
 
@@ -197,6 +204,13 @@ impl Heartbeat {
         ]) as usize;
         offset += 4;
 
+        // DoS bound (H6): cap before allocating.
+        if chunk_count > MAX_HEARTBEAT_CHUNKS {
+            return Err(StorageError::InvalidChunkSize {
+                expected: MAX_HEARTBEAT_CHUNKS,
+                actual: chunk_count,
+            });
+        }
         let mut chunk_ids = Vec::with_capacity(chunk_count);
         for _ in 0..chunk_count {
             if offset + 32 > data.len() {

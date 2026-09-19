@@ -370,6 +370,13 @@ fn take_return_route(data: &[u8], offset: &mut usize) -> Result<ReturnRoute, Sto
     let count_bytes = take_array::<4>(data, offset)?;
     let hop_count = u32::from_be_bytes(count_bytes) as usize;
 
+    // DoS bound (H6): cap before allocating. Legit routes are 1 hop.
+    if hop_count > 32 {
+        return Err(StorageError::InvalidChunkSize {
+            expected: 32,
+            actual: hop_count,
+        });
+    }
     let mut hops = Vec::with_capacity(hop_count);
     for _ in 0..hop_count {
         let public_key = take_array::<32>(data, offset)?;

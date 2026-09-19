@@ -122,19 +122,22 @@ impl PersistentConfig {
 
     /// Save configuration to the data directory.
     ///
-    /// The file is written first, then its permissions are restricted to
-    /// `0o600` on Unix (no-op on non-Unix) since it contains secrets.
+    /// Atomic write (P1-local): data goes to `config.json.tmp` with
+    /// `0o600` applied before an atomic rename, so there is no window
+    /// where `config.json` is world-readable and no torn file on crash.
     pub fn save(&self, data_dir: &PathBuf) -> Result<()> {
         std::fs::create_dir_all(data_dir)?;
         let config_path = data_dir.join("config.json");
+        let tmp_path = data_dir.join("config.json.tmp");
         let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(&config_path, data)?;
+        std::fs::write(&tmp_path, data)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&config_path, perms)?;
+            std::fs::set_permissions(&tmp_path, perms)?;
         }
+        std::fs::rename(&tmp_path, &config_path)?;
         tracing::info!(
             "Saved node configuration to {:?}",
             data_dir.join("config.json")
