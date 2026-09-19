@@ -50,8 +50,10 @@ Pre-alpha. The protocol is feature-complete and undergoing hardening.
 ### Build
 ```bash
 cargo build --release -p static-node
+```
 
-Run
+### Run
+```bash
 
 # Start a full node
 ./target/release/static-node start
@@ -61,8 +63,9 @@ Run
 
 # Start a seed-only node
 ./target/release/static-node --mode seed --sponsor 127.0.0.1:9001 start
+```
 
-CLI Commands
+### CLI Commands
 start: Start the node and connect to the network.
 status: Show node configuration and status.
 gen-id: Generate a new node identity.
@@ -70,7 +73,8 @@ info: Show architecture and version info.
 publish <file>: Publish a file to the network.
 retrieve <key> <output>: Retrieve a file from the network using its content public key.
 compute <module_key> <input>: Submit a WASM compute request.
-Architecture
+
+## Architecture
 The project is a Rust workspace consisting of 6 crates:
 
 static-crypto: Crypto primitives (X25519, ChaCha20-Poly1305, ML-KEM, Ed25519)
@@ -80,15 +84,16 @@ static-accounting: Proof of Space-Time, tit-for-tat, per-peer credit, Sybil resi
 static-mesh: Cover traffic, wire protocol, TCP transport (abstracted), routing tables, gossip, anonymous retrieval, fragmentation
 static-node: Node lifecycle, config persistence, async runner, local API server, CLI, WASM compute, blockchain payment
 
-Testing
+## Testing
 The network is extensively tested with 393+ tests across all crates.
 
 cargo test --workspace
+```
 
-License
+## License
 GNU Affero General Public License v3.0 (AGPL-3.0-or-later)
 
-Contributing
+## Contributing
 See CONTRIBUTING.md for privacy and OpSec guidelines for contributors.
 
 See AGENTS.md for guidelines for AI agents working on this codebase.
