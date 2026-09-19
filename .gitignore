@@ -1,18 +1,22 @@
+# Rust
 /target
 **/*.rs.bk
-*.pdb
+Cargo.lock
+
+# IDE
 .idea/
 .vscode/
 *.swp
 *.swo
-*~
+
+# OS
 .DS_Store
 Thumbs.db
-/node-data/
-*.log
-*.db
+
+# Static node test artifacts
 node*-data/
 node-data/
 secret.txt
-secret.txt.manifest.json
+secret*.manifest.json
 retrieved.txt
+*.log
