@@ -29,6 +29,10 @@ Future agents working on this codebase should follow these guidelines:
 - Content integrity verified via Merkle proofs on swap
 
 ## Testing
-- 393+ tests across 6 crates
+- 402+ tests across 6 crates
 - Run `cargo test --workspace` after every change
 - Zero warnings required: `cargo build --release -p static-node`
+- Phase 7 wire protocol: Handshake (Hello/Welcome/AuthIdentity, encrypted,
+  padded) + Sphinx only; all maintenance Sphinx-wrapped (body bytes
+  0x12-0x19); MIN_HOPS=3 routes; AEAD bodies; fixed 5440-byte KEM block;
+  no backward compatibility with Phase 6.

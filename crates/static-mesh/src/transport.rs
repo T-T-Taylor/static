@@ -18,19 +18,25 @@
 //! a cover traffic loop that sends dummy packets at a fixed rate,
 //! multiplexing real traffic in with the cover traffic.
 
-use crate::routing::{RoutingTable, KnownNode};
-use crate::retrieval::handle_retrieval_request;
+use crate::routing::{RoutingTable, KnownNode, PeerGossip};
+use crate::retrieval::{handle_retrieval_request, create_hybrid_payload_packets};
 use static_storage::swap::{
     SwapState, StorageCapacity, PendingSwap, decide_on_swap,
-    create_swap_accept, create_swap_reject,
+    create_swap_accept, create_swap_reject, create_swap_commit, create_swap_abort,
+    SwapProposal, SwapAccept, SwapReject, SwapCommit, SwapAbort,
     MAX_PENDING_SWAPS,
 };
 use static_storage::heartbeat::LeaseManager;
 use static_storage::retrieval::ChunkHolder;
 use crate::wire;
 use crate::wire::{
-    WireMessage, Handshake,
+    WireMessage, Handshake, Hello, Welcome,
     try_read_message, write_message, HYBRID_MAX_MESSAGE_SIZE,
+    handshake_session_aad, derive_handshake_secret,
+    encrypt_identity, decrypt_identity, wrap_maintenance_payload,
+    MSG_BODY_GOSSIP, MSG_BODY_SWAP_ACCEPT,
+    MSG_BODY_SWAP_REJECT, MSG_BODY_PREPAYMENT, MSG_BODY_RECONCILIATION,
+    MSG_BODY_SWAP_COMMIT, MSG_BODY_SWAP_ABORT,
 };
 use static_sphinx::{
     SphinxPacket, MixNode, RoutingFlag,
@@ -422,6 +428,9 @@ pub struct TransportState {
     /// Bounded at [`MAX_HANDSHAKE_NONCES`] with [`HANDSHAKE_NONCE_TTL_SECS`]
     /// TTL; std mutex (never held across await).
     pub handshake_nonces: Arc<std::sync::Mutex<HashMap<[u8; 32], u64>>>,
+    /// Recently seen maintenance nonces (swap accept/commit/abort replay
+    /// cache, nonce -> unix secs). Same bounds as handshakes.
+    pub maintenance_nonces: Arc<std::sync::Mutex<HashMap<[u8; 32], u64>>>,
 }
 
 impl TransportState {
@@ -457,16 +466,17 @@ impl TransportState {
                 let mut capacity = self.storage_capacity.lock().await;
                 capacity.release_reserved(swap.reserved_bytes, false);
             }
-            send_swap_control(
-                self,
-                swap.peer,
-                WireMessage::SwapAbort(crate::wire::SwapAbort {
-                    proposal_id: swap.proposal_id,
-                    from_node: self.node_id,
-                    reason: "pending swap timed out".to_string(),
-                }),
-            )
-            .await;
+            // Phase 7: signed abort, Sphinx-wrapped (no clear-text identity).
+            let mut abort = create_swap_abort(
+                swap.proposal_id,
+                self.node_id,
+                "pending swap timed out".to_string(),
+                None,
+            );
+            abort.sign(&self.identity_key);
+            if let Ok(json) = serde_json::to_vec(&abort) {
+                send_swap_control_sphinx(self, swap.peer, MSG_BODY_SWAP_ABORT, &json).await;
+            }
         }
         if !expired.is_empty() {
             debug!("Expired {} pending swap(s) past timeout", expired.len());
@@ -559,6 +569,146 @@ impl TransportState {
         hs
     }
 
+    /// Check-and-insert a handshake nonce (replay cache).
+    ///
+    /// Returns true if fresh (inserted), false if replayed. Prunes expired
+    /// entries and bounds memory (FIFO eviction at cap).
+    pub fn check_handshake_nonce(&self, nonce: &[u8; 32]) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Ok(mut cache) = self.handshake_nonces.lock() {
+            cache.retain(|_, ts| now.saturating_sub(*ts) <= HANDSHAKE_NONCE_TTL_SECS);
+            if cache.contains_key(nonce) {
+                return false;
+            }
+            if cache.len() >= MAX_HANDSHAKE_NONCES {
+                // FIFO-ish eviction: drop one arbitrary oldest entry.
+                if let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, ts)| **ts)
+                    .map(|(k, _)| *k)
+                {
+                    cache.remove(&oldest);
+                }
+            }
+            cache.insert(*nonce, now);
+            true
+        } else {
+            true
+        }
+    }
+
+    /// Check-and-insert a maintenance nonce (swap replay cache).
+    ///
+    /// Returns true if fresh (inserted), false if replayed. Same
+    /// TTL/bounds as [`TransportState::check_handshake_nonce`].
+    pub fn check_maintenance_nonce(&self, nonce: &[u8; 32]) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Ok(mut cache) = self.maintenance_nonces.lock() {
+            cache.retain(|_, ts| now.saturating_sub(*ts) <= HANDSHAKE_NONCE_TTL_SECS);
+            if cache.contains_key(nonce) {
+                return false;
+            }
+            if cache.len() >= MAX_HANDSHAKE_NONCES {
+                if let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, ts)| **ts)
+                    .map(|(k, _)| *k)
+                {
+                    cache.remove(&oldest);
+                }
+            }
+            cache.insert(*nonce, now);
+            true
+        } else {
+            true
+        }
+    }
+
+    /// Build a hybrid route to `dest` (Phase 7, Task 2).
+    ///
+    /// Prefers a [`MIN_HOPS`]-intermediate anonymous route via
+    /// [`RoutingTable::build_hybrid_route`]. Falls back to a direct 1-hop
+    /// route only when the routing table cannot supply 3 KEM-capable
+    /// intermediates (bootstrapping / 2-node test networks); production
+    /// networks with enough peers always get 3 intermediates + dest.
+    pub async fn build_route_to_destination(
+        &self,
+        dest: NodeId,
+    ) -> Option<static_sphinx::HybridRoute> {
+        let snapshot = {
+            let table = self.routing_table.read().await;
+            let dest_node = table.get_node(&dest).cloned()?;
+            (dest_node.public_key, dest_node.kem_public_key.clone()?)
+        };
+        let (dest_pub, dest_kem) = snapshot;
+        {
+            let table = self.routing_table.read().await;
+            if let Some(route) = table.build_hybrid_route(dest, dest_pub, &dest_kem) {
+                return Some(route);
+            }
+        }
+        // Fallback (documented MVP trade-off): direct route when the
+        // network is too small for 3 intermediates.
+        Some(static_sphinx::HybridRoute {
+            hops: vec![static_sphinx::HybridRouteHop {
+                node_id: dest,
+                classical_public_key: dest_pub,
+                kem_public_key: dest_kem,
+            }],
+            destination: dest,
+        })
+    }
+
+    /// Build an anonymous return route to ourselves (Phase 7, Task 2).
+    ///
+    /// [`MIN_HOPS`] random KEM-capable intermediates + ourselves as the
+    /// destination, so a responder sees only a random first hop — never
+    /// our identity or address. Falls back to a direct self-route only
+    /// when the table cannot supply 3 intermediates (bootstrap / small
+    /// test networks).
+    pub async fn build_self_return_route(&self) -> static_sphinx::HybridRoute {
+        let our_pub = self.mix_node.lock().await.public_key;
+        let our_kem = self.kem.lock().await.public_bytes();
+        let intermediates: Vec<static_sphinx::HybridRouteHop> = {
+            let table = self.routing_table.read().await;
+            let mut candidates: Vec<&KnownNode> = table
+                .nodes
+                .values()
+                .filter(|n| {
+                    n.node_id != self.node_id && n.kem_public_key.is_some()
+                })
+                .collect();
+            if candidates.len() < crate::routing::MIN_HOPS {
+                Vec::new()
+            } else {
+                use rand::seq::SliceRandom;
+                candidates.shuffle(&mut rand::thread_rng());
+                candidates
+                    .into_iter()
+                    .take(crate::routing::MIN_HOPS)
+                    .map(|n| static_sphinx::HybridRouteHop {
+                        node_id: n.node_id,
+                        classical_public_key: n.public_key,
+                        kem_public_key: n.kem_public_key.clone().unwrap_or_default(),
+                    })
+                    .collect()
+            }
+        };
+        let mut hops = intermediates;
+        hops.push(static_sphinx::HybridRouteHop {
+            node_id: self.node_id,
+            classical_public_key: our_pub,
+            kem_public_key: our_kem,
+        });
+        static_sphinx::HybridRoute { hops, destination: self.node_id }
+    }
+
     /// Verify an inbound handshake + key continuity against routing table.
     ///
     /// Returns true if signature valid and no known-key mismatch.
@@ -577,28 +727,8 @@ impl TransportState {
         }
         // Nonce replay cache (H5, non-breaking): reject recently seen
         // nonces, prune expired, bound memory.
-        {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if let Ok(mut cache) = self.handshake_nonces.lock() {
-                cache.retain(|_, ts| now.saturating_sub(*ts) <= HANDSHAKE_NONCE_TTL_SECS);
-                if cache.contains_key(&hs.nonce) {
-                    return false;
-                }
-                if cache.len() >= MAX_HANDSHAKE_NONCES {
-                    // FIFO-ish eviction: drop one arbitrary oldest entry.
-                    if let Some(oldest) = cache
-                        .iter()
-                        .min_by_key(|(_, ts)| **ts)
-                        .map(|(k, _)| *k)
-                    {
-                        cache.remove(&oldest);
-                    }
-                }
-                cache.insert(hs.nonce, now);
-            }
+        if !self.check_handshake_nonce(&hs.nonce) {
+            return false;
         }
         // Key continuity: known node_id must present same mix + identity keys.
         if let Some(known) = self.routing_table.read().await.get_node(&hs.node_id) {
@@ -655,7 +785,12 @@ pub enum TransportError {
 
 /// Handle an incoming connection
 ///
-/// Performs handshake, then enters the connection loop.
+/// Phase 7 encrypted handshake (mutual privacy):
+/// 1. Read Hello (ephemeral keys + nonce, no identity)
+/// 2. Send Welcome (server ephemeral + KEM ciphertext, no identity)
+/// 3. Read client's encrypted identity (AEAD, identity hidden from observers)
+/// 4. Send server's encrypted identity (AEAD, mutual privacy)
+/// All messages share one padded size (indistinguishable).
 pub async fn handle_incoming_connection(
     connection: Box<dyn Connection>,
     addr: String,
@@ -663,135 +798,195 @@ pub async fn handle_incoming_connection(
 ) {
     debug!("Incoming connection from {}", addr);
 
-    // Read handshake from peer
+    // Message 1: read Hello.
+    let hello = match read_wire_message(&connection, &addr).await {
+        Some(WireMessage::Hello(h)) => h,
+        Some(_) => {
+            warn!("Expected hello, got other message from {}", addr);
+            return;
+        }
+        None => {
+            warn!("Peer {} disconnected during handshake (hello)", addr);
+            return;
+        }
+    };
+    // Replay-cache the ephemeral nonce.
+    if !state.check_handshake_nonce(&hello.nonce) {
+        warn!("Rejected hello with replayed nonce from {}", addr);
+        return;
+    }
+
+    // Server ephemeral keys + encapsulation to client's ephemeral KEM key.
+    let server_dh = static_crypto::DhKeypair::random();
+    let server_kem = static_crypto::KemKeypair::random();
+    let (kem_shared, kem_ct) =
+        match static_crypto::KemKeypair::encapsulate_to(&hello.eph_kem_pub_key) {
+            Ok(v) => v,
+            Err(_) => {
+                warn!("Bad ephemeral KEM key in hello from {}", addr);
+                return;
+            }
+        };
+    let peer_eph_pub = x25519_dalek::PublicKey::from(hello.eph_pub_key);
+    let dh_shared = server_dh.dh(&peer_eph_pub);
+    let handshake_secret = derive_handshake_secret(&dh_shared, &kem_shared);
+    let mut server_nonce = [0u8; 32];
+    {
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut server_nonce);
+    }
+
+    // Message 2: send Welcome.
+    let welcome = Welcome {
+        eph_pub_key: server_dh.public.as_bytes().to_owned(),
+        eph_kem_pub_key: server_kem.public_bytes(),
+        nonce: server_nonce,
+        kem_ciphertext: kem_ct,
+    };
+    if send_wire_message(&connection, &WireMessage::Welcome(welcome.clone()), &addr).await.is_err() {
+        return;
+    }
+
+    // Message 3: read client's encrypted identity.
+    let client_enc = match read_wire_message(&connection, &addr).await {
+        Some(WireMessage::AuthIdentity(a)) => a,
+        Some(_) => {
+            warn!("Expected encrypted identity, got other from {}", addr);
+            return;
+        }
+        None => {
+            warn!("Peer {} disconnected during handshake (identity)", addr);
+            return;
+        }
+    };
+    let aad = handshake_session_aad(&hello.nonce, &server_nonce);
+    let Some(client_hs) = decrypt_identity(&handshake_secret, &client_enc, &aad) else {
+        warn!("Failed to decrypt client identity from {}", addr);
+        return;
+    };
+    if !state.verify_handshake(&client_hs).await {
+        warn!("Rejected client identity with bad signature/KEM from {}", addr);
+        return;
+    }
+
+    // Message 4: send server's encrypted identity (mutual privacy).
+    let our_hs = state.signed_handshake().await;
+    let server_enc = encrypt_identity(&handshake_secret, &our_hs, &aad);
+    if send_wire_message(&connection, &WireMessage::AuthIdentity(server_enc), &addr)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    finish_inbound_handshake(connection, addr, state, client_hs).await;
+}
+
+/// Complete an inbound handshake after authentication.
+///
+/// Shared tail for the Phase 7 flow: routing-table insert, connection
+/// setup, reconnection signal, and spawn of the connection loop.
+async fn finish_inbound_handshake(
+    connection: Box<dyn Connection>,
+    addr: String,
+    state: Arc<TransportState>,
+    hs: Handshake,
+) {
+    // Add to routing table
+    state.routing_table.write().await.add_node(KnownNode {
+        node_id: hs.node_id,
+        public_key: hs.public_key,
+        address: addr.clone(),
+        kem_public_key: hs.kem_public_key.clone(),
+        compute_enabled: hs.compute_enabled,
+        compute_capacity: hs.compute_capacity,
+        identity_public_key: Some(hs.identity_public_key),
+    });
+
+    // Set up connection
+    let (tx, rx) = mpsc::channel::<WireMessage>(CHANNEL_BUFFER);
+    state.connections.write().await.insert(hs.node_id, tx.clone());
+    // The handshake itself proves the peer is alive.
+    state.note_peer_activity(hs.node_id);
+
+    // Partition-heal detection: if this node ID was connected
+    // before, this handshake is a reconnection. Signal the
+    // runner via a handshake-echo InboundMessage so it can
+    // trigger accounting reconciliation.
+    if state.previously_connected.write().await.remove(&hs.node_id) {
+        let _ = state
+            .inbound_tx
+            .send(InboundMessage {
+                from: hs.node_id,
+                message: WireMessage::Handshake(hs.clone()),
+                is_reconnection: true,
+            })
+            .await;
+    }
+
+    // Enter the connection loop
+    let shared: Arc<dyn Connection> = Arc::from(connection);
+    let write_state = state.clone();
+    let peer_id = hs.node_id;
+    tokio::spawn(async move {
+        connection_loop(shared, rx, write_state, peer_id).await;
+    });
+}
+
+/// Read a single framed wire message (helper for handshakes).
+async fn read_wire_message(
+    connection: &Box<dyn Connection>,
+    addr: &str,
+) -> Option<WireMessage> {
     let mut buf = vec![0u8; READ_BUFFER_SIZE];
     let mut read_buf = bytes::BytesMut::with_capacity(READ_BUFFER_SIZE);
-
-    // Read until we have a complete handshake
     loop {
         let n = match connection.recv_bytes(&mut buf).await {
             Ok(Some(n)) => n,
             Ok(None) => {
                 warn!("Peer {} disconnected during handshake", addr);
-                return;
+                return None;
             }
             Err(e) => {
                 warn!("Error reading handshake from {}: {}", addr, e);
-                return;
+                return None;
             }
         };
         read_buf.extend_from_slice(&buf[..n]);
-
-        if let Some(msg) = match try_read_message(&mut read_buf) {
-            Ok(msg) => msg,
+        match try_read_message(&mut read_buf) {
+            Ok(Some(msg)) => return Some(msg),
+            Ok(None) => continue,
             Err(e) => {
                 warn!("Wire error from {}: {}", addr, e);
-                return;
-            }
-        } {
-            match msg {
-                WireMessage::Handshake(hs) => {
-                    // Authenticate before any state change.
-                    if !state.verify_handshake(&hs).await {
-                        warn!("Rejected handshake with bad signature/KEM from {}", addr);
-                        return;
-                    }
-                    // Send our handshake back
-                    let our_hs = WireMessage::Handshake(state.signed_handshake().await);
-                    
-                    let mut write_buf = bytes::BytesMut::new();
-                    if let Err(e) = write_message(&mut write_buf, &our_hs) {
-                        warn!("Failed to serialize handshake for {}: {}", addr, e);
-                        return;
-                    }
-                    if let Err(e) = connection.send_bytes(&write_buf).await {
-                        warn!("Failed to send handshake to {}: {}", addr, e);
-                        return;
-                    }
-
-                    // Add to routing table
-                    state.routing_table.write().await.add_node(KnownNode {
-                        node_id: hs.node_id,
-                        public_key: hs.public_key,
-                        address: addr.clone(),
-                        kem_public_key: hs.kem_public_key.clone(),
-                        compute_enabled: hs.compute_enabled,
-                        compute_capacity: hs.compute_capacity,
-                        identity_public_key: Some(hs.identity_public_key),
-                    });
-
-                    // Set up connection
-                    let (tx, rx) = mpsc::channel::<WireMessage>(CHANNEL_BUFFER);
-                    state.connections.write().await.insert(hs.node_id, tx.clone());
-                    // The handshake itself proves the peer is alive.
-                    state.note_peer_activity(hs.node_id);
-
-                    // Partition-heal detection: if this node ID was connected
-                    // before, this handshake is a reconnection. Signal the
-                    // runner via a handshake-echo InboundMessage so it can
-                    // trigger accounting reconciliation.
-                    if state.previously_connected.write().await.remove(&hs.node_id) {
-                        let _ = state
-                            .inbound_tx
-                            .send(InboundMessage {
-                                from: hs.node_id,
-                                message: WireMessage::Handshake(hs.clone()),
-                                is_reconnection: true,
-                            })
-                            .await;
-                    }
-                    
-                    // Enter the connection loop
-                    let shared: Arc<dyn Connection> = Arc::from(connection);
-                    let write_state = state.clone();
-                    let peer_id = hs.node_id;
-                    tokio::spawn(async move {
-                        connection_loop(shared, rx, write_state, peer_id).await;
-                    });
-                    return;
-                }
-                WireMessage::Sphinx(_) => {
-                    warn!("Expected handshake, got Sphinx from {}", addr);
-                    return;
-                }
-                WireMessage::Gossip(_) => {
-                    warn!("Expected handshake, got Gossip from {}", addr);
-                    return;
-                }
-                WireMessage::SwapProposal(_) => {
-                    warn!("Expected handshake, got SwapProposal from {}", addr);
-                    return;
-                }
-                WireMessage::SwapAccept(_) => {
-                    warn!("Expected handshake, got SwapAccept from {}", addr);
-                    return;
-                }
-                WireMessage::SwapReject(_) => {
-                    warn!("Expected handshake, got SwapReject from {}", addr);
-                    return;
-                }
-                WireMessage::SwapCommit(_) => {
-                    warn!("Expected handshake, got SwapCommit from {}", addr);
-                    return;
-                }
-                WireMessage::SwapAbort(_) => {
-                    warn!("Expected handshake, got SwapAbort from {}", addr);
-                    return;
-                }
-                WireMessage::Prepayment(_) => {
-                    warn!("Expected handshake, got Prepayment from {}", addr);
-                    return;
-                }
-                WireMessage::AccountingReconciliation(_) => {
-                    warn!("Expected handshake, got AccountingReconciliation from {}", addr);
-                    return;
-                }
+                return None;
             }
         }
     }
 }
 
+/// Send a single framed wire message (helper for handshakes).
+async fn send_wire_message(
+    connection: &Box<dyn Connection>,
+    msg: &WireMessage,
+    addr: &str,
+) -> Result<(), ()> {
+    let mut write_buf = bytes::BytesMut::new();
+    if let Err(e) = write_message(&mut write_buf, msg) {
+        warn!("Failed to serialize handshake for {}: {}", addr, e);
+        return Err(());
+    }
+    if let Err(e) = connection.send_bytes(&write_buf).await {
+        warn!("Failed to send handshake to {}: {}", addr, e);
+        return Err(());
+    }
+    Ok(())
+}
+
 /// Connect to a peer
+///
+/// Phase 7 encrypted handshake (mirrors [`handle_incoming_connection`]):
+/// Hello -> Welcome -> ClientAuth -> ServerAuth. Identities stay AEAD-
+/// encrypted; an observer learns nothing about either peer.
 pub async fn connect_to_peer(
     addr: SocketAddr,
     state: Arc<TransportState>,
@@ -800,98 +995,114 @@ pub async fn connect_to_peer(
 
     let connection = state.transport.connect(&addr.to_string()).await?;
 
-    // Send our handshake first (signed, no tier)
-    let our_hs = WireMessage::Handshake(state.signed_handshake().await);
-
-    let mut write_buf = bytes::BytesMut::new();
-    write_message(&mut write_buf, &our_hs)?;
-    connection.send_bytes(&write_buf).await?;
-
-    // Read their handshake
-    let mut buf = vec![0u8; READ_BUFFER_SIZE];
-    let mut read_buf = bytes::BytesMut::with_capacity(READ_BUFFER_SIZE);
-
-    loop {
-        let n = match connection.recv_bytes(&mut buf).await? {
-            Some(n) => n,
-            None => return Err(TransportError::HandshakeFailed("peer disconnected".into())),
-        };
-        read_buf.extend_from_slice(&buf[..n]);
-
-        if let Some(msg) = try_read_message(&mut read_buf)? {
-            match msg {
-                WireMessage::Handshake(hs) => {
-                    if !state.verify_handshake(&hs).await {
-                        return Err(TransportError::HandshakeFailed("bad handshake signature/KEM".into()));
-                    }
-                    // Add to routing table
-                    state.routing_table.write().await.add_node(KnownNode {
-                        node_id: hs.node_id,
-                        public_key: hs.public_key,
-                        address: addr.to_string(),
-                        kem_public_key: hs.kem_public_key.clone(),
-                        compute_enabled: hs.compute_enabled,
-                        compute_capacity: hs.compute_capacity,
-                        identity_public_key: Some(hs.identity_public_key),
-                    });
-
-                    let (tx, rx) = mpsc::channel::<WireMessage>(CHANNEL_BUFFER);
-                    state.connections.write().await.insert(hs.node_id, tx.clone());
-                    // The handshake itself proves the peer is alive.
-                    state.note_peer_activity(hs.node_id);
-
-                    // Partition-heal detection (outbound side).
-                    if state.previously_connected.write().await.remove(&hs.node_id) {
-                        debug!("Partition heal detected (outbound) with {:02x?}", hs.node_id);
-                        let _ = state
-                            .inbound_tx
-                            .send(InboundMessage {
-                                from: hs.node_id,
-                                message: WireMessage::Handshake(hs.clone()),
-                                is_reconnection: true,
-                            })
-                            .await;
-                    }
-                    
-                    let shared: Arc<dyn Connection> = Arc::from(connection);
-                    let write_state = state.clone();
-                    let peer_id = hs.node_id;
-                    tokio::spawn(async move {
-                        connection_loop(shared, rx, write_state, peer_id).await;
-                    });
-
-                    return Ok(());
-                }
-                WireMessage::Sphinx(_) => {
-                    return Err(TransportError::HandshakeFailed("expected handshake".into()));
-                }
-                WireMessage::Gossip(_) => {
-                    return Err(TransportError::HandshakeFailed("expected handshake, got gossip".into()));
-                }
-                WireMessage::SwapProposal(_) => {
-                    return Err(TransportError::HandshakeFailed("expected handshake, got swap proposal".into()));
-                }
-                WireMessage::SwapAccept(_) => {
-                    return Err(TransportError::HandshakeFailed("expected handshake, got swap accept".into()));
-                }
-                WireMessage::SwapReject(_) => {
-                    return Err(TransportError::HandshakeFailed("expected handshake, got swap reject".into()));
-                }
-                WireMessage::SwapCommit(_) => {
-                    return Err(TransportError::HandshakeFailed("expected handshake, got swap commit".into()));
-                }
-                WireMessage::SwapAbort(_) => {
-                    return Err(TransportError::HandshakeFailed("expected handshake, got swap abort".into()));
-                }
-                WireMessage::Prepayment(_) => {
-                    return Err(TransportError::HandshakeFailed("expected handshake, got prepayment".into()));
-                }
-                WireMessage::AccountingReconciliation(_) => {
-                    return Err(TransportError::HandshakeFailed("expected handshake, got reconciliation".into()));
-                }
-            }
-        }
+    // Message 1: send Hello (fresh ephemeral keys + nonce).
+    let client_dh = static_crypto::DhKeypair::random();
+    let client_kem = static_crypto::KemKeypair::random();
+    let mut client_nonce = [0u8; 32];
+    {
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut client_nonce);
     }
+    let hello = Hello {
+        eph_pub_key: client_dh.public.as_bytes().to_owned(),
+        eph_kem_pub_key: client_kem.public_bytes(),
+        nonce: client_nonce,
+    };
+    {
+        let mut write_buf = bytes::BytesMut::new();
+        write_message(&mut write_buf, &WireMessage::Hello(hello.clone()))?;
+        connection
+            .send_bytes(&write_buf)
+            .await
+            .map_err(|e| TransportError::HandshakeFailed(format!("hello send: {}", e)))?;
+    }
+
+    // Message 2: read Welcome.
+    let welcome = match read_wire_message(&connection, &addr.to_string()).await {
+        Some(WireMessage::Welcome(w)) => w,
+        Some(_) => {
+            return Err(TransportError::HandshakeFailed("expected welcome".into()));
+        }
+        None => return Err(TransportError::HandshakeFailed("peer disconnected".into())),
+    };
+    if !state.check_handshake_nonce(&welcome.nonce) {
+        return Err(TransportError::HandshakeFailed("welcome nonce replay".into()));
+    }
+    // Derive the shared secret: DH + decapsulated KEM.
+    let server_eph_pub = x25519_dalek::PublicKey::from(welcome.eph_pub_key);
+    let dh_shared = client_dh.dh(&server_eph_pub);
+    let kem_shared = client_kem
+        .decapsulate(&welcome.kem_ciphertext)
+        .map_err(|_| TransportError::HandshakeFailed("KEM decapsulation failed".into()))?;
+    let handshake_secret = derive_handshake_secret(&dh_shared, &kem_shared);
+    let aad = handshake_session_aad(&client_nonce, &welcome.nonce);
+
+    // Message 3: send client's encrypted identity.
+    let our_hs = state.signed_handshake().await;
+    let client_enc = encrypt_identity(&handshake_secret, &our_hs, &aad);
+    {
+        let mut write_buf = bytes::BytesMut::new();
+        write_message(&mut write_buf, &WireMessage::AuthIdentity(client_enc))?;
+        connection
+            .send_bytes(&write_buf)
+            .await
+            .map_err(|e| TransportError::HandshakeFailed(format!("identity send: {}", e)))?;
+    }
+
+    // Message 4: read server's encrypted identity.
+    let server_hs = match read_wire_message(&connection, &addr.to_string()).await {
+        Some(WireMessage::AuthIdentity(a)) => {
+            decrypt_identity(&handshake_secret, &a, &aad).ok_or_else(|| {
+                TransportError::HandshakeFailed("server identity decrypt failed".into())
+            })?
+        }
+        Some(_) => {
+            return Err(TransportError::HandshakeFailed("expected server identity".into()));
+        }
+        None => return Err(TransportError::HandshakeFailed("peer disconnected".into())),
+    };
+    if !state.verify_handshake(&server_hs).await {
+        return Err(TransportError::HandshakeFailed("bad server identity/KEM".into()));
+    }
+    let hs = server_hs;
+
+    // Add to routing table
+    state.routing_table.write().await.add_node(KnownNode {
+        node_id: hs.node_id,
+        public_key: hs.public_key,
+        address: addr.to_string(),
+        kem_public_key: hs.kem_public_key.clone(),
+        compute_enabled: hs.compute_enabled,
+        compute_capacity: hs.compute_capacity,
+        identity_public_key: Some(hs.identity_public_key),
+    });
+
+    let (tx, rx) = mpsc::channel::<WireMessage>(CHANNEL_BUFFER);
+    state.connections.write().await.insert(hs.node_id, tx.clone());
+    // The handshake itself proves the peer is alive.
+    state.note_peer_activity(hs.node_id);
+
+    // Partition-heal detection (outbound side).
+    if state.previously_connected.write().await.remove(&hs.node_id) {
+        debug!("Partition heal detected (outbound) with {:02x?}", hs.node_id);
+        let _ = state
+            .inbound_tx
+            .send(InboundMessage {
+                from: hs.node_id,
+                message: WireMessage::Handshake(hs.clone()),
+                is_reconnection: true,
+            })
+            .await;
+    }
+
+    let shared: Arc<dyn Connection> = Arc::from(connection);
+    let write_state = state.clone();
+    let peer_id = hs.node_id;
+    tokio::spawn(async move {
+        connection_loop(shared, rx, write_state, peer_id).await;
+    });
+
+    Ok(())
 }
 
 /// Connection loop for an established peer connection
@@ -1003,8 +1214,13 @@ async fn connection_loop(
                 let remaining = target_bytes_per_interval.saturating_sub(bytes_this_interval);
 
                 if remaining > 0 && cfg.enabled {
-                    // Hybrid-only cover (v1-sized dummies).
-                    let dummy_msg = dummy_sphinx_message(true, remaining as usize);
+                    // Hybrid-only cover (Phase 7): valid Sphinx when the
+                    // peer's keys are known, size-realistic dummy otherwise.
+                    let dummy_msg = {
+                        let table = state.routing_table.read().await;
+                        valid_cover_message(&peer_id, &table, remaining as usize)
+                            .unwrap_or_else(|| dummy_sphinx_message(true, remaining as usize))
+                    };
                     let mut wire_buf = bytes::BytesMut::new();
 
                     if write_message(&mut wire_buf, &dummy_msg).is_err() {
@@ -1103,326 +1319,8 @@ pub async fn handle_message(
         WireMessage::Handshake(_) => {
             warn!("Unexpected handshake from connected peer");
         }
-        WireMessage::Gossip(gossip) => {
-            // Enforce sender binding: gossip must come from its claimed sender.
-            if gossip.from_node != from {
-                return Ok(());
-            }
-            let new_peers = state.routing_table.write().await.process_gossip(&gossip);
-            if new_peers > 0 {
-                debug!("Added {} new peers from gossip", new_peers);
-            }
-        }
-        WireMessage::SwapProposal(proposal) => {
-            // Validate the proposal
-            let current_time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            // Reconcile the shared capacity counter with holder reality
-            // before deciding: the counter is maintained incrementally and
-            // any missed update would otherwise corrupt the decision.
-            // (No record_accept here: accepting stores nothing in the
-            // holder — the 2-phase flow only reserves until commit.)
-            let actual_bytes = {
-                let holder = state.chunk_holder.lock().await;
-                holder.total_bytes()
-            };
-            {
-                let mut capacity = state.storage_capacity.lock().await;
-                capacity.reconcile(actual_bytes);
-            }
-
-            let peer_chunks = {
-                state.peer_chunk_counts.lock().await.get(&from).copied().unwrap_or(0)
-            };
-            let capacity = state.storage_capacity.lock().await;
-            let result = decide_on_swap(
-                &proposal,
-                &capacity,
-                peer_chunks,
-                static_storage::CHUNK_SIZE + 16,
-                current_time,
-            );
-            drop(capacity);
-
-            match result {
-                Ok(()) => {
-                    // Spoof binding: proposal must come from its claimant.
-                    if proposal.from_node != from {
-                        let proposal_id = static_storage::swap::proposal_id(&proposal);
-                        let reject = create_swap_reject(state.node_id, proposal_id, static_storage::swap::SwapRejectReason::InvalidLease);
-                        let connections = state.connections.read().await;
-                        if let Some(sender) = connections.get(&from) {
-                            let _ = sender.send(WireMessage::SwapReject(reject)).await;
-                        }
-                        return Ok(());
-                    }
-                    // Select a real return chunk (first held, excluding offered).
-                    // Only its ID goes on the wire; the peer fetches the
-                    // data via the Sphinx retrieval protocol.
-                    let return_entry: Option<static_storage::ChunkId> = {
-                        let holder = state.chunk_holder.lock().await;
-                        holder
-                            .chunks
-                            .iter()
-                            .find(|(id, _)| **id != proposal.chunk_id)
-                            .map(|(id, _data)| *id)
-                    };
-                    let Some(ret_id) = return_entry else {
-                        // Nothing real to offer: reject instead of dummy.
-                        let proposal_id = static_storage::swap::proposal_id(&proposal);
-                        let reject = create_swap_reject(state.node_id, proposal_id, static_storage::swap::SwapRejectReason::NoCapacity);
-                        let connections = state.connections.read().await;
-                        if let Some(sender) = connections.get(&from) {
-                            let _ = sender.send(WireMessage::SwapReject(reject)).await;
-                        }
-                        return Ok(());
-                    };
-                    // DoS bound: too many pending swaps pin too much
-                    // buffered chunk memory.
-                    {
-                        let swaps = state.swap_state.lock().await;
-                        if swaps.pending_swaps.len() >= MAX_PENDING_SWAPS {
-                            let proposal_id = static_storage::swap::proposal_id(&proposal);
-                            let reject = create_swap_reject(state.node_id, proposal_id, static_storage::swap::SwapRejectReason::NoCapacity);
-                            let connections = state.connections.read().await;
-                            if let Some(sender) = connections.get(&from) {
-                                let _ = sender.send(WireMessage::SwapReject(reject)).await;
-                            }
-                            return Ok(());
-                        }
-                    }
-                    // Prepare phase: reserve capacity atomically (re-check
-                    // under the same lock that reserves) but store nothing.
-                    // The proposal carries no data (metadata-only wire),
-                    // so we reserve the fixed chunk size up front.
-                    let chunk_len = (static_storage::CHUNK_SIZE + 16) as u64;
-                    {
-                        let mut capacity = state.storage_capacity.lock().await;
-                        if !capacity.can_accept(chunk_len, peer_chunks) {
-                            let proposal_id = static_storage::swap::proposal_id(&proposal);
-                            let reject = create_swap_reject(state.node_id, proposal_id, static_storage::swap::SwapRejectReason::NoCapacity);
-                            let connections = state.connections.read().await;
-                            if let Some(sender) = connections.get(&from) {
-                                let _ = sender.send(WireMessage::SwapReject(reject)).await;
-                            }
-                            return Ok(());
-                        }
-                        capacity.reserve(chunk_len);
-                    }
-                    // Track the pending 2-phase swap. Their chunk data is
-                    // NOT on the wire: it arrives via the Sphinx-fragmented
-                    // retrieval phase, is verified against the proposal's
-                    // Merkle proof, and only then do we commit.
-                    let pid = static_storage::swap::proposal_id(&proposal);
-                    {
-                        let mut swaps = state.swap_state.lock().await;
-                        swaps.remove_proposal(&pid);
-                        swaps.start_pending_swap(PendingSwap {
-                            proposal_id: pid,
-                            peer: from,
-                            our_chunk_id: ret_id,
-                            their_chunk_id: proposal.chunk_id,
-                            their_chunk_data: Vec::new(),
-                            reserved_bytes: chunk_len,
-                            received_their_chunk: false,
-                            retrieval_requested: false,
-                            content_root: proposal.content_root,
-                            merkle_proof: proposal.merkle_proof.clone(),
-                            sent_commit: false,
-                            received_commit: false,
-                            renewal_token: proposal.lease.renewal_token,
-                            lease_expires_at: proposal.lease.expires_at,
-                            content_pub_key: proposal.content_public_key,
-                            started_at: current_time,
-                        });
-                    }
-
-                    let master_key = state.storage_key.lock().await.clone();
-                    let accept = create_swap_accept(
-                        state.node_id,
-                        ret_id,
-                        &master_key,
-                        pid,
-                        86400,
-                    );
-
-                    // Send the acceptance back. No commit yet: we still
-                    // have to retrieve and verify their chunk data via
-                    // the Sphinx retrieval protocol before we are ready
-                    // to finalize.
-                    {
-                        let connections = state.connections.read().await;
-                        if let Some(sender) = connections.get(&from) {
-                            let _ = sender.send(WireMessage::SwapAccept(accept)).await;
-                        }
-                    }
-                }
-                Err(reason) => {
-                    let proposal_id = static_storage::swap::proposal_id(&proposal);
-                    let reject = create_swap_reject(state.node_id, proposal_id, reason);
-                    // Clean pending on reject too.
-                    state.swap_state.lock().await.remove_proposal(&proposal_id);
-                    state.swap_state.lock().await.rejected_swaps += 1;
-                    let connections = state.connections.read().await;
-                    if let Some(sender) = connections.get(&from) {
-                        let _ = sender.send(WireMessage::SwapReject(reject)).await;
-                    }
-                }
-            }
-        }
-        WireMessage::SwapAccept(accept) => {
-            // Proposer side of the prepare phase: the accept is
-            // metadata-only and names the return chunk by ID. Validate,
-            // reserve capacity for the (fixed-size) return chunk — and
-            // store nothing. The chunk data itself arrives via the
-            // Sphinx retrieval phase.
-            let pid = accept.proposal_id;
-            let has_pending = {
-                let swaps = state.swap_state.lock().await;
-                swaps.get_pending_swap(&pid).is_some()
-            };
-            if !has_pending {
-                // Stale or duplicate accept (no proposal in flight).
-                return Ok(());
-            }
-            let chunk_len = (static_storage::CHUNK_SIZE + 16) as u64;
-            // Reserve capacity for their return chunk; abort the swap if
-            // we cannot honor the barter.
-            let fits = {
-                let mut capacity = state.storage_capacity.lock().await;
-                let fits = capacity.can_accept(chunk_len, 0);
-                if fits {
-                    capacity.reserve(chunk_len);
-                }
-                fits
-            };
-            if !fits {
-                let swap = state.swap_state.lock().await.abort_swap(&pid);
-                if let Some(swap) = swap {
-                    state.storage_capacity.lock().await.release_reserved(swap.reserved_bytes, false);
-                }
-                send_swap_control(
-                    state,
-                    from,
-                    WireMessage::SwapAbort(crate::wire::SwapAbort {
-                        proposal_id: pid,
-                        from_node: state.node_id,
-                        reason: "no capacity for return chunk".to_string(),
-                    }),
-                )
-                .await;
-                return Ok(());
-            }
-            {
-                let mut swaps = state.swap_state.lock().await;
-                if let Some(swap) = swaps.pending_swaps.get_mut(&pid) {
-                    swap.their_chunk_id = accept.chunk_id;
-                    swap.reserved_bytes = chunk_len;
-                    // The return chunk's lease terms come from the
-                    // accepter (it minted the lease). The return chunk
-                    // carries no content binding in chunk-level barter,
-                    // so `content_pub_key` stays all-zero: the lease
-                    // adopts the owner key on the first signed
-                    // heartbeat (see `LeaseManager`).
-                    swap.renewal_token = accept.lease.renewal_token;
-                    swap.lease_expires_at = accept.lease.expires_at;
-                }
-            }
-            // No commit yet: we must first retrieve their chunk over the
-            // Sphinx retrieval protocol, verify it, and only then commit.
-        }
-        WireMessage::SwapCommit(commit) => {
-            // Commit phase: the peer holds our chunk and is ready to
-            // store. Finalize only when we have both sent and received
-            // a commit for the proposal (and hold their chunk — it
-            // arrives via the retrieval phase, see
-            // `handle_swap_chunk_retrieval`).
-            if commit.from_node != from {
-                return Ok(());
-            }
-            let pid = commit.proposal_id;
-            {
-                // Auth: the commit must belong to a pending swap with
-                // this exact peer.
-                let swaps = state.swap_state.lock().await;
-                if !swaps
-                    .get_pending_swap(&pid)
-                    .is_some_and(|swap| swap.peer == from)
-                {
-                    // Unknown proposal or wrong peer: ignore.
-                    return Ok(());
-                }
-            }
-            {
-                let mut swaps = state.swap_state.lock().await;
-                swaps.mark_commit_received(&pid);
-            }
-            finalize_swap_if_ready(state, &pid).await;
-        }
-        WireMessage::SwapAbort(abort) => {
-            // One side failed (or the timeout fired): cancel the swap and
-            // release the reserved capacity. Nothing is stored.
-            if abort.from_node != from {
-                return Ok(());
-            }
-            let pid = abort.proposal_id;
-            let swap = state.swap_state.lock().await.abort_swap(&pid);
-            if let Some(swap) = swap {
-                state
-                    .storage_capacity
-                    .lock()
-                    .await
-                    .release_reserved(swap.reserved_bytes, false);
-                debug!(
-                    "Swap {:02x?} aborted by peer {:02x?}: {}",
-                    pid,
-                    from,
-                    abort.reason
-                );
-            }
-        }
-        WireMessage::SwapReject(reject) => {
-            state.swap_state.lock().await.rejected_swaps += 1;
-            state.swap_state.lock().await.remove_proposal(&reject.proposal_id);
-        }
-        WireMessage::Prepayment(prepayment) => {
-            // Prepayments are accounting metadata (like gossip): forward to
-            // the node runner for validation. NodeRunner::handle_inbound
-            // owns signature checks, rate limiting, sponsor limits, and
-            // accounting updates to preserve layering (mesh = transport,
-            // node = business logic).
-            debug!(
-                "Received prepayment from {:02x?} for content {:02x?} ({} bytes)",
-                from, prepayment.content_id, prepayment.bytes
-            );
-            let _ = state
-                .inbound_tx
-                .send(InboundMessage {
-                    from,
-                    message: WireMessage::Prepayment(prepayment),
-                    is_reconnection: false,
-                })
-                .await;
-        }
-        WireMessage::AccountingReconciliation(recon) => {
-            // Reconciliation batches are accounting metadata: forward to
-            // the runner, which owns last-write-wins merging.
-            debug!(
-                "Received accounting reconciliation from {:02x?} ({} entries)",
-                from,
-                recon.peer_credits.len()
-            );
-            let _ = state
-                .inbound_tx
-                .send(InboundMessage {
-                    from,
-                    message: WireMessage::AccountingReconciliation(recon),
-                    is_reconnection: false,
-                })
-                .await;
+        WireMessage::Hello(_)| WireMessage::Welcome(_) | WireMessage::AuthIdentity(_) => {
+            warn!("Unexpected handshake-phase message from connected peer");
         }
         WireMessage::Sphinx(packet) => {
             // Hybrid-only mandate (Phase 0, Q2): classical v0 rejected.
@@ -1559,6 +1457,362 @@ pub async fn handle_message(
     Ok(())
 }
 
+/// Check sender key continuity for a maintenance message (Phase 7).
+///
+/// When the claimed sender is a known routing-table entry with a pinned
+/// identity key, the message's key must match; otherwise the message is
+/// rejected (impersonation). Unknown senders pass here — the message
+/// signature itself is still verified by the caller.
+async fn check_maintenance_sender(
+    state: &Arc<TransportState>,
+    claimed: &NodeId,
+    presented_identity: &[u8; 32],
+) -> bool {
+    let table = state.routing_table.read().await;
+    match table.get_node(claimed) {
+        Some(known) => match known.identity_public_key {
+            Some(stored) => stored == *presented_identity,
+            None => true,
+        },
+        None => true,
+    }
+}
+
+/// Send a signed swap rejection Sphinx-wrapped (helper for handlers).
+async fn send_maintenance_reject(
+    state: &Arc<TransportState>,
+    dest: NodeId,
+    proposal_id: [u8; 32],
+    reason: static_storage::swap::SwapRejectReason,
+) {
+    let reject = create_swap_reject(state.node_id, proposal_id, reason);
+    if let Ok(json) = serde_json::to_vec(&reject) {
+        send_maintenance_sphinx(state, dest, MSG_BODY_SWAP_REJECT, &json).await;
+    }
+}
+
+/// Handle a Sphinx-delivered gossip message (Phase 7, Task 1).
+///
+/// Sender authentication is the Ed25519 gossip signature (verified inside
+/// `process_gossip`) — no TCP-connection binding, which Sphinx delivery
+/// cannot provide by design.
+pub async fn handle_maintenance_gossip(
+    state: &Arc<TransportState>,
+    gossip: PeerGossip,
+) {
+    state.note_peer_activity(gossip.from_node);
+    let new_peers = state.routing_table.write().await.process_gossip(&gossip);
+    if new_peers > 0 {
+        debug!("Added {} new peers from Sphinx gossip", new_peers);
+    }
+}
+
+/// Handle a Sphinx-delivered swap proposal (Phase 7, Task 1).
+///
+/// Same prepare-phase logic as the former direct-wire handler, except:
+/// sender identity rests on the content signature (not the TCP peer),
+/// and the accept/reject goes back Sphinx-wrapped to the claimed sender.
+/// A forged `from_node` only misdirects our response (the victim drops
+/// it for want of a matching pending proposal), so spoofing gains nothing.
+pub async fn handle_maintenance_proposal(
+    state: &Arc<TransportState>,
+    proposal: SwapProposal,
+) {
+    let sender = proposal.from_node;
+    state.note_peer_activity(sender);
+    // Validate the proposal (lease + content signature; no content_id).
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Reconcile the shared capacity counter with holder reality
+    // before deciding (incremental counter hygiene).
+    let actual_bytes = {
+        let holder = state.chunk_holder.lock().await;
+        holder.total_bytes()
+    };
+    {
+        let mut capacity = state.storage_capacity.lock().await;
+        capacity.reconcile(actual_bytes);
+    }
+
+    let peer_chunks = {
+        state.peer_chunk_counts.lock().await.get(&sender).copied().unwrap_or(0)
+    };
+    let capacity = state.storage_capacity.lock().await;
+    let result = decide_on_swap(
+        &proposal,
+        &capacity,
+        peer_chunks,
+        static_storage::CHUNK_SIZE + 16,
+        current_time,
+    );
+    drop(capacity);
+
+    match result {
+        Ok(()) => {
+            // Select a real return chunk (first held, excluding offered).
+            let return_entry: Option<static_storage::ChunkId> = {
+                let holder = state.chunk_holder.lock().await;
+                holder
+                    .chunks
+                    .iter()
+                    .find(|(id, _)| **id != proposal.chunk_id)
+                    .map(|(id, _data)| *id)
+            };
+            let Some(ret_id) = return_entry else {
+                let pid = static_storage::swap::proposal_id(&proposal);
+                send_maintenance_reject(
+                    state,
+                    sender,
+                    pid,
+                    static_storage::swap::SwapRejectReason::NoCapacity,
+                )
+                .await;
+                return;
+            };
+            // DoS bound: too many pending swaps pin too much memory.
+            {
+                let swaps = state.swap_state.lock().await;
+                if swaps.pending_swaps.len() >= MAX_PENDING_SWAPS {
+                    let pid = static_storage::swap::proposal_id(&proposal);
+                    send_maintenance_reject(
+                        state,
+                        sender,
+                        pid,
+                        static_storage::swap::SwapRejectReason::NoCapacity,
+                    )
+                    .await;
+                    return;
+                }
+            }
+            // Prepare phase: reserve capacity atomically (re-check under
+            // the same lock that reserves) but store nothing.
+            let chunk_len = (static_storage::CHUNK_SIZE + 16) as u64;
+            {
+                let mut capacity = state.storage_capacity.lock().await;
+                if !capacity.can_accept(chunk_len, peer_chunks) {
+                    let pid = static_storage::swap::proposal_id(&proposal);
+                    send_maintenance_reject(
+                        state,
+                        sender,
+                        pid,
+                        static_storage::swap::SwapRejectReason::NoCapacity,
+                    )
+                    .await;
+                    return;
+                }
+                capacity.reserve(chunk_len);
+            }
+            // Track the pending 2-phase swap (data arrives via retrieval).
+            let pid = static_storage::swap::proposal_id(&proposal);
+            {
+                let mut swaps = state.swap_state.lock().await;
+                swaps.remove_proposal(&pid);
+                swaps.start_pending_swap(PendingSwap {
+                    proposal_id: pid,
+                    peer: sender,
+                    our_chunk_id: ret_id,
+                    their_chunk_id: proposal.chunk_id,
+                    their_chunk_data: Vec::new(),
+                    reserved_bytes: chunk_len,
+                    received_their_chunk: false,
+                    retrieval_requested: false,
+                    content_root: proposal.content_root,
+                    merkle_proof: proposal.merkle_proof.clone(),
+                    sent_commit: false,
+                    received_commit: false,
+                    renewal_token: proposal.lease.renewal_token,
+                    lease_expires_at: proposal.lease.expires_at,
+                    content_pub_key: proposal.content_public_key,
+                    started_at: current_time,
+                });
+            }
+
+            // Signed accept (Phase 7, H2-H3), Sphinx-wrapped.
+            let master_key = state.storage_key.lock().await.clone();
+            let mut accept = create_swap_accept(state.node_id, ret_id, &master_key, pid, 86400);
+            accept.sign(&state.identity_key);
+            if let Ok(json) = serde_json::to_vec(&accept) {
+                send_maintenance_sphinx(state, sender, MSG_BODY_SWAP_ACCEPT, &json).await;
+            }
+        }
+        Err(reason) => {
+            let pid = static_storage::swap::proposal_id(&proposal);
+            state.swap_state.lock().await.remove_proposal(&pid);
+            state.swap_state.lock().await.rejected_swaps += 1;
+            send_maintenance_reject(state, sender, pid, reason).await;
+        }
+    }
+}
+
+/// Handle a Sphinx-delivered swap accept (Phase 7, Tasks 1+6).
+///
+/// Verifies the acceptor signature + continuity + nonce replay, binds to
+/// the pending swap's peer (not the TCP connection), reserves capacity,
+/// and waits for the retrieval phase. Failures send a signed abort.
+pub async fn handle_maintenance_accept(
+    state: &Arc<TransportState>,
+    accept: SwapAccept,
+) {
+    let sender = accept.from_node;
+    state.note_peer_activity(sender);
+    // Auth: signature, continuity, replay.
+    if !accept.verify_signature() {
+        return;
+    }
+    if !check_maintenance_sender(state, &sender, &accept.identity_public_key).await {
+        return;
+    }
+    if !state.check_maintenance_nonce(&accept.nonce) {
+        return;
+    }
+    let pid = accept.proposal_id;
+    // Bind to our pending proposal AND its peer (anti-spoof).
+    let peer_ok = {
+        let swaps = state.swap_state.lock().await;
+        swaps
+            .get_pending_swap(&pid)
+            .is_some_and(|swap| swap.peer == sender)
+    };
+    if !peer_ok {
+        return;
+    }
+    let chunk_len = (static_storage::CHUNK_SIZE + 16) as u64;
+    let fits = {
+        let mut capacity = state.storage_capacity.lock().await;
+        let fits = capacity.can_accept(chunk_len, 0);
+        if fits {
+            capacity.reserve(chunk_len);
+        }
+        fits
+    };
+    if !fits {
+        let swap = state.swap_state.lock().await.abort_swap(&pid);
+        if let Some(swap) = swap {
+            state.storage_capacity.lock().await.release_reserved(swap.reserved_bytes, false);
+        }
+        let mut abort = create_swap_abort(
+            pid,
+            state.node_id,
+            "no capacity for return chunk".to_string(),
+            None,
+        );
+        abort.sign(&state.identity_key);
+        if let Ok(json) = serde_json::to_vec(&abort) {
+            send_maintenance_sphinx(state, sender, MSG_BODY_SWAP_ABORT, &json).await;
+        }
+        return;
+    }
+    {
+        let mut swaps = state.swap_state.lock().await;
+        if let Some(swap) = swaps.pending_swaps.get_mut(&pid) {
+            swap.their_chunk_id = accept.chunk_id;
+            swap.reserved_bytes = chunk_len;
+            // Return-chunk lease terms come from the accepter; adopt the
+            // return content binding when present (zero root = barter).
+            swap.renewal_token = accept.lease.renewal_token;
+            swap.lease_expires_at = accept.lease.expires_at;
+            if accept.return_content_root != [0u8; 32] {
+                swap.content_root = accept.return_content_root;
+                swap.merkle_proof = accept.return_merkle_proof.clone();
+            }
+        }
+    }
+    // No commit yet: retrieve their chunk first (retrieval phase).
+}
+
+/// Handle a Sphinx-delivered swap commit (Phase 7, Tasks 1+6).
+pub async fn handle_maintenance_commit(
+    state: &Arc<TransportState>,
+    commit: SwapCommit,
+) {
+    let sender = commit.from_node;
+    state.note_peer_activity(sender);
+    if !commit.verify_signature() {
+        return;
+    }
+    if !check_maintenance_sender(state, &sender, &commit.identity_public_key).await {
+        return;
+    }
+    if !state.check_maintenance_nonce(&commit.nonce) {
+        return;
+    }
+    let pid = commit.proposal_id;
+    {
+        // Auth: the commit must belong to a pending swap with this peer.
+        let swaps = state.swap_state.lock().await;
+        if !swaps
+            .get_pending_swap(&pid)
+            .is_some_and(|swap| swap.peer == sender)
+        {
+            return;
+        }
+    }
+    {
+        let mut swaps = state.swap_state.lock().await;
+        swaps.mark_commit_received(&pid);
+    }
+    finalize_swap_if_ready(state, &pid).await;
+}
+
+/// Handle a Sphinx-delivered swap abort (Phase 7, Tasks 1+6).
+pub async fn handle_maintenance_abort(
+    state: &Arc<TransportState>,
+    abort: SwapAbort,
+) {
+    let sender = abort.from_node;
+    state.note_peer_activity(sender);
+    if !abort.verify_signature() {
+        return;
+    }
+    if !check_maintenance_sender(state, &sender, &abort.identity_public_key).await {
+        return;
+    }
+    if !state.check_maintenance_nonce(&abort.nonce) {
+        return;
+    }
+    let pid = abort.proposal_id;
+    // Bind to the pending swap's peer (anti-spoof).
+    let peer_ok = {
+        let swaps = state.swap_state.lock().await;
+        swaps
+            .get_pending_swap(&pid)
+            .is_some_and(|swap| swap.peer == sender)
+    };
+    if !peer_ok {
+        // Still allow cleanup of proposer-side proposal records.
+        state.swap_state.lock().await.remove_proposal(&pid);
+        return;
+    }
+    let swap = state.swap_state.lock().await.abort_swap(&pid);
+    if let Some(swap) = swap {
+        state
+            .storage_capacity
+            .lock()
+            .await
+            .release_reserved(swap.reserved_bytes, false);
+        debug!(
+            "Swap {:02x?} aborted by peer {:02x?}: {}",
+            pid, sender, abort.reason
+        );
+    }
+}
+
+/// Handle a Sphinx-delivered swap rejection (Phase 7, Task 1).
+///
+/// Rejections carry no signature (auth risk accepted: handling only
+/// cleans local proposal state). The proposal ID must match a record we
+/// created, so blind forgeries hit nothing.
+pub async fn handle_maintenance_reject(
+    state: &Arc<TransportState>,
+    reject: SwapReject,
+) {
+    state.swap_state.lock().await.rejected_swaps += 1;
+    state.swap_state.lock().await.remove_proposal(&reject.proposal_id);
+}
+
 /// Feed a chunk retrieved via the Sphinx retrieval protocol into a
 /// pending 2-phase swap
 ///
@@ -1566,9 +1820,9 @@ pub async fn handle_message(
 /// response's chunk ID matches a pending swap still waiting for data,
 /// the chunk is verified against the swap's stashed Merkle
 /// proof/root and buffered in the pending swap. On success we send our
-/// [`SwapCommit`](crate::wire::SwapCommit) (if not already sent) and
+/// signed commit Sphinx-wrapped (if not already sent) and
 /// finalize when both commits are in. On verification failure the swap
-/// is aborted, the reservation released, and a `SwapAbort` sent to the
+/// is aborted, the reservation released, and a signed abort sent to the
 /// peer — nothing is ever stored.
 ///
 /// Returns `true` when the chunk was consumed by a pending swap (the
@@ -1621,16 +1875,12 @@ pub async fn handle_swap_chunk_retrieval(
                     .await
                     .release_reserved(swap.reserved_bytes, false);
             }
-            send_swap_control(
-                state,
-                peer,
-                WireMessage::SwapAbort(crate::wire::SwapAbort {
-                    proposal_id: pid,
-                    from_node: state.node_id,
-                    reason: "retrieved chunk failed integrity verification".to_string(),
-                }),
-            )
-            .await;
+            let mut abort =
+                create_swap_abort(pid, state.node_id, "retrieved chunk failed integrity verification".to_string(), None);
+            abort.sign(&state.identity_key);
+            if let Ok(json) = serde_json::to_vec(&abort) {
+                send_swap_control_sphinx(state, peer, MSG_BODY_SWAP_ABORT, &json).await;
+            }
             warn!(
                 "Swap {:02x?}: retrieved chunk {:02x?} failed Merkle verification; aborted",
                 pid, chunk_id
@@ -1659,15 +1909,11 @@ pub async fn handle_swap_chunk_retrieval(
         }
     };
     if need_commit {
-        send_swap_control(
-            state,
-            peer,
-            WireMessage::SwapCommit(crate::wire::SwapCommit {
-                proposal_id: pid,
-                from_node: state.node_id,
-            }),
-        )
-        .await;
+        let mut commit = create_swap_commit(pid, state.node_id, None);
+        commit.sign(&state.identity_key);
+        if let Ok(json) = serde_json::to_vec(&commit) {
+            send_swap_control_sphinx(state, peer, MSG_BODY_SWAP_COMMIT, &json).await;
+        }
     }
     finalize_swap_if_ready(state, &pid).await;
     true
@@ -1756,19 +2002,18 @@ fn generate_cover_packet(size: usize) -> Vec<u8> {
 }
 
 /// Build a dummy Sphinx message for cover traffic (hybrid-only, Phase 0).
+///
+/// Phase 7 (Task 4c): prefer a structurally valid packet so cover is
+/// indistinguishable from real traffic; fall back to size-realistic
+/// random bytes when the peer's keys are unknown (tests/early boot).
 fn dummy_sphinx_message(_use_hybrid: bool, budget: usize) -> WireMessage {
     use rand::RngCore;
 
-    // Hybrid dummy: fill the budget with version + ephemeral + as many
-    // whole KEM ciphertexts as fit (capped at MAX_HOPS), random bytes
-    // throughout. Validity is not required — only wire-size realism.
-    let max_kem = static_sphinx::MAX_HOPS * static_sphinx::HYBRID_KEM_CIPHERTEXT_SIZE;
-    let fixed = 32 + static_sphinx::ROUTING_INFO_SIZE + 16 + static_sphinx::BODY_SIZE;
-    let kem_budget = budget.saturating_sub(fixed + 1 + 4);
-    let kem_len = (kem_budget / static_sphinx::HYBRID_KEM_CIPHERTEXT_SIZE
-        * static_sphinx::HYBRID_KEM_CIPHERTEXT_SIZE)
-        .min(max_kem);
+    // Hybrid dummy: fixed KEM block + AEAD wire body (Phase 7 sizes).
+    let fixed = 32 + static_sphinx::ROUTING_INFO_SIZE + 16 + static_sphinx::WIRE_BODY_SIZE;
+    let kem_len = static_sphinx::KEM_BLOCK_SIZE;
     let total = fixed + kem_len;
+    let _ = budget;
     let mut dummy = vec![0u8; total.max(32)];
     rand::rngs::OsRng.fill_bytes(&mut dummy);
     let routing_end = 32 + static_sphinx::ROUTING_INFO_SIZE;
@@ -1786,28 +2031,87 @@ fn dummy_sphinx_message(_use_hybrid: bool, budget: usize) -> WireMessage {
     })
 }
 
-/// Background loop to periodically gossip known peers to connected peers
+/// Build valid cover for a peer: a real 3-hop hybrid packet routed through
+/// the peer as first hop (Phase 7, Task 4c).
+///
+/// Returns `None` when the peer's KEM key is unknown; the caller falls back
+/// to [`dummy_sphinx_message`]. Random intermediates fill hops 2-3 so the
+/// packet is fully formed; it dies in the network after the peer forwards.
+fn valid_cover_message(
+    peer_id: &NodeId,
+    routing_table: &RoutingTable,
+    _budget: usize,
+) -> Option<WireMessage> {
+    use rand::RngCore;
+    let peer = routing_table.get_node(peer_id)?;
+    let peer_kem = peer.kem_public_key.clone()?;
+    if peer_kem.len() != static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE {
+        return None;
+    }
+    // Two fresh random intermediates (their secrets are unknown; the packet
+    // is cover and is allowed to die after the first real hop forwards).
+    let r1 = static_sphinx::HybridMixNode::new();
+    let r2 = static_sphinx::HybridMixNode::new();
+    let route = static_sphinx::HybridRoute {
+        hops: vec![
+            static_sphinx::HybridRouteHop {
+                node_id: peer.node_id,
+                classical_public_key: peer.public_key,
+                kem_public_key: peer_kem,
+            },
+            r1.as_hop(),
+            r2.as_hop(),
+        ],
+        destination: {
+            let mut d = [0u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut d);
+            d
+        },
+    };
+    let mut body = [0u8; static_sphinx::BODY_SIZE];
+    rand::rngs::OsRng.fill_bytes(&mut body);
+    static_sphinx::create_packet_hybrid(&route, &body)
+        .map(WireMessage::Sphinx)
+        .ok()
+}
+
+/// Background loop to periodically gossip known peers (Phase 7: Sphinx).
+///
+/// Gossip content is signed (sender auth) and Sphinx-wrapped per
+/// destination. Fan-out is capped at 10 random connected peers (Task 2,
+/// gossip cap 10) instead of broadcasting to all connections.
 pub async fn gossip_loop(state: Arc<TransportState>, interval_secs: u64) {
+    use rand::seq::SliceRandom;
     let mut interval = time::interval(Duration::from_secs(interval_secs));
-    
+
     loop {
         interval.tick().await;
-        
-        // Signed gossip (Phase 0 sender auth).
+
+        // Signed gossip (sender auth).
         let gossip = {
             let table = state.routing_table.read().await;
             let sk_bytes = state.identity_key.to_bytes();
             let sk = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
             table.create_signed_gossip(50, &sk)
         };
-        
-        let connections = state.connections.read().await;
-        if connections.is_empty() {
+        let Ok(json) = serde_json::to_vec(&gossip) else {
+            continue;
+        };
+
+        // Random subset of connected peers (cap 10), snapshot then send.
+        let peers: Vec<NodeId> = {
+            let connections = state.connections.read().await;
+            let mut ids: Vec<NodeId> = connections.keys().copied().collect();
+            ids.shuffle(&mut rand::thread_rng());
+            ids.truncate(10);
+            ids
+        };
+        if peers.is_empty() {
             continue;
         }
-        
-        for sender in connections.values() {
-            let _ = sender.send(WireMessage::Gossip(gossip.clone())).await;
+
+        for peer in peers {
+            send_maintenance_sphinx(&state, peer, MSG_BODY_GOSSIP, &json).await;
         }
     }
 }
@@ -1915,24 +2219,79 @@ pub fn create_transport_state(
         compute_capacity: 0,
         transport,
         handshake_nonces: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        maintenance_nonces: Arc::new(std::sync::Mutex::new(HashMap::new())),
     });
 
     (state, inbound_rx)
 }
 
-/// Send a `SwapCommit` or `SwapAbort` to a swap peer
+/// Send maintenance payload Sphinx-wrapped to a destination (Phase 7).
 ///
-/// Commit/abort are direct wire maintenance traffic (like rejects), not
-/// Sphinx-wrapped.
-async fn send_swap_control(
+/// Builds `[body_type][payload]`, fragments it, wraps each fragment in a
+/// hybrid Sphinx packet routed via [`TransportState::build_route_to_
+/// destination`] (3-hop when the table allows, else direct), and queues
+/// each packet on the first hop's connection. Drops (with a warning)
+/// when the destination's keys are unknown.
+///
+/// Public so the node runner Sphinx-wraps its own maintenance sends
+/// (swap proposals, reconciliation batches, prepayments) through the
+/// same path instead of direct-wire messages.
+pub async fn send_maintenance_sphinx(
+    state: &TransportState,
+    dest: NodeId,
+    body_type: u8,
+    payload: &[u8],
+) {
+    let body = wrap_maintenance_payload(body_type, payload);
+    let Some(route) = state.build_route_to_destination(dest).await else {
+        warn!("No route for maintenance to {:02x?}: unknown peer", dest);
+        return;
+    };
+    let first_hop = route.hops[0].node_id;
+    let kem_map: HashMap<NodeId, Vec<u8>> = {
+        let table = state.routing_table.read().await;
+        table
+            .nodes
+            .iter()
+            .filter_map(|(id, n)| n.kem_public_key.as_ref().map(|k| (*id, k.clone())))
+            .collect()
+    };
+    let kem_lookup = |id: &NodeId| kem_map.get(id).cloned();
+    let classical = static_sphinx::Route {
+        hops: route
+            .hops
+            .iter()
+            .map(|h| static_sphinx::RouteHop {
+                public_key: h.classical_public_key,
+                node_id: h.node_id,
+            })
+            .collect(),
+        destination: route.destination,
+    };
+    let packets = match create_hybrid_payload_packets(&body, &classical, &kem_lookup) {
+        Ok(p) => p,
+        Err(_) => {
+            warn!("Failed to wrap maintenance for {:02x?}", dest);
+            return;
+        }
+    };
+    let connections = state.connections.read().await;
+    let Some(sender) = connections.get(&first_hop) else {
+        return;
+    };
+    for pkt in packets {
+        let _ = sender.send(WireMessage::Sphinx(pkt)).await;
+    }
+}
+
+/// Send a signed `SwapCommit`/`SwapAbort` Sphinx-wrapped to a swap peer.
+async fn send_swap_control_sphinx(
     state: &TransportState,
     peer: NodeId,
-    message: WireMessage,
+    body_type: u8,
+    payload_json: &[u8],
 ) {
-    let connections = state.connections.read().await;
-    if let Some(sender) = connections.get(&peer) {
-        let _ = sender.send(message).await;
-    }
+    send_maintenance_sphinx(state, peer, body_type, payload_json).await;
 }
 
 /// Send a Sphinx packet to a specific peer
@@ -1950,45 +2309,32 @@ pub async fn send_sphinx(
         .map_err(|_| TransportError::ChannelSend)
 }
 
-/// Send a prepayment to a sponsor peer
-///
-/// Prepayments are direct wire maintenance traffic (like gossip),
-/// not Sphinx-wrapped. Sponsored chunks themselves are Sphinx-wrapped.
+/// Send a prepayment to a sponsor peer (Phase 7: Sphinx-wrapped).
 pub async fn send_prepayment(
     state: &Arc<TransportState>,
     peer: NodeId,
     prepayment: crate::wire::Prepayment,
 ) -> Result<(), TransportError> {
-    let connections = state.connections.read().await;
-    let sender = connections
-        .get(&peer)
-        .ok_or(TransportError::ConnectionNotFound(peer))?;
-
-    sender
-        .send(WireMessage::Prepayment(prepayment))
-        .await
-        .map_err(|_| TransportError::ChannelSend)
+    let json =
+        serde_json::to_vec(&prepayment).map_err(|_| TransportError::ChannelSend)?;
+    send_maintenance_sphinx(state, peer, MSG_BODY_PREPAYMENT, &json).await;
+    Ok(())
 }
 
 /// Send an accounting reconciliation batch to a reconnected peer
+/// (Phase 7: Sphinx-wrapped).
 ///
-/// Reconciliation traffic is direct wire maintenance (like gossip),
-/// not Sphinx-wrapped. Large states are split by the caller into
-/// batches of at most `crate::wire::MAX_RECONCILIATION_ENTRIES`.
+/// Large states are split by the caller into batches of at most
+/// `crate::wire::MAX_RECONCILIATION_ENTRIES`.
 pub async fn send_reconciliation(
     state: &Arc<TransportState>,
     peer: NodeId,
     reconciliation: crate::wire::AccountingReconciliation,
 ) -> Result<(), TransportError> {
-    let connections = state.connections.read().await;
-    let sender = connections
-        .get(&peer)
-        .ok_or(TransportError::ConnectionNotFound(peer))?;
-
-    sender
-        .send(WireMessage::AccountingReconciliation(reconciliation))
-        .await
-        .map_err(|_| TransportError::ChannelSend)
+    let json =
+        serde_json::to_vec(&reconciliation).map_err(|_| TransportError::ChannelSend)?;
+    send_maintenance_sphinx(state, peer, MSG_BODY_RECONCILIATION, &json).await;
+    Ok(())
 }
 
 /// Get transport statistics
@@ -2335,10 +2681,10 @@ mod tests {
         let chunk = static_storage::EncryptedChunk { id: chunk_id, data };
         let (content_root, proofs) =
             static_storage::integrity::generate_proofs(std::slice::from_ref(&chunk));
-        // Sign with ephemeral content key so binding + sig verify.
+        // Sign with ephemeral content key so sig verifies (Phase 7: no
+        // content_id on the wire; proposal carries a fresh nonce).
         let content_sk = ed25519_dalek::SigningKey::from_bytes(&[0x33u8; 32]);
         let content_pub = content_sk.verifying_key().to_bytes();
-        let content_id = *blake3::hash(&content_pub).as_bytes();
         let mut proposal = static_storage::swap::SwapProposal {
             from_node: from,
             chunk_id,
@@ -2351,15 +2697,11 @@ mod tests {
             encrypted_master_key: Vec::new(),
             content_root,
             merkle_proof: proofs.into_iter().next().expect("one chunk, one proof"),
-            content_id,
+            proposal_nonce: [0u8; 32],
             content_public_key: content_pub,
             content_signature: vec![],
         };
-        {
-            use ed25519_dalek::Signer;
-            let sig = content_sk.sign(&proposal.signing_bytes());
-            proposal.content_signature = sig.to_bytes().to_vec();
-        }
+        proposal.sign(&content_sk);
         proposal
     }
 
@@ -2396,9 +2738,7 @@ mod tests {
         let pid = static_storage::swap::proposal_id(&proposal);
 
         // Prepare phase: reserve, store nothing (no data on the wire).
-        handle_message(WireMessage::SwapProposal(proposal.clone()), &state, from)
-            .await
-            .unwrap();
+        handle_maintenance_proposal(&state, proposal.clone()).await;
 
         assert!(state.chunk_holder.lock().await.get_chunk(&chunk_id).is_none());
         {
@@ -2434,13 +2774,10 @@ mod tests {
         assert!(state.chunk_holder.lock().await.get_chunk(&chunk_id).is_none());
 
         // Commit phase: the peer's commit finalizes the swap.
-        handle_message(
-            WireMessage::SwapCommit(crate::wire::SwapCommit { proposal_id: pid, from_node: from }),
-            &state,
-            from,
-        )
-        .await
-        .unwrap();
+        let mut commit =
+            static_storage::swap::create_swap_commit(pid, from, None);
+        commit.sign(&state.identity_key);
+        handle_maintenance_commit(&state, commit).await;
 
         let expected_len = (static_storage::CHUNK_SIZE + 16) as u64 * 2;
         assert_eq!(state.chunk_holder.lock().await.get_chunk(&chunk_id), Some(&data));
@@ -2486,16 +2823,15 @@ mod tests {
         // The metadata accept names their return chunk by ID.
         let their_id = [0xC2u8; 32];
         let their_data = vec![0x6Bu8; static_storage::CHUNK_SIZE + 16];
-        let accept = create_swap_accept(
+        let mut accept = create_swap_accept(
             peer,
             their_id,
             &static_crypto::SymmetricKey::random(),
             pid,
             86400,
         );
-        handle_message(WireMessage::SwapAccept(accept), &state, peer)
-            .await
-            .unwrap();
+        accept.sign(&state.identity_key);
+        handle_maintenance_accept(&state, accept).await;
 
         // Prepare phase on the proposer side: reserved, not stored.
         assert!(state.chunk_holder.lock().await.get_chunk(&their_id).is_none());
@@ -2519,13 +2855,10 @@ mod tests {
         assert!(consumed);
 
         // Their commit arrives: finalize.
-        handle_message(
-            WireMessage::SwapCommit(crate::wire::SwapCommit { proposal_id: pid, from_node: peer }),
-            &state,
-            peer,
-        )
-        .await
-        .unwrap();
+        let mut commit =
+            static_storage::swap::create_swap_commit(pid, peer, None);
+        commit.sign(&state.identity_key);
+        handle_maintenance_commit(&state, commit).await;
 
         assert_eq!(state.chunk_holder.lock().await.get_chunk(&their_id), Some(&their_data));
         let capacity = state.storage_capacity.lock().await;
@@ -2560,25 +2893,20 @@ mod tests {
         let proposal = test_swap_proposal(from, chunk_id, vec![0x5Fu8; static_storage::CHUNK_SIZE + 16]);
         let pid = static_storage::swap::proposal_id(&proposal);
 
-        handle_message(WireMessage::SwapProposal(proposal), &state, from)
-            .await
-            .unwrap();
+        handle_maintenance_proposal(&state, proposal).await;
         assert_eq!(
             state.storage_capacity.lock().await.reserved_bytes,
             (static_storage::CHUNK_SIZE + 16) as u64
         );
 
-        handle_message(
-            WireMessage::SwapAbort(crate::wire::SwapAbort {
-                proposal_id: pid,
-                from_node: from,
-                reason: "cannot honor barter".to_string(),
-            }),
-            &state,
+        let mut abort = static_storage::swap::create_swap_abort(
+            pid,
             from,
-        )
-        .await
-        .unwrap();
+            "cannot honor barter".to_string(),
+            None,
+        );
+        abort.sign(&state.identity_key);
+        handle_maintenance_abort(&state, abort).await;
 
         assert!(state.chunk_holder.lock().await.get_chunk(&chunk_id).is_none());
         let capacity = state.storage_capacity.lock().await;
@@ -2612,9 +2940,7 @@ mod tests {
         let proposal = test_swap_proposal(from, chunk_id, vec![0x60u8; static_storage::CHUNK_SIZE + 16]);
         let pid = static_storage::swap::proposal_id(&proposal);
 
-        handle_message(WireMessage::SwapProposal(proposal), &state, from)
-            .await
-            .unwrap();
+        handle_maintenance_proposal(&state, proposal).await;
 
         // Age the pending swap past the timeout without sleeping.
         {
@@ -2638,8 +2964,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_active_swap_accept_stores_nothing() {
-        // Spoofed proposal (sender != claimant) is rejected: nothing
-        // stored, nothing reserved.
+        // Forged proposal (bad content signature) is rejected: nothing
+        // stored, nothing reserved. Phase 7: with Sphinx delivery there is
+        // no TCP peer to bind against — the content signature is the binding.
         let (state, _rx) = test_state(
             random_node_id(),
             MixNode::new(),
@@ -2649,15 +2976,14 @@ mod tests {
         assert!(state.serve_enabled.load(std::sync::atomic::Ordering::Relaxed));
 
         let chunk_id = [0xB2u8; 32];
-        let proposal = test_swap_proposal(
+        let mut proposal = test_swap_proposal(
             random_node_id(),
             chunk_id,
             vec![0x5Du8; static_storage::CHUNK_SIZE + 16],
         );
+        proposal.content_signature[0] ^= 0xFF;
 
-        handle_message(WireMessage::SwapProposal(proposal), &state, random_node_id())
-            .await
-            .unwrap();
+        handle_maintenance_proposal(&state, proposal).await;
 
         assert!(state.chunk_holder.lock().await.get_chunk(&chunk_id).is_none());
         let capacity = state.storage_capacity.lock().await;
@@ -2692,9 +3018,7 @@ mod tests {
 
         // Metadata proposal is accepted (integrity is data-bound and
         // deferred to the retrieval phase).
-        handle_message(WireMessage::SwapProposal(proposal.clone()), &state, from)
-            .await
-            .unwrap();
+        handle_maintenance_proposal(&state, proposal.clone()).await;
         assert!(state.swap_state.lock().await.get_pending_swap(&pid).is_some());
 
         // Same size, different bytes than the proof was generated over.
@@ -2728,9 +3052,7 @@ mod tests {
         let from = random_node_id();
         let chunk_id = [0xB6u8; 32];
         let proposal = test_swap_proposal(from, chunk_id, vec![0x61u8; static_storage::CHUNK_SIZE + 16]);
-        handle_message(WireMessage::SwapProposal(proposal), &state, from)
-            .await
-            .unwrap();
+        handle_maintenance_proposal(&state, proposal).await;
 
         let other_id = [0xB7u8; 32];
         let other_data = vec![0x62u8; static_storage::CHUNK_SIZE + 16];
@@ -2797,5 +3119,70 @@ mod tests {
         // response was sent (no connection to the requester existed, and
         // more importantly the dormant gate returned before serving).
         assert!(state.chunk_holder.lock().await.get_chunk(&chunk_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_swap_accept_binding() {
+        // Phase 7 Task 6 (H2-H3): an accept with a VALID signature but
+        // from the WRONG node is rejected — the accept must come from
+        // the pending swap's peer (sender binding without TCP).
+        let (state, _rx) = test_state(
+            random_node_id(),
+            MixNode::new(),
+            crate::CoverTrafficConfig::default(),
+        );
+        let peer = random_node_id();
+        let impostor = random_node_id();
+        let our_chunk_id = [0xD1u8; 32];
+        let proposal = test_swap_proposal(
+            state.node_id,
+            our_chunk_id,
+            vec![0x6Au8; static_storage::CHUNK_SIZE + 16],
+        );
+        let pid = state.begin_swap_proposal(peer, &proposal).await;
+
+        // Signed accept from an impostor (not the swap peer).
+        let their_id = [0xD2u8; 32];
+        let mut accept = create_swap_accept(
+            impostor,
+            their_id,
+            &static_crypto::SymmetricKey::random(),
+            pid,
+            86400,
+        );
+        accept.sign(&state.identity_key);
+        assert!(accept.verify_signature(), "signature itself is valid");
+        handle_maintenance_accept(&state, accept).await;
+
+        // Nothing reserved, pending swap untouched.
+        assert_eq!(state.storage_capacity.lock().await.reserved_bytes, 0);
+        let swaps = state.swap_state.lock().await;
+        let pending = swaps.get_pending_swap(&pid).unwrap();
+        assert_eq!(pending.their_chunk_id, [0u8; 32]);
+        drop(swaps);
+
+
+        // The genuine peer's signed accept is accepted.
+        let mut good = create_swap_accept(
+            peer,
+            [0xD3u8; 32],
+            &static_crypto::SymmetricKey::random(),
+            pid,
+            86400,
+        );
+        good.sign(&state.identity_key);
+        handle_maintenance_accept(&state, good).await;
+        let pending = state
+            .swap_state
+            .lock()
+            .await
+            .get_pending_swap(&pid)
+            .cloned()
+            .expect("pending swap present");
+        assert_eq!(pending.their_chunk_id, [0xD3u8; 32]);
+        assert_eq!(
+            state.storage_capacity.lock().await.reserved_bytes,
+            (static_storage::CHUNK_SIZE + 16) as u64
+        );
     }
 }

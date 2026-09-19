@@ -220,6 +220,9 @@ pub struct AccountingState {
     /// Last prepayment timestamp per (seed, content_id) for rate limiting
     #[serde(default)]
     pub prepayment_attempts: HashMap<(NodeId, [u8; 32]), u64>,
+    /// Last reconciliation time per peer (Phase 7 delta sync)
+    #[serde(default)]
+    pub peer_sync_times: HashMap<NodeId, u64>,
 }
 
 impl AccountingState {
@@ -233,6 +236,7 @@ impl AccountingState {
             initial_credit: 1024 * 1024, // 1 MiB goodwill (new-ID cost)
             sponsored_seeds: HashMap::new(),
             prepayment_attempts: HashMap::new(),
+            peer_sync_times: HashMap::new(),
         }
     }
 
@@ -533,6 +537,38 @@ impl AccountingState {
             .iter()
             .map(|(id, credit)| (*id, credit.clone()))
             .collect()
+    }
+
+    /// Export only peer credits changed since `last_sync_time` (Phase 7).
+    ///
+    /// Delta reconciliation: instead of cloning the full table on every
+    /// heal, export entries with `last_interaction >= last_sync_time`
+    /// (`>=` so same-second interactions are never missed; re-exporting
+    /// is harmless — reconcile is idempotent). Callers track per-peer
+    /// sync times via [`AccountingState::mark_reconciled`]. An attacker
+    /// observing deltas learns only recently-active peers, not the full
+    /// credit graph.
+    pub fn export_reconciliation_delta(
+        &self,
+        last_sync_time: u64,
+    ) -> Vec<(NodeId, PeerCredit)> {
+        self.peers
+            .iter()
+            .filter(|(_, credit)| credit.last_interaction >= last_sync_time)
+            .map(|(id, credit)| (*id, credit.clone()))
+            .collect()
+    }
+
+    /// Record a successful reconciliation with a peer at `now_secs`.
+    ///
+    /// Stores per-peer sync times so the next heal exports a delta.
+    pub fn mark_reconciled(&mut self, peer: &NodeId, now_secs: u64) {
+        self.peer_sync_times.insert(*peer, now_secs);
+    }
+
+    /// Last reconciliation time with a peer (0 = never).
+    pub fn last_sync_time(&self, peer: &NodeId) -> u64 {
+        self.peer_sync_times.get(peer).copied().unwrap_or(0)
     }
 
     /// Reconcile with a peer's exported accounting state (last-write-wins)
@@ -1486,5 +1522,35 @@ mod tests {
         let peer4 = random_node_id();
         state.reconcile(&[(peer4, make_remote_credit(100, 100, now))]);
         assert!(state.peers.contains_key(&peer4));
+    }
+
+    #[test]
+    fn test_reconciliation_delta_only() {
+        // Phase 7 Task 5: delta export returns only entries changed since
+        // the last sync with that peer (timestamps set explicitly to
+        // avoid same-second flakiness).
+        let mut state = AccountingState::new();
+        let peer1 = random_node_id();
+        let peer2 = random_node_id();
+        state.record_served(peer1, 100);
+        state.record_served(peer2, 200);
+
+        // First sync: everything changed since 0.
+        let delta = state.export_reconciliation_delta(0);
+        assert_eq!(delta.len(), 2);
+
+        // Advance both interactions to a known tick, sync after it.
+        const T: u64 = 1_700_000_000;
+        state.peers.get_mut(&peer1).unwrap().last_interaction = T;
+        state.peers.get_mut(&peer2).unwrap().last_interaction = T;
+        state.mark_reconciled(&peer1, T + 1);
+        let delta = state.export_reconciliation_delta(state.last_sync_time(&peer1));
+        assert!(delta.is_empty(), "no changes after sync: {:?}", delta);
+
+        // New activity after the sync shows up in the next delta.
+        state.peers.get_mut(&peer1).unwrap().last_interaction = T + 2;
+        let delta = state.export_reconciliation_delta(state.last_sync_time(&peer1));
+        assert!(delta.iter().any(|(id, _)| *id == peer1));
+        assert!(!delta.iter().any(|(id, _)| *id == peer2));
     }
 }

@@ -17,6 +17,15 @@ use std::collections::HashMap;
 /// Maximum number of peers to gossip in a single message
 pub const MAX_GOSSIP_PEERS: usize = 50;
 
+/// Minimum number of hops for all Sphinx routes (Phase 7, Task 2).
+///
+/// Anonymity requirement: forward routes use [`MIN_HOPS`] random
+/// intermediates plus the destination; SURB return routes likewise. A
+/// 1-hop route links sender IP to destination IP directly. Route
+/// builders return `None` when the routing table cannot supply
+/// [`MIN_HOPS`] KEM-capable intermediates.
+pub const MIN_HOPS: usize = 3;
+
 /// A known node in the network
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KnownNode {
@@ -223,6 +232,9 @@ impl RoutingTable {
     /// KEM public keys are stripped from gossiped entries to bound message
     /// size (each ML-KEM key is ~1 KiB). KEM keys propagate via direct
     /// handshake only; hybrid routes use handshake-known peers.
+    /// Phase 7 (P1-Graph): network addresses are also stripped — peers
+    /// learn addresses from live TCP connections, not from gossip, so an
+    /// observer of gossip cannot map network topology.
     /// Unsigned (for tests/back-compat); use `create_signed_gossip` in prod.
     pub fn create_gossip(&self, max_peers: usize) -> PeerGossip {
         let mut unsigned = self.unsigned_gossip(max_peers);
@@ -252,6 +264,7 @@ impl RoutingTable {
             .map(|n| {
                 let mut stripped = n.clone();
                 stripped.kem_public_key = None;
+                stripped.address = String::new();
                 stripped
             })
             .collect();
@@ -262,6 +275,52 @@ impl RoutingTable {
             identity_public_key: [0u8; 32],
             signature: vec![],
         }
+    }
+
+    /// Build a hybrid Sphinx route to a destination (Phase 7, Task 2).
+    ///
+    /// Always selects [`MIN_HOPS`] random KEM-capable intermediates
+    /// (excluding self and the destination) plus the destination as the
+    /// final hop — 4 hops total. Returns `None` when the table cannot
+    /// supply [`MIN_HOPS`] intermediates: the caller must not send with
+    /// fewer hops (that would link sender to destination directly).
+    pub fn build_hybrid_route(
+        &self,
+        destination: NodeId,
+        dest_public_key: [u8; 32],
+        dest_kem_public_key: &[u8],
+    ) -> Option<static_sphinx::HybridRoute> {
+        let mut candidates: Vec<&KnownNode> = self
+            .nodes
+            .values()
+            .filter(|n| {
+                n.node_id != destination
+                    && n.node_id != self.our_node_id
+                    && n.kem_public_key.is_some()
+            })
+            .collect();
+        if candidates.len() < MIN_HOPS {
+            return None;
+        }
+        candidates.shuffle(&mut rand::thread_rng());
+
+        let mut hops: Vec<static_sphinx::HybridRouteHop> = candidates
+            .into_iter()
+            .take(MIN_HOPS)
+            .map(|n| static_sphinx::HybridRouteHop {
+                node_id: n.node_id,
+                classical_public_key: n.public_key,
+                kem_public_key: n.kem_public_key.clone().unwrap_or_default(),
+            })
+            .collect();
+
+        hops.push(static_sphinx::HybridRouteHop {
+            node_id: destination,
+            classical_public_key: dest_public_key,
+            kem_public_key: dest_kem_public_key.to_vec(),
+        });
+
+        Some(static_sphinx::HybridRoute { hops, destination })
     }
 
     /// Build a hybrid Sphinx route to a destination
@@ -701,5 +760,60 @@ mod tests {
             .hops
             .iter()
             .all(|h| h.kem_public_key.len() == 1184));
+    }
+
+    #[test]
+    fn test_min_hops_enforced() {
+        use static_crypto::KemKeypair;
+        // Phase 7 Task 2: build_hybrid_route always returns
+        // MIN_HOPS intermediates + destination (4 hops total), and
+        // refuses to build with fewer KEM-capable peers.
+        let dest_kem = KemKeypair::random().public_bytes();
+        let mut table = RoutingTable::new(random_node_id());
+        // Only 2 intermediates: refuses (would link sender to dest).
+        for i in 0..2u8 {
+            let mut n = random_known_node();
+            n.node_id = [i + 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            n.kem_public_key = Some(KemKeypair::random().public_bytes());
+            table.add_node(n);
+        }
+        assert!(table
+            .build_hybrid_route([0xFFu8; 16], [0xEEu8; 32], &dest_kem)
+            .is_none());
+
+        // 3 intermediates: builds MIN_HOPS + dest.
+        for i in 2..6u8 {
+            let mut n = random_known_node();
+            n.node_id = [i + 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            n.kem_public_key = Some(KemKeypair::random().public_bytes());
+            table.add_node(n);
+        }
+        let route = table
+            .build_hybrid_route([0xFFu8; 16], [0xEEu8; 32], &dest_kem)
+            .unwrap();
+        assert_eq!(route.hops.len(), crate::routing::MIN_HOPS + 1);
+        assert_eq!(route.hops.last().unwrap().node_id, [0xFFu8; 16]);
+        // Intermediates exclude the destination.
+        assert!(route.hops[..crate::routing::MIN_HOPS]
+            .iter()
+            .all(|h| h.node_id != [0xFFu8; 16]));
+    }
+
+    #[test]
+    fn test_gossip_no_address() {
+        // Phase 7 Task 5: gossip strips network addresses — an observer
+        // of gossip cannot map the network topology.
+        let mut table = RoutingTable::new(random_node_id());
+        let mut node = random_known_node();
+        node.address = "10.1.2.3:9000".to_string();
+        table.add_node(node);
+        let gossip = table.create_gossip(10);
+        assert_eq!(gossip.peers.len(), 1);
+        assert_eq!(gossip.peers[0].address, String::new());
+        // Local table keeps the address (learned from TCP).
+        assert_eq!(
+            table.nodes.values().next().unwrap().address,
+            "10.1.2.3:9000"
+        );
     }
 }

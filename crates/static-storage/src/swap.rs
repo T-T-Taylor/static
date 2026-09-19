@@ -72,10 +72,14 @@ fn current_timestamp() -> u64 {
 
 /// A swap proposal from one node to another
 ///
-/// Metadata-only: chunk payloads exceed the padded wire MTU
-/// (`PADDED_MESSAGE_SIZE`), so the proposal carries the chunk ID and
-/// the cryptographic binding; the data itself is fetched via the
-/// Sphinx-fragmented retrieval protocol after the accept.
+/// Metadata-only: chunk payloads exceed the padded wire MTU, so the
+/// proposal carries the chunk ID and the cryptographic binding; the data
+/// itself is fetched via the Sphinx-fragmented retrieval protocol after
+/// the accept.
+///
+/// Phase 7 (P1-Graph): no `content_id` — the holder verifies the content
+/// signature against `content_public_key` without learning the content
+/// address (`blake3(pubkey)` derivation is never sent).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SwapProposal {
     /// The proposing node's ID
@@ -91,17 +95,18 @@ pub struct SwapProposal {
     pub content_root: MerkleRoot,
     /// Merkle proof verifying this chunk against `content_root`
     pub merkle_proof: MerkleProof,
-    /// Content ID this chunk belongs to (`blake3(content_public_key)`)
+    /// Random per-proposal nonce (uniqueness + replay separation)
     ///
-    /// Binds the offered chunk to a content identity so receivers can
-    /// attribute garbage-flooding to a stable key.
+    /// Included in [`proposal_id`] so re-proposals for renewed leases get
+    /// fresh IDs and stale accepts cannot cross leases.
     #[serde(default)]
-    pub content_id: [u8; 32],
-    /// Ed25519 public key authorizing this content (`blake3(pub) == content_id`)
+    pub proposal_nonce: [u8; 32],
+    /// Ed25519 public key authorizing this content
     #[serde(default)]
     pub content_public_key: [u8; 32],
     /// Ed25519 signature over [`SwapProposal::signing_bytes`]
-    /// (`content_root || chunk_id || from_node`), 64 bytes when signed.
+    /// (`content_root || chunk_id || from_node || proposal_nonce`), 64
+    /// bytes when signed.
     ///
     /// Empty (`vec![]`) means unsigned — [`validate_swap_proposal`]
     /// rejects it with [`SwapRejectReason::InvalidSignature`].
@@ -112,43 +117,42 @@ pub struct SwapProposal {
 impl SwapProposal {
     /// Bytes covered by the content signature.
     ///
-    /// `content_root (32) || chunk_id (32) || from_node (16)` = 80 bytes.
-    /// Binds the offered chunk and its Merkle root to the sender so a
-    /// captured signature cannot be replayed for a different root/chunk.
+    /// `content_root (32) || chunk_id (32) || from_node (16) ||
+    /// proposal_nonce (32)` = 112 bytes. Binds the offered chunk, its
+    /// Merkle root, the sender, and the proposal uniqueness nonce.
     pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(32 + 32 + 16);
+        let mut buf = Vec::with_capacity(32 + 32 + 16 + 32);
         buf.extend_from_slice(&self.content_root);
         buf.extend_from_slice(&self.chunk_id);
         buf.extend_from_slice(&self.from_node);
+        buf.extend_from_slice(&self.proposal_nonce);
         buf
     }
 
     /// Sign this proposal with the content signing key.
     ///
-    /// Sets `content_public_key` from the key, `content_id` to
-    /// `blake3(public_key)` (so the binding check passes), and
-    /// `content_signature` to the Ed25519 signature over
-    /// [`SwapProposal::signing_bytes`].
+    /// Sets `content_public_key` from the key and `content_signature` to
+    /// the Ed25519 signature over [`SwapProposal::signing_bytes`].
+    /// Generates a fresh random `proposal_nonce` when currently zero.
     pub fn sign(&mut self, content_signing_key: &ed25519_dalek::SigningKey) {
         use ed25519_dalek::Signer;
+        use rand::RngCore;
         let public = content_signing_key.verifying_key().to_bytes();
         self.content_public_key = public;
-        self.content_id = *blake3::hash(&public).as_bytes();
+        if self.proposal_nonce == [0u8; 32] {
+            rand::rngs::OsRng.fill_bytes(&mut self.proposal_nonce);
+        }
         let sig = content_signing_key.sign(&self.signing_bytes());
         self.content_signature = sig.to_bytes().to_vec();
     }
 
-    /// Verify the content binding and signature.
+    /// Verify the content signature.
     ///
-    /// Returns `Ok(())` when `blake3(content_public_key) == content_id`
-    /// and the Ed25519 signature over [`SwapProposal::signing_bytes`]
-    /// verifies. Returns `Err(InvalidSignature)` otherwise.
+    /// Returns `Ok(())` when the Ed25519 signature over
+    /// [`SwapProposal::signing_bytes`] verifies against
+    /// `content_public_key`. No content-address is sent or checked
+    /// (Phase 7 privacy). Returns `Err(InvalidSignature)` otherwise.
     pub fn verify_content_signature(&self) -> Result<(), SwapRejectReason> {
-        // Binding: content_id must be blake3(content_public_key).
-        let expected = *blake3::hash(&self.content_public_key).as_bytes();
-        if expected != self.content_id {
-            return Err(SwapRejectReason::InvalidSignature);
-        }
         // Signature must be 64 bytes.
         if self.content_signature.len() != 64 {
             return Err(SwapRejectReason::InvalidSignature);
@@ -169,7 +173,13 @@ impl SwapProposal {
 /// A swap acceptance
 ///
 /// Metadata-only (see [`SwapProposal`]): names the return chunk by ID;
-/// the data is retrieved separately.
+/// the data is retrieved separately. Phase 7 (H2-H3): sender-bound via
+/// `from_node` + Ed25519 `signature` over
+/// (`proposal_id || from_node || return chunk || nonce`), verified against
+/// `identity_public_key` with key continuity. The return chunk carries
+/// its own content binding (`return_content_root` + proof + signature);
+/// a zero root marks barter without content binding (accepted without
+/// Merkle verification, like the proposer's side).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SwapAccept {
     /// The accepting node's ID
@@ -182,6 +192,63 @@ pub struct SwapAccept {
     pub proposal_id: [u8; 32],
     /// The master key for the return chunk (encrypted to the proposer)
     pub encrypted_master_key: Vec<u8>,
+    /// Merkle root of the return chunk's content (zero = barter, no binding)
+    #[serde(default)]
+    pub return_content_root: MerkleRoot,
+    /// Merkle proof for the return chunk against `return_content_root`
+    pub return_merkle_proof: MerkleProof,
+    /// Content signature for the return chunk binding
+    #[serde(default)]
+    pub return_content_signature: Vec<u8>,
+    /// Random anti-replay nonce
+    #[serde(default)]
+    pub nonce: [u8; 32],
+    /// Ed25519 identity public key of the acceptor
+    #[serde(default)]
+    pub identity_public_key: [u8; 32],
+    /// Ed25519 signature over [`SwapAccept::signing_bytes`]
+    #[serde(default)]
+    pub signature: Vec<u8>,
+}
+
+impl SwapAccept {
+    /// Bytes covered by the acceptor signature.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + 16 + 32 + 32 + 32);
+        buf.extend_from_slice(&self.proposal_id);
+        buf.extend_from_slice(&self.from_node);
+        buf.extend_from_slice(&self.chunk_id);
+        buf.extend_from_slice(&self.return_content_root);
+        buf.extend_from_slice(&self.nonce);
+        buf
+    }
+
+    /// Sign this accept with the node's identity key.
+    pub fn sign(&mut self, identity_key: &ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        use rand::RngCore;
+        self.identity_public_key = identity_key.verifying_key().to_bytes();
+        if self.nonce == [0u8; 32] {
+            rand::rngs::OsRng.fill_bytes(&mut self.nonce);
+        }
+        let sig = identity_key.sign(&self.signing_bytes());
+        self.signature = sig.to_bytes().to_vec();
+    }
+
+    /// Verify the acceptor signature against `identity_public_key`.
+    pub fn verify_signature(&self) -> bool {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        if self.signature.len() != 64 {
+            return false;
+        }
+        let Ok(pk) = VerifyingKey::from_bytes(&self.identity_public_key) else {
+            return false;
+        };
+        let mut arr = [0u8; 64];
+        arr.copy_from_slice(&self.signature);
+        let sig = Signature::from_bytes(&arr);
+        pk.verify(&self.signing_bytes(), &sig).is_ok()
+    }
 }
 
 /// A swap rejection
@@ -201,12 +268,64 @@ pub struct SwapReject {
 /// "I have your chunk and am ready to store it". The receiver finalizes
 /// the swap (stores chunks, converts the reservation) once it has both
 /// sent and received a commit for the proposal.
+///
+/// Phase 7 (H2-H3): Ed25519-signed over
+/// (`proposal_id || from_node || nonce`), verified against
+/// `identity_public_key` with key continuity. Replays rejected via the
+/// receiver's nonce cache.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SwapCommit {
     /// The proposal ID this commit is for
     pub proposal_id: [u8; 32],
     /// The sending node's ID
     pub from_node: NodeId,
+    /// Random anti-replay nonce
+    #[serde(default)]
+    pub nonce: [u8; 32],
+    /// Ed25519 identity public key of the committer
+    #[serde(default)]
+    pub identity_public_key: [u8; 32],
+    /// Ed25519 signature over [`SwapCommit::signing_bytes`]
+    #[serde(default)]
+    pub signature: Vec<u8>,
+}
+
+impl SwapCommit {
+    /// Bytes covered by the commit signature.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + 16 + 32);
+        buf.extend_from_slice(&self.proposal_id);
+        buf.extend_from_slice(&self.from_node);
+        buf.extend_from_slice(&self.nonce);
+        buf
+    }
+
+    /// Sign this commit with the node's identity key.
+    pub fn sign(&mut self, identity_key: &ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        use rand::RngCore;
+        self.identity_public_key = identity_key.verifying_key().to_bytes();
+        if self.nonce == [0u8; 32] {
+            rand::rngs::OsRng.fill_bytes(&mut self.nonce);
+        }
+        let sig = identity_key.sign(&self.signing_bytes());
+        self.signature = sig.to_bytes().to_vec();
+    }
+
+    /// Verify the committer signature against `identity_public_key`.
+    pub fn verify_signature(&self) -> bool {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        if self.signature.len() != 64 {
+            return false;
+        }
+        let Ok(pk) = VerifyingKey::from_bytes(&self.identity_public_key) else {
+            return false;
+        };
+        let mut arr = [0u8; 64];
+        arr.copy_from_slice(&self.signature);
+        let sig = Signature::from_bytes(&arr);
+        pk.verify(&self.signing_bytes(), &sig).is_ok()
+    }
 }
 
 /// A swap abort (2-phase commit cancel)
@@ -214,6 +333,9 @@ pub struct SwapCommit {
 /// Sent when a side cannot proceed (capacity missing, retrieval failed)
 /// or by the timeout sweep after [`DEFAULT_PENDING_SWAP_TIMEOUT_SECS`].
 /// Both sides release reserved capacity and store nothing.
+///
+/// Phase 7 (H2-H3): signed like [`SwapCommit`] (adds `reason` to the
+/// signed bytes).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SwapAbort {
     /// The proposal ID this abort is for
@@ -222,6 +344,54 @@ pub struct SwapAbort {
     pub from_node: NodeId,
     /// Reason for abort
     pub reason: String,
+    /// Random anti-replay nonce
+    #[serde(default)]
+    pub nonce: [u8; 32],
+    /// Ed25519 identity public key of the aborter
+    #[serde(default)]
+    pub identity_public_key: [u8; 32],
+    /// Ed25519 signature over [`SwapAbort::signing_bytes`]
+    #[serde(default)]
+    pub signature: Vec<u8>,
+}
+
+impl SwapAbort {
+    /// Bytes covered by the abort signature.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(32 + 16 + self.reason.len() + 32);
+        buf.extend_from_slice(&self.proposal_id);
+        buf.extend_from_slice(&self.from_node);
+        buf.extend_from_slice(self.reason.as_bytes());
+        buf.extend_from_slice(&self.nonce);
+        buf
+    }
+
+    /// Sign this abort with the node's identity key.
+    pub fn sign(&mut self, identity_key: &ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        use rand::RngCore;
+        self.identity_public_key = identity_key.verifying_key().to_bytes();
+        if self.nonce == [0u8; 32] {
+            rand::rngs::OsRng.fill_bytes(&mut self.nonce);
+        }
+        let sig = identity_key.sign(&self.signing_bytes());
+        self.signature = sig.to_bytes().to_vec();
+    }
+
+    /// Verify the aborter signature against `identity_public_key`.
+    pub fn verify_signature(&self) -> bool {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        if self.signature.len() != 64 {
+            return false;
+        }
+        let Ok(pk) = VerifyingKey::from_bytes(&self.identity_public_key) else {
+            return false;
+        };
+        let mut arr = [0u8; 64];
+        arr.copy_from_slice(&self.signature);
+        let sig = Signature::from_bytes(&arr);
+        pk.verify(&self.signing_bytes(), &sig).is_ok()
+    }
 }
 
 /// Reasons for rejecting a swap
@@ -239,9 +409,8 @@ pub enum SwapRejectReason {
     InvalidIntegrityTag = 4,
     /// Content binding or Ed25519 signature invalid
     ///
-    /// Covers: `blake3(content_public_key) != content_id`, signature
-    /// length != 64, unparseable public key, or failed verification
-    /// over `content_root || chunk.id || from_node`.
+    /// Covers: signature length != 64, unparseable public key, or failed
+    /// verification (proposal content sig, accept/commit/abort sender sig).
     InvalidSignature = 5,
 }
 
@@ -537,20 +706,23 @@ pub struct SwapStats {
 
 /// Compute a proposal ID (C2 idempotency).
 ///
-/// `blake3(chunk_id || from_node || content_root || lease.expires_at_be)`.
+/// `blake3(chunk_id || from_node || content_root || lease.expires_at_be ||
+/// proposal_nonce)`.
 ///
-/// Binding the content root and lease expiry makes the ID unique per
-/// (chunk, sender, content, lease): re-proposals for the same lease
-/// deduplicate to the same ID, while a renewed lease (different
+/// Binding the content root, lease expiry, and per-proposal nonce makes
+/// the ID unique per (chunk, sender, content, lease, proposal):
+/// re-proposals for the same lease deduplicate only when the nonce
+/// repeats (never — random 32 bytes), while a renewed lease (different
 /// `expires_at`) yields a different ID so stale accepts/rejects cannot
 /// be replayed across leases.
 pub fn proposal_id(proposal: &SwapProposal) -> [u8; 32] {
     use blake3;
-    let mut input = Vec::with_capacity(32 + 16 + 32 + 8);
+    let mut input = Vec::with_capacity(32 + 16 + 32 + 8 + 32);
     input.extend_from_slice(&proposal.chunk_id);
     input.extend_from_slice(&proposal.from_node);
     input.extend_from_slice(&proposal.content_root);
     input.extend_from_slice(&proposal.lease.expires_at.to_be_bytes());
+    input.extend_from_slice(&proposal.proposal_nonce);
     let hash = blake3::hash(&input);
     let mut id = [0u8; 32];
     id.copy_from_slice(hash.as_bytes());
@@ -566,12 +738,11 @@ pub fn proposal_id(proposal: &SwapProposal) -> [u8; 32] {
 /// [`crate::integrity::generate_proofs`] over the content's chunks; the
 /// receiver verifies the retrieved data against them before committing.
 ///
-/// `content_id` must be `blake3(content_public_key)`. If
-/// `content_signing_key` is `Some`, the proposal is signed over
-/// [`SwapProposal::signing_bytes`] (Ed25519 over
-/// `content_root || chunk_id || from_node`); if `None`, the signature
-/// is left empty (unsigned — validation rejects it, useful for tests
-/// that exercise the unsigned path).
+/// Phase 7: no `content_id` is stored or sent (privacy). If
+/// `content_signing_key` is `Some`, the proposal gets a fresh random
+/// `proposal_nonce` and is signed over [`SwapProposal::signing_bytes`];
+/// if `None`, nonce and signature stay empty (unsigned — validation
+/// rejects it, useful for tests exercising the unsigned path).
 pub fn create_swap_proposal(
     from_node: NodeId,
     chunk_id: ChunkId,
@@ -579,7 +750,6 @@ pub fn create_swap_proposal(
     lease_duration_secs: u64,
     content_root: MerkleRoot,
     merkle_proof: MerkleProof,
-    content_id: [u8; 32],
     content_public_key: [u8; 32],
     content_signing_key: Option<&ed25519_dalek::SigningKey>,
 ) -> SwapProposal {
@@ -601,18 +771,15 @@ pub fn create_swap_proposal(
         encrypted_master_key: vec![],
         content_root,
         merkle_proof,
-        content_id,
+        proposal_nonce: [0u8; 32],
         content_public_key,
         content_signature: vec![],
     };
 
-    // Sign if a key is provided, preserving the caller-supplied
-    // content_id / content_public_key so binding mismatches stay
-    // detectable (validation rejects them with InvalidSignature).
+    // Sign if a key is provided (fresh nonce + signature). Unsigned
+    // proposals stay empty (validation rejects them).
     if let Some(sk) = content_signing_key {
-        use ed25519_dalek::Signer;
-        let sig = sk.sign(&proposal.signing_bytes());
-        proposal.content_signature = sig.to_bytes().to_vec();
+        proposal.sign(sk);
     }
 
     proposal
@@ -622,6 +789,10 @@ pub fn create_swap_proposal(
 ///
 /// Metadata-only: names the return chunk by ID; the proposer fetches
 /// its data via the retrieval protocol.
+///
+/// Phase 7: the accept is sender-signed when `identity_key` is `Some`
+/// (fresh nonce + Ed25519 over [`SwapAccept::signing_bytes`]); `None`
+/// leaves it unsigned (tests only — transport rejects unsigned).
 pub fn create_swap_accept(
     from_node: NodeId,
     chunk_id: ChunkId,
@@ -629,6 +800,37 @@ pub fn create_swap_accept(
     proposal_id: [u8; 32],
     lease_duration_secs: u64,
 ) -> SwapAccept {
+    create_signed_swap_accept(
+        from_node,
+        chunk_id,
+        master_key,
+        proposal_id,
+        lease_duration_secs,
+        [0u8; 32],
+        MerkleProof { leaf_index: 0, siblings: vec![] },
+        vec![],
+        None,
+    )
+}
+
+/// Create a signed swap acceptance with return-chunk content binding.
+///
+/// `return_content_root`/`proof`/`signature` bind the return chunk to its
+/// content (zero root = barter without binding). `identity_key` signs the
+/// accept (`None` = unsigned, tests only).
+#[allow(clippy::too_many_arguments)]
+pub fn create_signed_swap_accept(
+    from_node: NodeId,
+    chunk_id: ChunkId,
+    master_key: &SymmetricKey,
+    proposal_id: [u8; 32],
+    lease_duration_secs: u64,
+    return_content_root: MerkleRoot,
+    return_merkle_proof: MerkleProof,
+    return_content_signature: Vec<u8>,
+    identity_key: Option<&ed25519_dalek::SigningKey>,
+) -> SwapAccept {
+    use rand::RngCore;
     let lease = create_lease(
         &chunk_id,
         master_key,
@@ -636,13 +838,25 @@ pub fn create_swap_accept(
         current_timestamp(),
     );
 
-    SwapAccept {
+    let mut nonce = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let mut accept = SwapAccept {
         from_node,
         chunk_id,
         lease,
         proposal_id,
         encrypted_master_key: vec![],
+        return_content_root,
+        return_merkle_proof,
+        return_content_signature,
+        nonce,
+        identity_public_key: [0u8; 32],
+        signature: vec![],
+    };
+    if let Some(sk) = identity_key {
+        accept.sign(sk);
     }
+    accept
 }
 
 /// Create a swap rejection
@@ -658,13 +872,64 @@ pub fn create_swap_reject(
     }
 }
 
+/// Create a signed swap commit.
+///
+/// `identity_key` signs the commit (`None` = unsigned, tests only —
+/// transport rejects unsigned commits).
+pub fn create_swap_commit(
+    proposal_id: [u8; 32],
+    from_node: NodeId,
+    identity_key: Option<&ed25519_dalek::SigningKey>,
+) -> SwapCommit {
+    use rand::RngCore;
+    let mut nonce = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let mut commit = SwapCommit {
+        proposal_id,
+        from_node,
+        nonce,
+        identity_public_key: [0u8; 32],
+        signature: vec![],
+    };
+    if let Some(sk) = identity_key {
+        commit.sign(sk);
+    }
+    commit
+}
+
+/// Create a signed swap abort.
+///
+/// `identity_key` signs the abort (`None` = unsigned, tests only).
+pub fn create_swap_abort(
+    proposal_id: [u8; 32],
+    from_node: NodeId,
+    reason: String,
+    identity_key: Option<&ed25519_dalek::SigningKey>,
+) -> SwapAbort {
+    use rand::RngCore;
+    let mut nonce = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let mut abort = SwapAbort {
+        proposal_id,
+        from_node,
+        reason,
+        nonce,
+        identity_public_key: [0u8; 32],
+        signature: vec![],
+    };
+    if let Some(sk) = identity_key {
+        abort.sign(sk);
+    }
+    abort
+}
+
 /// Validate a swap proposal (metadata-only)
 ///
 /// Checks:
 /// 1. Lease is valid
-/// 2. Content binding: `blake3(content_public_key) == content_id`
-/// 3. Content signature: 64-byte Ed25519 over
-///    `content_root || chunk_id || from_node` verifies
+/// 2. Content signature: 64-byte Ed25519 over
+///    `content_root || chunk_id || from_node || proposal_nonce` verifies
+///    against `content_public_key` (no content address sent, Phase 7).
 ///
 /// The proposal carries no chunk data, so chunk size and Merkle
 /// integrity cannot be checked here; the retrieved data is verified
@@ -846,7 +1111,6 @@ mod tests {
         rand::rngs::OsRng.fill_bytes(&mut sk_bytes);
         let content_signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
         let content_public_key = content_signing_key.verifying_key().to_bytes();
-        let content_id = *blake3::hash(&content_public_key).as_bytes();
         create_swap_proposal(
             node_id,
             chunk.id,
@@ -854,7 +1118,6 @@ mod tests {
             lease_duration_secs,
             root,
             proofs.into_iter().next().expect("one chunk, one proof"),
-            content_id,
             content_public_key,
             Some(&content_signing_key),
         )
@@ -872,7 +1135,6 @@ mod tests {
         rand::rngs::OsRng.fill_bytes(&mut sk_bytes);
         let sk = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
         let pk = sk.verifying_key().to_bytes();
-        let cid = *blake3::hash(&pk).as_bytes();
         create_swap_proposal(
             node_id,
             chunk.id,
@@ -880,7 +1142,6 @@ mod tests {
             lease_duration_secs,
             root,
             proofs.into_iter().next().expect("one chunk, one proof"),
-            cid,
             pk,
             None,
         )
@@ -902,8 +1163,9 @@ mod tests {
         assert_eq!(proposal.from_node, node_id);
         assert_eq!(proposal.chunk_id, chunk.id);
         assert!(is_lease_valid(&proposal.lease, current_timestamp()));
-        // Content auth is bound: blake3(pub) == content_id and signature verifies.
-        assert_eq!(*blake3::hash(&proposal.content_public_key).as_bytes(), proposal.content_id);
+        // Phase 7: no content_id on the wire; signature verifies against
+        // content_public_key and covers the fresh proposal nonce.
+        assert_ne!(proposal.proposal_nonce, [0u8; 32]);
         assert_eq!(proposal.content_signature.len(), 64);
         assert!(proposal.verify_content_signature().is_ok());
     }
@@ -948,10 +1210,8 @@ mod tests {
         let master = SymmetricKey::random();
 
         let proposal1 = make_proposal(node_id, chunk.clone(), &master, 3600);
-        let mut proposal2 = make_proposal(node_id, chunk, &master, 3600);
-        // C2 id includes lease expiry; both minted within the same second
-        // in practice, but normalize to rule out a 1s-boundary flake.
-        proposal2.lease.expires_at = proposal1.lease.expires_at;
+        // Same proposal bytes (including nonce) => same ID.
+        let proposal2 = proposal1.clone();
 
         let id1 = proposal_id(&proposal1);
         let id2 = proposal_id(&proposal2);
@@ -967,10 +1227,8 @@ mod tests {
         let master = SymmetricKey::random();
 
         let proposal1 = make_proposal(node_id, chunk.clone(), &master, 3600);
-        let mut proposal2 = make_proposal(node_id, chunk, &master, 3600);
-        // Force identical except expiry, then diverge expiry.
-        proposal2.content_root = proposal1.content_root;
-        proposal2.lease.expires_at = proposal1.lease.expires_at;
+        // Same bytes except expiry: clone then diverge expiry.
+        let mut proposal2 = proposal1.clone();
         assert_eq!(proposal_id(&proposal1), proposal_id(&proposal2));
 
         proposal2.lease.expires_at = proposal1.lease.expires_at.saturating_add(1000);
@@ -1076,14 +1334,14 @@ mod tests {
 
     #[test]
     fn test_validate_wrong_content_id_binding_fails() {
-        // content_id must equal blake3(content_public_key); a mismatched
-        // binding fails even with an otherwise valid signature.
+        // Phase 7: no content_id is sent; swapping the content public key
+        // breaks the signature binding instead.
         let node_id = random_node_id();
         let master = SymmetricKey::random();
 
         let proposal = make_proposal(node_id, random_chunk(), &master, 3600);
         let mut tampered = proposal;
-        tampered.content_id = [0xFFu8; 32];
+        tampered.content_public_key = [0xFFu8; 32];
 
         let result = validate_swap_proposal(&tampered, current_timestamp());
         assert_eq!(result.unwrap_err(), SwapRejectReason::InvalidSignature);
@@ -1132,10 +1390,11 @@ mod tests {
         let proposal = make_proposal(node_id, random_chunk(), &master, 3600);
 
         let bytes = proposal.signing_bytes();
-        assert_eq!(bytes.len(), 32 + 32 + 16);
+        assert_eq!(bytes.len(), 32 + 32 + 16 + 32);
         assert_eq!(&bytes[..32], &proposal.content_root);
         assert_eq!(&bytes[32..64], &proposal.chunk_id);
-        assert_eq!(&bytes[64..], &proposal.from_node);
+        assert_eq!(&bytes[64..80], &proposal.from_node);
+        assert_eq!(&bytes[80..], &proposal.proposal_nonce);
     }
 
     #[test]
@@ -1473,5 +1732,62 @@ mod tests {
         // Release is saturating (no underflow).
         capacity.release_reserved(9999, false);
         assert_eq!(capacity.reserved_bytes, 0);
+    }
+
+    #[test]
+    fn test_swap_proposal_no_content_id() {
+        // Phase 7 Task 5: the wire (JSON) form of a proposal leaks no
+        // content address — no "content_id" field exists at all.
+        let node_id = random_node_id();
+        let chunk = random_chunk();
+        let master = SymmetricKey::random();
+        let proposal = make_proposal(node_id, chunk, &master, 3600);
+
+        let json = serde_json::to_string(&proposal).unwrap();
+        assert!(!json.contains("content_id"));
+        // The public key is present (needed for signature verification),
+        // but the content address (blake3(pub)) is never derivable from
+        // the wire because the derivation is not sent.
+        assert!(json.contains("content_public_key"));
+
+        let back: SwapProposal = serde_json::from_str(&json).unwrap();
+        assert!(back.verify_content_signature().is_ok());
+    }
+
+    #[test]
+    fn test_swap_commit_signed() {
+        // Phase 7 Task 6 (H2): commits are Ed25519-signed; forgeries and
+        // tampering are rejected.
+        let mut sk_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut sk_bytes);
+        let sk = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
+        let mut commit = create_swap_commit([0x77u8; 32], random_node_id(), Some(&sk));
+        assert!(commit.verify_signature());
+        commit.proposal_id[0] ^= 0xFF;
+        assert!(!commit.verify_signature());
+
+        // Forged signature from a different key.
+        let mut forged = create_swap_commit([0x77u8; 32], random_node_id(), Some(&sk));
+        forged.signature[0] ^= 0xFF;
+        assert!(!forged.verify_signature());
+        // Unsigned commits rejected.
+        let unsigned = create_swap_commit([0x77u8; 32], random_node_id(), None);
+        assert!(!unsigned.verify_signature());
+    }
+
+    #[test]
+    fn test_swap_abort_signed() {
+        // Phase 7 Task 6 (H3): aborts are Ed25519-signed (reason bound).
+        let mut sk_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut sk_bytes);
+        let sk = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
+        let mut abort =
+            create_swap_abort([0x88u8; 32], random_node_id(), "test".into(), Some(&sk));
+        assert!(abort.verify_signature());
+        abort.reason = "tampered".into();
+        assert!(!abort.verify_signature());
+
+        let unsigned = create_swap_abort([0x88u8; 32], random_node_id(), "x".into(), None);
+        assert!(!unsigned.verify_signature());
     }
 }

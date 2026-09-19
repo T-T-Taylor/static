@@ -397,3 +397,95 @@ emitters are gone:
   paths end to end: compute request/response (echo module),
   verification challenge/response (accounting credit), payment quote
   (pending_payment). Suite: 372 tests, release build zero warnings.
+
+## Phase 7 Notes (2026-09-19) — Breaking Anonymity Fixes (402 tests)
+
+Wire protocol upgrade: coordinated deployment required; Phase 6 nodes cannot
+talk to Phase 7 nodes (by design — no backward compatibility).
+
+### P0-1 ✅ Sphinx-Wrap All Maintenance
+- `WireMessage` reduced to `Handshake` (legacy signaling/tests only) +
+  `Hello`/`Welcome`/`AuthIdentity` + `Sphinx`. The 8 direct-wire maintenance
+  variants (Gossip, SwapProposal/Accept/Reject/Commit/Abort, Prepayment,
+  Reconciliation) are deleted from the wire enum; old type bytes 0x03-0x08,
+  0x0B, 0x0C are rejected at framing.
+- Maintenance bodies carry a type byte (new namespace 0x12-0x19:
+  gossip/swap-*/prepayment/reconciliation) inside the encrypted Sphinx body,
+  fragmented and wrapped via `create_hybrid_payload_packets`.
+- `transport::send_maintenance_sphinx` is the single maintenance egress
+  (3-hop when the table allows, direct fallback on tiny networks).
+  Dispatch moved to the runner (`MaintenanceState` reassembler +
+  `handle_maintenance_fragment`), transport handlers are pure state machines
+  (`handle_maintenance_{gossip,proposal,accept,reject,commit,abort}`).
+- Sender binding over mixnet delivery: Ed25519 signatures + routing-table
+  identity-pin continuity (no TCP peer to bind against). Swap accept/commit/
+  abort also replay-cached (`maintenance_nonces`, bounded 4096/300s).
+
+### P0-2 ✅ MIN_HOPS=3 + Anonymous Return Routes
+- `routing::MIN_HOPS = 3`; `RoutingTable::build_hybrid_route` always selects
+  3 random KEM-capable intermediates + destination (4 hops), `None` when the
+  table cannot supply them.
+- `TransportState::build_route_to_destination` (forward) and
+  `build_self_return_route` (return: 3 intermediates + us) used by every
+  send path: swap retrieval, retrieve/fetch, compute request/confirm,
+  verification challenge, heartbeats, missing-chunk gossip, maintenance.
+  Sends target the route's first hop (random intermediary), never the
+  destination directly.
+- SURB batch-hybrid added (`create_surb_batch_hybrid`); SURB return routes
+  are proven at the protocol layer (roundtrip + blindness tests). Full
+  per-fragment SURB retrieval remains future work: one hybrid SURB is
+  ~5.6 KB, so embedding 1038 SURBs for a 1 MiB chunk response cannot fit
+  the wire — the 3-intermediate ReturnRoute gives the responder-path
+  anonymity MVP.
+- Gossip fan-out capped at 10 random connected peers (was: all).
+
+### P0-3 ✅ Encrypted, Padded Handshake
+- 4-message mutual-privacy handshake: Hello (ephemeral X25519 + ML-KEM +
+  nonce) → Welcome (server eph + KEM ciphertext) → AuthIdentity (client,
+  AEAD) → AuthIdentity (server, AEAD). Identities never in cleartext.
+- Shared secret: `derive_hybrid_shared_secret(x25519 || kem)`. Identity AEAD:
+  ChaCha20-Poly1305, AAD = hello_nonce || welcome_nonce (session binding).
+- All three handshake messages padded (random) to the uniform wire size —
+  indistinguishable to an observer.
+
+### P0-4 ✅ Sphinx Body Authentication + Fixed KEM Block
+- Body AEAD (Task 4a): innermost layer is ChaCha20-Poly1305
+  (`WIRE_BODY_SIZE = 1024 + 16`), AAD = destination node id. Outer onion
+  layers stay size-preserving XOR. Per-hop routing MACs now cover
+  `version || ephemeral || slot || body` → tampering fails fast
+  (MacVerificationFailed); residual tampering fails end-to-end
+  (BodyAuthFailed). SURB headers use a zero-placeholder MAC with end-to-end
+  AEAD still covering the payload.
+- Fixed KEM block (Task 4b): `KEM_BLOCK_SIZE = 5 * 1088 = 5440`. Real
+  ciphertexts + random dummies; each hop decapsulates slot 0, shifts left,
+  pads random — packet size never changes (no hop-position leak).
+- Valid cover (Task 4c): `create_dummy_sphinx_packet` (real 3-hop hybrid
+  packet, random body); the cover loop prefers a valid packet routed through
+  the peer when keys are known, size-realistic dummy otherwise.
+
+### P1-Graph ✅ Content-Graph Metadata Removal
+- `SwapProposal`: `content_id` removed (holder verifies the content
+  signature against `content_public_key` without the content address).
+- `Heartbeat`: `content_id` removed from wire + signature (local bookkeeping
+  only); holders renew by chunk set + token + owner key.
+- Gossip strips `address` (learned from TCP only) in addition to KEM keys.
+- Reconciliation exports deltas: `export_reconciliation_delta(last_sync)` +
+  per-peer `peer_sync_times` (`mark_reconciled`); heal sends only changed
+  entries.
+
+### H2-H3 ✅ Signed Swap Control
+- `SwapCommit`/`SwapAbort`/`SwapAccept`: Ed25519 identity signatures +
+  32-byte nonces (`create_swap_commit/abort`, `create_signed_swap_accept`).
+  Signatures cover proposal id, sender, (return root / reason) and nonce;
+  verified against the routing-table identity pin with replay cache.
+- `proposal_id = blake3(chunk || from || root || expiry || proposal_nonce)`
+  — fresh random nonce per proposal kills cross-lease replay.
+
+### Known trade-offs (documented, intentional)
+- Direct fallback routes on <4-node networks (bootstrap/tests); production
+  networks get 3 intermediates + destination on every path.
+- SURB retrieval is protocol-ready but not yet used for multi-fragment
+  responses (size math above).
+- `Handshake` wire variant retained for reconnection signaling + tests only.
+
+Suite: 402 tests, release build zero warnings.

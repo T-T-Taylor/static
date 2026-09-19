@@ -53,9 +53,15 @@ fn current_timestamp() -> u64 {
 }
 
 /// A heartbeat packet sent by the content owner
+///
+/// Phase 7 (P1-Graph): no `content_id` on the wire — the holder refreshes
+/// leases by `chunk_ids` (+ renewal token + owner key) without learning
+/// which content the chunks belong to. The `content_id` field is retained
+/// for local bookkeeping (sender-side grouping) but is never serialized
+/// or signed.
 #[derive(Debug, Clone)]
 pub struct Heartbeat {
-    /// The content ID this heartbeat covers
+    /// The content ID (local bookkeeping only, never sent)
     pub content_id: [u8; 32],
     /// The renewal token proving ownership
     pub renewal_token: [u8; 32],
@@ -107,12 +113,11 @@ impl Heartbeat {
 
     /// Bytes covered by the owner signature.
     ///
-    /// `content_id (32) || chunk_ids (32 each) || new_expires_at (8 BE)
-    /// || nonce (32)`. Binds the renewal to the content identity, the
-    /// exact chunk set, the expiration and the replay nonce.
+    /// `chunk_ids (32 each) || new_expires_at (8 BE) || nonce (32)`.
+    /// Binds the exact chunk set, the expiration and the replay nonce.
+    /// No content address is covered or sent (Phase 7 privacy).
     pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(32 + 32 * self.chunk_ids.len() + 8 + 32);
-        buf.extend_from_slice(&self.content_id);
+        let mut buf = Vec::with_capacity(32 * self.chunk_ids.len() + 8 + 32);
         for chunk_id in &self.chunk_ids {
             buf.extend_from_slice(chunk_id);
         }
@@ -131,19 +136,14 @@ impl Heartbeat {
         self.signature = sig.to_bytes().to_vec();
     }
 
-    /// Verify the owner signature and content binding.
+    /// Verify the owner signature.
     ///
-    /// Returns `Ok(())` when `blake3(content_pub_key) == content_id`,
-    /// the signature is 64 bytes, and the Ed25519 signature over
-    /// [`Heartbeat::signing_bytes`] verifies. Otherwise returns
+    /// Returns `Ok(())` when the signature is 64 bytes and the Ed25519
+    /// signature over [`Heartbeat::signing_bytes`] verifies against
+    /// `content_pub_key`. No content-address binding is sent or checked
+    /// (Phase 7 privacy). Otherwise returns
     /// [`HeartbeatError::InvalidSignature`].
     pub fn verify_signature(&self) -> Result<(), HeartbeatError> {
-        // Binding: content_id must be blake3(content_pub_key) so the
-        // signing key is pinned to this content identity.
-        let expected = *blake3::hash(&self.content_pub_key).as_bytes();
-        if expected != self.content_id {
-            return Err(HeartbeatError::InvalidSignature);
-        }
         if self.signature.len() != 64 {
             return Err(HeartbeatError::InvalidSignature);
         }
@@ -159,9 +159,12 @@ impl Heartbeat {
     }
 
     /// Serialize the heartbeat for transmission
+    ///
+    /// Phase 7: `content_id` is local-only and never serialized.
+    /// Layout: `[renewal_token 32][expires 8][count 4][chunk_ids][nonce 32]
+    /// [pubkey 32][sig_len 4][sig]`.
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(&self.content_id);
         buf.extend_from_slice(&self.renewal_token);
         buf.extend_from_slice(&self.new_expires_at.to_be_bytes());
         buf.extend_from_slice(&(self.chunk_ids.len() as u32).to_be_bytes());
@@ -176,18 +179,18 @@ impl Heartbeat {
     }
 
     /// Deserialize a heartbeat
+    ///
+    /// Phase 7 wire format (no `content_id`); the field is set to zeros
+    /// locally (sender-side grouping only, never trusted from the wire).
     pub fn deserialize(data: &[u8]) -> Result<Self, StorageError> {
-        if data.len() < 32 + 32 + 8 + 4 + 32 + 32 + 4 {
+        if data.len() < 32 + 8 + 4 + 32 + 32 + 4 {
             return Err(StorageError::InvalidChunkSize {
-                expected: 144,
+                expected: 112,
                 actual: data.len(),
             });
         }
 
         let mut offset = 0;
-        let mut content_id = [0u8; 32];
-        content_id.copy_from_slice(&data[offset..offset + 32]);
-        offset += 32;
 
         let mut renewal_token = [0u8; 32];
         renewal_token.copy_from_slice(&data[offset..offset + 32]);
@@ -255,7 +258,7 @@ impl Heartbeat {
         let signature = data[offset..offset + sig_len].to_vec();
 
         Ok(Self {
-            content_id,
+            content_id: [0u8; 32],
             renewal_token,
             new_expires_at,
             chunk_ids,
@@ -770,7 +773,8 @@ mod tests {
         let serialized = heartbeat.serialize();
         let deserialized = Heartbeat::deserialize(&serialized).unwrap();
 
-        assert_eq!(deserialized.content_id, content_id);
+        // Phase 7: content_id is local-only, never on the wire.
+        assert_eq!(deserialized.content_id, [0u8; 32]);
         assert_eq!(deserialized.renewal_token, token);
         assert_eq!(deserialized.chunk_ids, chunk_ids);
         assert_eq!(deserialized.new_expires_at, heartbeat.new_expires_at);
@@ -798,7 +802,8 @@ mod tests {
 
         assert_eq!(wire[0], MSG_HEARTBEAT);
         let deserialized = Heartbeat::wire_deserialize(&wire).unwrap();
-        assert_eq!(deserialized.content_id, content_id);
+        // Phase 7: content_id is local-only, never on the wire.
+        assert_eq!(deserialized.content_id, [0u8; 32]);
         assert_eq!(deserialized.renewal_token, token);
         assert_eq!(deserialized.chunk_ids, chunk_ids);
         assert_eq!(deserialized.new_expires_at, heartbeat.new_expires_at);
@@ -1046,15 +1051,17 @@ mod tests {
 
     #[test]
     fn test_heartbeat_signature_invalid() {
-        // A signature from the wrong key (valid for a different
-        // content identity) must be rejected.
+        // A heartbeat verified against the wrong owner key must be
+        // rejected at the lease-match step (signature itself is valid
+        // for the attacker's key; Phase 7 has no content-address binding).
         let mut manager = LeaseManager::new();
-        let (_owner_key, content_id) = test_owner();
+        let (owner_key, content_id) = test_owner();
         let attacker_key = test_owner().0;
         let chunk_id = random_chunk_id();
         let master = SymmetricKey::random();
 
-        let lease = create_lease(&chunk_id, &master, 3600, current_timestamp());
+        let mut lease = create_lease(&chunk_id, &master, 3600, current_timestamp());
+        lease.content_pub_key = owner_key.verifying_key().to_bytes();
         manager.add_lease(chunk_id, lease.clone());
 
         let heartbeat = signed_heartbeat(
@@ -1064,12 +1071,12 @@ mod tests {
             7200,
             &attacker_key,
         );
-        // blake3(attacker_pub) != content_id, so the binding fails.
-        assert!(matches!(
-            heartbeat.verify_signature(),
-            Err(HeartbeatError::InvalidSignature)
-        ));
-        let result = manager.process_heartbeat(&heartbeat, current_timestamp());
+        // Attacker's own signature verifies against the attacker's key...
+        assert!(heartbeat.verify_signature().is_ok());
+        // ...but the lease owner-key check rejects it.
+        let mut held = std::collections::HashSet::new();
+        held.insert(chunk_id);
+        let result = manager.process_heartbeat_upsert(&heartbeat, current_timestamp(), &held);
         assert!(matches!(result, Err(HeartbeatError::InvalidSignature)));
     }
 
@@ -1122,11 +1129,11 @@ mod tests {
 
         let mut lease = create_lease(&chunk_id, &master, 3600, current_timestamp());
         lease.content_pub_key = owner_key.verifying_key().to_bytes();
-        manager.add_lease(chunk_id, lease);
+        manager.add_lease(chunk_id, lease.clone());
 
         let heartbeat = signed_heartbeat(
             content_id,
-            [0x66u8; 32],
+            lease.renewal_token,
             vec![chunk_id],
             7200,
             &other_key,
@@ -1260,5 +1267,23 @@ mod tests {
         // Cleanup nonces older than 24 hours
         manager.cleanup_nonces(1000 + DEFAULT_LEASE_DURATION_SECS + 1);
         assert_eq!(manager.seen_nonces.len(), 0);
+    }
+
+    #[test]
+    fn test_heartbeat_no_content_id() {
+        // Phase 7 Task 5: the heartbeat wire form carries no content_id —
+        // holders cannot link chunks to content without the manifest.
+        let (signing_key, content_id) = test_owner();
+        let chunk_ids = vec![random_chunk_id(), random_chunk_id()];
+        let mut heartbeat = Heartbeat::new(content_id, [0x42u8; 32], chunk_ids, 3600);
+        heartbeat.sign(&signing_key);
+
+        let serialized = heartbeat.serialize();
+        // The local content_id bytes never appear on the wire.
+        assert!(serialized.windows(32).all(|w| w != content_id));
+        let back = Heartbeat::deserialize(&serialized).unwrap();
+        assert_eq!(back.content_id, [0u8; 32]);
+        // Signature still verifies over chunk set + expiry + nonce.
+        assert!(back.verify_signature().is_ok());
     }
 }

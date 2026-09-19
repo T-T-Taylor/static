@@ -241,6 +241,18 @@ pub struct LifecycleState {
     pub reassembler: Reassembler,
 }
 
+/// State for maintenance message reassembly (Phase 7, Task 1)
+///
+/// Maintenance (gossip, swap control, prepayment, reconciliation) arrives
+/// Sphinx-wrapped in fragmented bodies; this reassembler rebuilds the
+/// `[type byte][payload]` stream before type-byte dispatch. One
+/// reassembly in flight at a time, mirroring the other states.
+#[derive(Default)]
+pub struct MaintenanceState {
+    /// Reassembler for inbound maintenance fragments
+    pub reassembler: Reassembler,
+}
+
 impl std::fmt::Debug for ComputeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ComputeState")
@@ -404,6 +416,8 @@ pub struct NodeRunner {
     pub verification_state: Arc<Mutex<VerificationState>>,
     /// Lifecycle message reassembly (missing-chunk gossip, heartbeat)
     pub lifecycle_state: Arc<Mutex<LifecycleState>>,
+    /// Maintenance message reassembly (Phase 7: Sphinx-wrapped control)
+    pub maintenance_state: Arc<Mutex<MaintenanceState>>,
     /// Recently sent missing-chunk gossip, deduped at the source
     /// ((content_id, chunk_id) -> last sent unix secs)
     pub missing_gossip_recent: Arc<Mutex<HashMap<(ContentId, ChunkId), u64>>>,
@@ -504,6 +518,7 @@ impl NodeRunner {
             host_buffer: Arc::new(Mutex::new(HostBuffer::new(512 * 1024 * 1024))),
             verification_state: Arc::new(Mutex::new(VerificationState::default())),
             lifecycle_state: Arc::new(Mutex::new(LifecycleState::default())),
+            maintenance_state: Arc::new(Mutex::new(MaintenanceState::default())),
             missing_gossip_recent: Arc::new(Mutex::new(HashMap::new())),
             payment_watchers,
             inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
@@ -931,13 +946,13 @@ impl NodeRunner {
                 // fragments and route by type byte (missing-chunk gossip
                 // to the host role, heartbeats to the holder role).
                 self.handle_lifecycle_fragment(&packet.body, inbound.from).await;
-            }
-            WireMessage::Prepayment(prepayment) => {
-                let accepted = self.handle_prepayment(inbound.from, prepayment).await?;
-                debug!("Prepayment handled (accepted={})", accepted);
-            }
-            WireMessage::AccountingReconciliation(recon) => {
-                self.process_reconciliation(inbound.from, recon).await?;
+
+                // Maintenance dispatch (Phase 7, Task 1): reassemble
+                // maintenance fragments (gossip, swap control, prepayment,
+                // reconciliation) and route by body type byte. Gossip is
+                // not parseable as a fragment when it doesn't collide, so
+                // this is best-effort like the other reassembly paths.
+                self.handle_maintenance_fragment(&packet.body).await;
             }
             _ => {}
         }
@@ -1125,6 +1140,142 @@ impl NodeRunner {
         }
     }
 
+    /// Reassemble a maintenance fragment and dispatch by body type
+    ///
+    /// Phase 7 (Task 1): gossip, swap control, prepayment, and
+    /// reconciliation travel Sphinx-wrapped as `[type byte][payload]`
+    /// fragments. Bodies that do not parse as fragments are ignored;
+    /// payloads whose type byte is not a maintenance message are
+    /// discarded (keeps stray retrieval/lifecycle traffic out of this
+    /// path, mirroring the compute/verification/lifecycle handlers).
+    async fn handle_maintenance_fragment(self: &Arc<Self>, body: &[u8]) {
+        use static_mesh::wire::{
+            split_maintenance_payload, MSG_BODY_GOSSIP, MSG_BODY_SWAP_PROPOSAL,
+            MSG_BODY_SWAP_ACCEPT, MSG_BODY_SWAP_REJECT, MSG_BODY_PREPAYMENT,
+            MSG_BODY_RECONCILIATION, MSG_BODY_SWAP_COMMIT, MSG_BODY_SWAP_ABORT,
+        };
+        let fragment = match deserialize_fragment(body) {
+            Ok(fragment) => fragment,
+            Err(_) => return,
+        };
+
+        let completed = {
+            let mut state = self.maintenance_state.lock().await;
+            state.reassembler.cleanup_expired(300);
+            if !state.reassembler.add_fragment(fragment) {
+                return;
+            }
+            if !state.reassembler.is_complete() {
+                return;
+            }
+            match state.reassembler.reassemble() {
+                Ok(payload) => Some(payload),
+                Err(_) => {
+                    state.reassembler = Reassembler::new();
+                    None
+                }
+            }
+        };
+        let Some(payload) = completed else {
+            return;
+        };
+        self.maintenance_state.lock().await.reassembler = Reassembler::new();
+
+        let Some((msg_type, json)) = split_maintenance_payload(&payload) else {
+            return;
+        };
+        match msg_type {
+            MSG_BODY_GOSSIP => match serde_json::from_slice::<static_mesh::routing::PeerGossip>(json) {
+                Ok(gossip) => {
+                    static_mesh::transport::handle_maintenance_gossip(&self.transport, gossip)
+                        .await;
+                }
+                Err(_) => debug!("Dropping malformed Sphinx gossip"),
+            },
+            MSG_BODY_SWAP_PROPOSAL => {
+                match serde_json::from_slice::<static_storage::swap::SwapProposal>(json) {
+                    Ok(proposal) => {
+                        // Content signature is the binding (no TCP peer).
+                        let now = current_timestamp();
+                        if let Err(reason) =
+                            static_storage::swap::validate_swap_proposal(&proposal, now)
+                        {
+                            debug!(
+                                "Dropping invalid swap proposal ({:?})",
+                                reason
+                            );
+                            return;
+                        }
+                        // Register our pending swap so the accept can be
+                        // matched (mirrors transport prepare phase).
+                        static_mesh::transport::handle_maintenance_proposal(
+                            &self.transport,
+                            proposal,
+                        )
+                        .await;
+                    }
+                    Err(_) => debug!("Dropping malformed swap proposal"),
+                }
+            }
+            MSG_BODY_SWAP_ACCEPT => {
+                match serde_json::from_slice::<static_storage::swap::SwapAccept>(json) {
+                    Ok(accept) => {
+                        static_mesh::transport::handle_maintenance_accept(&self.transport, accept)
+                            .await;
+                    }
+                    Err(_) => debug!("Dropping malformed swap accept"),
+                }
+            }
+            MSG_BODY_SWAP_REJECT => {
+                match serde_json::from_slice::<static_storage::swap::SwapReject>(json) {
+                    Ok(reject) => {
+                        static_mesh::transport::handle_maintenance_reject(&self.transport, reject)
+                            .await;
+                    }
+                    Err(_) => debug!("Dropping malformed swap reject"),
+                }
+            }
+            MSG_BODY_PREPAYMENT => match serde_json::from_slice::<Prepayment>(json) {
+                Ok(prepayment) => {
+                    let accepted = self.handle_prepayment(prepayment.from_node, prepayment).await;
+                    if let Ok(true) = accepted {
+                        debug!("Prepayment handled (accepted)");
+                    }
+                }
+                Err(_) => debug!("Dropping malformed prepayment"),
+            },
+            MSG_BODY_RECONCILIATION => {
+                match serde_json::from_slice::<AccountingReconciliation>(json) {
+                    Ok(recon) => {
+                        if let Err(e) = self.process_reconciliation(recon.from_node, recon).await {
+                            debug!("Reconciliation rejected: {}", e);
+                        }
+                    }
+                    Err(_) => debug!("Dropping malformed reconciliation"),
+                }
+            }
+            MSG_BODY_SWAP_COMMIT => {
+                match serde_json::from_slice::<static_storage::swap::SwapCommit>(json) {
+                    Ok(commit) => {
+                        static_mesh::transport::handle_maintenance_commit(&self.transport, commit)
+                            .await;
+                    }
+                    Err(_) => debug!("Dropping malformed swap commit"),
+                }
+            }
+            MSG_BODY_SWAP_ABORT => {
+                match serde_json::from_slice::<static_storage::swap::SwapAbort>(json) {
+                    Ok(abort) => {
+                        static_mesh::transport::handle_maintenance_abort(&self.transport, abort)
+                            .await;
+                    }
+                    Err(_) => debug!("Dropping malformed swap abort"),
+                }
+            }
+            _ => debug!("Discarding non-maintenance payload after reassembly"),
+        }
+    }
+
     /// Handle a missing-chunk gossip report (host role, Phase 1)
     ///
     /// If the reported chunk is in our HostBuffer: reseed it into the
@@ -1263,13 +1414,18 @@ impl NodeRunner {
             return;
         }
 
-        let our_pubkey = self.transport.mix_node.lock().await.public_key;
+        // Anonymous return route (3 intermediates + us, Phase 7).
+        let self_route = self.transport.build_self_return_route().await;
         let return_route = RetrievalReturnRoute {
-            hops: vec![static_storage::retrieval::RouteHopInfo {
-                public_key: our_pubkey,
-                node_id: self.transport.node_id,
-            }],
-            destination: self.transport.node_id,
+            hops: self_route
+                .hops
+                .iter()
+                .map(|h| static_storage::retrieval::RouteHopInfo {
+                    public_key: h.classical_public_key,
+                    node_id: h.node_id,
+                })
+                .collect(),
+            destination: self_route.destination,
         };
         let gossip = MissingChunkGossip {
             content_id,
@@ -1280,17 +1436,32 @@ impl NodeRunner {
         let payload = serialize_gossip(&gossip);
 
         for peer in &peers {
-            let route = Route {
-                hops: vec![RouteHop {
-                    public_key: peer.public_key,
-                    node_id: peer.node_id,
-                }],
-                destination: peer.node_id,
-            };
-            let Some(kem) = peer.kem_public_key.clone() else {
+            // Forward route (3 intermediates + peer, Phase 7).
+            let Some(route) = self.transport.build_route_to_destination(peer.node_id).await else {
                 continue;
             };
-            let kem_lookup = single_peer_kem_lookup(peer.node_id, kem);
+            let route = Route {
+                hops: route
+                    .hops
+                    .iter()
+                    .map(|h| RouteHop {
+                        public_key: h.classical_public_key,
+                        node_id: h.node_id,
+                    })
+                    .collect(),
+                destination: route.destination,
+            };
+            let kem_map: std::collections::HashMap<NodeId, Vec<u8>> = {
+                let table = self.transport.routing_table.read().await;
+                table
+                    .nodes
+                    .iter()
+                    .filter_map(|(id, n)| {
+                        n.kem_public_key.as_ref().map(|k| (*id, k.clone()))
+                    })
+                    .collect()
+            };
+            let kem_lookup = move |id: &NodeId| kem_map.get(id).cloned();
             let Ok(packets) =
                 static_mesh::retrieval::create_hybrid_payload_packets(&payload, &route, &kem_lookup)
             else {
@@ -1895,6 +2066,9 @@ impl NodeRunner {
     }
 
     /// Send pre-built Sphinx packets to a return route's first hop
+    ///
+    /// Phase 7: delivery goes through [`send_sphinx`] so packets share
+    /// the shaped, cover-mixed outbound path (no bypass sends).
     async fn send_packets(
         &self,
         packets: Vec<static_sphinx::SphinxPacket>,
@@ -1906,13 +2080,8 @@ impl NodeRunner {
             .map(|h| h.node_id)
             .ok_or_else(|| anyhow::anyhow!("empty return route"))?;
 
-        let connections = self.transport.connections.read().await;
-        if let Some(sender) = connections.get(&first_hop) {
-            for packet in packets {
-                let _ = sender.send(WireMessage::Sphinx(packet)).await;
-            }
-        } else {
-            anyhow::bail!("no connection to return route first hop");
+        for packet in packets {
+            send_sphinx(&self.transport, first_hop, packet).await?;
         }
         Ok(())
     }
@@ -2037,12 +2206,19 @@ impl NodeRunner {
         let Some(peer) = peer else {
             anyhow::bail!("No compute-capable peers available");
         };
-        let Some(peer_kem) = peer.kem_public_key.clone() else {
+        // KEM presence is checked by build_route_to_destination; keep an
+        // explicit guard for the hybrid-only mandate.
+        if peer
+            .kem_public_key
+            .as_ref()
+            .map(|k| k.len() != static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE)
+            .unwrap_or(true)
+        {
             anyhow::bail!(
                 "Compute peer {:02x?} has no KEM key (hybrid-only transport)",
                 peer.node_id
             );
-        };
+        }
 
         let module_content_id =
             static_storage::hidden_service::content_id_from_public(module_content_pub_key);
@@ -2050,18 +2226,22 @@ impl NodeRunner {
         let mut request_id = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut request_id);
 
-        let our_pubkey = self.transport.mix_node.lock().await.public_key;
-        let our_node_id = self.transport.node_id;
+        // Anonymous return route (3 intermediates + us, Phase 7).
+        let self_route = self.transport.build_self_return_route().await;
         let return_route = ReturnRoute::from_sphinx_route(&Route {
-            hops: vec![RouteHop {
-                public_key: our_pubkey,
-                node_id: our_node_id,
-            }],
-            destination: our_node_id,
+            hops: self_route
+                .hops
+                .iter()
+                .map(|h| RouteHop {
+                    public_key: h.classical_public_key,
+                    node_id: h.node_id,
+                })
+                .collect(),
+            destination: self_route.destination,
         });
 
         let request = ComputeRequest {
-            from_node: our_node_id,
+            from_node: self.transport.node_id,
             module_content_id,
             module_content_pub_key: *module_content_pub_key,
             currency: currency.to_byte(),
@@ -2071,14 +2251,32 @@ impl NodeRunner {
             input_data,
         };
 
+        // Forward route (3 intermediates + provider, Phase 7).
+        let fwd = self
+            .transport
+            .build_route_to_destination(peer.node_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no route to compute provider"))?;
         let forward_route = Route {
-            hops: vec![RouteHop {
-                public_key: peer.public_key,
-                node_id: peer.node_id,
-            }],
-            destination: peer.node_id,
+            hops: fwd
+                .hops
+                .iter()
+                .map(|h| RouteHop {
+                    public_key: h.classical_public_key,
+                    node_id: h.node_id,
+                })
+                .collect(),
+            destination: fwd.destination,
         };
-        let kem_lookup = single_peer_kem_lookup(peer.node_id, peer_kem);
+        let kem_map: std::collections::HashMap<NodeId, Vec<u8>> = {
+            let table = self.transport.routing_table.read().await;
+            table
+                .nodes
+                .iter()
+                .filter_map(|(id, n)| n.kem_public_key.as_ref().map(|k| (*id, k.clone())))
+                .collect()
+        };
+        let kem_lookup = move |id: &NodeId| kem_map.get(id).cloned();
         let packets = build_request_packets(&request, &forward_route, &kem_lookup)?;
 
         self.compute_state.lock().await.pending_requests.insert(
@@ -2092,9 +2290,10 @@ impl NodeRunner {
         );
 
         // Each fragment travels as its own Sphinx packet, indistinguishable
-        // from cover traffic.
+        // from cover traffic, delivered to the route's first hop.
+        let fwd_first = fwd.hops[0].node_id;
         for packet in packets {
-            send_sphinx(&self.transport, peer.node_id, packet).await?;
+            send_sphinx(&self.transport, fwd_first, packet).await?;
         }
 
         debug!(
@@ -2146,34 +2345,40 @@ impl NodeRunner {
             currency,
         };
         let payload = serialize_payment_confirmation(&confirmation)?;
-        let (public_key, kem) = {
-            let table = self.transport.routing_table.read().await;
-            match table.get_node(&provider) {
-                Some(n) => (n.public_key, n.kem_public_key.clone()),
-                None => anyhow::bail!("unknown compute provider {:02x?}", provider),
-            }
-        };
-        let Some(kem) = kem else {
-            anyhow::bail!(
-                "compute provider {:02x?} has no KEM key (hybrid-only transport)",
-                provider
-            );
-        };
+        // Forward route (3 intermediates + provider, Phase 7).
+        let fwd = self
+            .transport
+            .build_route_to_destination(provider)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no route to compute provider"))?;
         let forward_route = Route {
-            hops: vec![RouteHop {
-                public_key,
-                node_id: provider,
-            }],
-            destination: provider,
+            hops: fwd
+                .hops
+                .iter()
+                .map(|h| RouteHop {
+                    public_key: h.classical_public_key,
+                    node_id: h.node_id,
+                })
+                .collect(),
+            destination: fwd.destination,
         };
-        let kem_lookup = single_peer_kem_lookup(provider, kem);
+        let kem_map: std::collections::HashMap<NodeId, Vec<u8>> = {
+            let table = self.transport.routing_table.read().await;
+            table
+                .nodes
+                .iter()
+                .filter_map(|(id, n)| n.kem_public_key.as_ref().map(|k| (*id, k.clone())))
+                .collect()
+        };
+        let kem_lookup = move |id: &NodeId| kem_map.get(id).cloned();
         let packets = static_mesh::retrieval::create_hybrid_payload_packets(
             &payload,
             &forward_route,
             &kem_lookup,
         )?;
+        let fwd_first = forward_route.hops[0].node_id;
         for packet in packets {
-            send_sphinx(&self.transport, provider, packet).await?;
+            send_sphinx(&self.transport, fwd_first, packet).await?;
         }
 
         info!(
@@ -2243,21 +2448,29 @@ impl NodeRunner {
 
     /// Trigger reconciliation with a reconnected peer (partition heal)
     ///
-    /// Exports local state and sends it in batches of at most
+    /// Exports a delta (entries changed since the last sync with this
+    /// peer, Phase 7) and sends it in batches of at most
     /// [`MAX_RECONCILIATION_ENTRIES`] entries. Locks are never held
     /// across `.await` pairs: accounting is cloned then dropped before
-    /// touching connections.
+    /// touching connections. Sends are Sphinx-wrapped (no clear-text
+    /// credit graph on the wire).
     pub async fn trigger_reconciliation(&self, peer: NodeId) -> anyhow::Result<()> {
         let (peers, total_served, total_received) = {
             let accounting = self.accounting.lock().await;
+            let since = accounting.last_sync_time(&peer);
             (
-                accounting.peers.clone(),
+                accounting.export_reconciliation_delta(since),
                 accounting.total_bytes_served,
                 accounting.total_bytes_received,
             )
         };
+        // Convert delta pairs into a peer map for batching.
+        let mut map: HashMap<NodeId, PeerCredit> = HashMap::new();
+        for (id, credit) in peers {
+            map.insert(id, credit);
+        }
         let batches = Self::reconciliation_batches(
-            &peers,
+            &map,
             total_served,
             total_received,
             self.transport.node_id,
@@ -2267,36 +2480,34 @@ impl NodeRunner {
         // Sign each batch with our Ed25519 identity key (Phase 0 auth).
         let sk_bytes = self.transport.identity_key.to_bytes();
         let sk = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
+        let now = current_timestamp();
         for mut batch in batches {
             batch.sign(&sk);
             static_mesh::transport::send_reconciliation(&self.transport, peer, batch).await?;
         }
-        debug!("Sent {} reconciliation batch(es)", count);
+        // Record the sync time so the next heal exports only a delta.
+        self.accounting.lock().await.mark_reconciled(&peer, now);
+        debug!("Sent {} reconciliation batch(es) (delta)", count);
         Ok(())
     }
 
     /// Process an incoming reconciliation batch (verified LWW merge)
     pub async fn process_reconciliation(
         &self,
-        from: NodeId,
+        _from: NodeId,
         recon: AccountingReconciliation,
     ) -> anyhow::Result<()> {
         // Phase 0 auth: signature + future-timestamp bound + sanity.
         if !recon.verify(current_timestamp()) {
             anyhow::bail!("Invalid reconciliation signature/timestamp");
         }
-        // Sender binding (H5, non-breaking): the batch must come from its
-        // claimant over the authenticated connection. This closes the
-        // spoof where an attacker signs with its own key but claims
-        // `from_node == victim`.
-        if recon.from_node != from {
-            anyhow::bail!("Reconciliation sender mismatch");
-        }
-        // Identity continuity: a known peer must present its pinned
+        // Phase 7: with Sphinx delivery the TCP peer is a mix relay, not
+        // the sender — sender binding rests on the Ed25519 signature plus
+        // identity continuity. A known peer must present its pinned
         // identity key; a changed key is rejected (hijack/overwrite).
         {
             let table = self.transport.routing_table.read().await;
-            if let Some(known) = table.get_node(&from) {
+            if let Some(known) = table.get_node(&recon.from_node) {
                 if let Some(stored) = known.identity_public_key {
                     if stored != recon.identity_public_key {
                         anyhow::bail!("Reconciliation identity key mismatch");
@@ -2479,9 +2690,11 @@ impl NodeRunner {
             return Ok(false);
         }
 
-        // 1. Real signature check + sender binding.
-        if prepayment.from_node != from || !prepayment.validate() {
-            warn!("Rejecting prepayment: invalid signature/amount/binding");
+        // 1. Real signature check. Phase 7: with Sphinx delivery the TCP
+        // peer is a relay, not the sender — the Ed25519 signature over
+        // (from_node || bytes || content_id) binds the claim.
+        if !prepayment.validate() {
+            warn!("Rejecting prepayment: invalid signature/amount");
             return Ok(false);
         }
 
@@ -2847,26 +3060,46 @@ impl NodeRunner {
     ///
     /// Requires the forward peer's ML-KEM key (handshake-learned). No
     /// classical fallback — mixed-version networks are not supported.
-    fn build_forward_request(
+    /// Classical return route for requests (Phase 7, Task 2).
+    ///
+    /// [`MIN_HOPS`] random intermediates + us as destination (direct
+    /// self-route only on tiny networks), so a responder cannot link the
+    /// response origin to our address.
+    async fn anonymous_return_route(&self) -> Route {
+        let hybrid = self.transport.build_self_return_route().await;
+        Route {
+            hops: hybrid
+                .hops
+                .iter()
+                .map(|h| RouteHop {
+                    public_key: h.classical_public_key,
+                    node_id: h.node_id,
+                })
+                .collect(),
+            destination: hybrid.destination,
+        }
+    }
+
+    /// Build a chunk-retrieval request packet (Phase 7, Task 2).
+    ///
+    /// Forward route: [`MIN_HOPS`] intermediates + the candidate holder
+    /// (direct route only on tiny networks) via
+    /// [`TransportState::build_route_to_destination`].
+    async fn build_forward_request(
+        &self,
         chunk_id: ChunkId,
         peer: &static_mesh::routing::KnownNode,
         return_route: &Route,
     ) -> anyhow::Result<static_sphinx::SphinxPacket> {
-        let kem = peer.kem_public_key.as_ref().filter(|k| {
-            k.len() == static_sphinx::HYBRID_KEM_PUBLIC_KEY_SIZE
-        }).ok_or_else(|| anyhow::anyhow!("Peer missing KEM key for hybrid route"))?;
-        let hybrid_forward = static_sphinx::HybridRoute {
-            hops: vec![static_sphinx::HybridRouteHop {
-                node_id: peer.node_id,
-                classical_public_key: peer.public_key,
-                kem_public_key: kem.clone(),
-            }],
-            destination: peer.node_id,
-        };
+        let forward = self
+            .transport
+            .build_route_to_destination(peer.node_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No route to candidate holder"))?;
         Ok(static_mesh::retrieval::create_anonymous_request_hybrid(
             chunk_id,
             return_route,
-            &hybrid_forward,
+            &forward,
         )?)
     }
 
@@ -2902,16 +3135,8 @@ impl NodeRunner {
             return 0;
         }
 
-        // Return route back to ourselves (1 hop: us).
-        let our_pubkey = self.transport.mix_node.lock().await.public_key;
-        let our_node_id = self.transport.node_id;
-        let return_route = Route {
-            hops: vec![RouteHop {
-                public_key: our_pubkey,
-                node_id: our_node_id,
-            }],
-            destination: our_node_id,
-        };
+        // Return route back to ourselves (3 intermediates + us, Phase 7).
+        let return_route = self.anonymous_return_route().await;
 
         let mut sent = 0;
         for (pid, peer, chunk_id) in targets {
@@ -2923,17 +3148,26 @@ impl NodeRunner {
                 );
                 continue;
             };
-            let packet = match Self::build_forward_request(chunk_id, &peer_node, &return_route) {
+            let packet = match self.build_forward_request(chunk_id, &peer_node, &return_route).await {
                 Ok(pkt) => pkt,
                 Err(e) => {
                     debug!("Swap {:02x?}: cannot build retrieval request: {}", pid, e);
                     continue;
                 }
             };
+            // Deliver to the route's first hop (a random intermediary).
+            let first_hop = match self
+                .transport
+                .build_route_to_destination(peer)
+                .await
+            {
+                Some(r) => r.hops[0].node_id,
+                None => continue,
+            };
             // Open the response session keyed by proposal ID so the
             // returning fragments have a reassembler to land in.
             self.retriever.lock().await.start_retrieval(pid);
-            if static_mesh::transport::send_sphinx(&self.transport, peer, packet)
+            if static_mesh::transport::send_sphinx(&self.transport, first_hop, packet)
                 .await
                 .is_ok()
             {
@@ -2977,15 +3211,8 @@ impl NodeRunner {
             return Err(anyhow::anyhow!("No known peers to request manifest from"));
         }
 
-        let our_pubkey = self.transport.mix_node.lock().await.public_key;
-        let our_node_id = self.transport.node_id;
-        let return_route = Route {
-            hops: vec![RouteHop {
-                public_key: our_pubkey,
-                node_id: our_node_id,
-            }],
-            destination: our_node_id,
-        };
+        // Return route back to ourselves (3 intermediates + us, Phase 7).
+        let return_route = self.anonymous_return_route().await;
 
         // Hybrid-capable peers only (hybrid mandate).
         let peers: Vec<_> = known_nodes
@@ -3004,8 +3231,12 @@ impl NodeRunner {
             manager.start_retrieval(content_id);
         }
         for peer in &peers {
-            if let Ok(pkt) = Self::build_forward_request(content_id, peer, &return_route) {
-                let _ = static_mesh::transport::send_sphinx(&self.transport, peer.node_id, pkt).await;
+            if let Ok(pkt) = self.build_forward_request(content_id, peer, &return_route).await {
+                // Deliver to the route's first hop (random intermediary).
+                let Some(fwd) = self.transport.build_route_to_destination(peer.node_id).await else {
+                    continue;
+                };
+                let _ = static_mesh::transport::send_sphinx(&self.transport, fwd.hops[0].node_id, pkt).await;
             }
         }
 
@@ -3153,8 +3384,12 @@ impl NodeRunner {
         let pending_ids: Vec<ChunkId> = self.content_retriever.lock().await.pending.keys().cloned().collect();
         for chunk_id in &pending_ids {
             for peer in peers {
-                if let Ok(pkt) = Self::build_forward_request(*chunk_id, peer, return_route) {
-                    let _ = static_mesh::transport::send_sphinx(&self.transport, peer.node_id, pkt).await;
+                if let Ok(pkt) = self.build_forward_request(*chunk_id, peer, return_route).await {
+                    // Deliver to the route's first hop (random intermediary).
+                    let Some(fwd) = self.transport.build_route_to_destination(peer.node_id).await else {
+                        continue;
+                    };
+                    let _ = static_mesh::transport::send_sphinx(&self.transport, fwd.hops[0].node_id, pkt).await;
                 }
             }
         }
@@ -3460,15 +3695,18 @@ async fn run_verification_tick(runner: &Arc<NodeRunner>) {
     let mut nonce = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
 
-    // Return route back to us (1-hop, same MVP pattern as retrieval).
-    let our_pubkey = runner.transport.mix_node.lock().await.public_key;
-    let our_node_id = runner.transport.node_id;
+    // Return route back to us (3 intermediates + us, Phase 7).
+    let self_route = runner.transport.build_self_return_route().await;
     let return_route = VerificationReturnRoute {
-        hops: vec![static_storage::verification::RouteHopInfo {
-            public_key: our_pubkey,
-            node_id: our_node_id,
-        }],
-        destination: our_node_id,
+        hops: self_route
+            .hops
+            .iter()
+            .map(|h| static_storage::verification::RouteHopInfo {
+                public_key: h.classical_public_key,
+                node_id: h.node_id,
+            })
+            .collect(),
+        destination: self_route.destination,
     };
 
     let challenge = VerificationChallenge {
@@ -3501,7 +3739,7 @@ async fn run_verification_tick(runner: &Arc<NodeRunner>) {
             .find(|n| n.node_id == partner)
             .map(|n| (n.public_key, n.kem_public_key.clone()))
     };
-    let Some((peer_pubkey, peer_kem)) = peer_keys else {
+    let Some((_peer_pubkey, peer_kem)) = peer_keys else {
         runner
             .verification_state
             .lock()
@@ -3523,12 +3761,30 @@ async fn run_verification_tick(runner: &Arc<NodeRunner>) {
             .remove(&nonce);
         return;
     };
+    // Forward route (3 intermediates + partner, Phase 7).
+    let fwd = runner
+        .transport
+        .build_route_to_destination(partner)
+        .await;
+    let Some(fwd) = fwd else {
+        runner
+            .verification_state
+            .lock()
+            .await
+            .pending
+            .remove(&nonce);
+        return;
+    };
     let forward_route = Route {
-        hops: vec![RouteHop {
-            public_key: peer_pubkey,
-            node_id: partner,
-        }],
-        destination: partner,
+        hops: fwd
+            .hops
+            .iter()
+            .map(|h| RouteHop {
+                public_key: h.classical_public_key,
+                node_id: h.node_id,
+            })
+            .collect(),
+        destination: fwd.destination,
     };
 
     let payload = match serialize_challenge(&challenge) {
@@ -3564,8 +3820,9 @@ async fn run_verification_tick(runner: &Arc<NodeRunner>) {
     };
 
     let mut sent = true;
+    let challenge_first_hop = forward_route.hops[0].node_id;
     for packet in packets {
-        if send_sphinx(&runner.transport, partner, packet)
+        if send_sphinx(&runner.transport, challenge_first_hop, packet)
             .await
             .is_err()
         {
@@ -3792,14 +4049,8 @@ async fn repair_content_once(
             }
         }
 
-        let our_pubkey = runner.transport.mix_node.lock().await.public_key;
-        let return_route = Route {
-            hops: vec![RouteHop {
-                public_key: our_pubkey,
-                node_id: runner.transport.node_id,
-            }],
-            destination: runner.transport.node_id,
-        };
+        // Return route (3 intermediates + us, Phase 7).
+        let return_route = runner.anonymous_return_route().await;
         let fetched = runner
             .fetch_shards(manifest, &return_route, &peers, 30)
             .await
@@ -3923,33 +4174,41 @@ async fn propagate_heartbeats_once(runner: &Arc<NodeRunner>) -> usize {
         // Wire payload (type byte + heartbeat fields).
         let payload = heartbeat.wire_serialize();
         for peer in &peers_to_notify {
-            // Build the single-hop hybrid route from handshake-learned keys.
-            let (public_key, kem) = {
-                let table = runner.transport.routing_table.read().await;
-                match table.get_node(peer) {
-                    Some(n) => (n.public_key, n.kem_public_key.clone()),
-                    None => continue,
-                }
-            };
-            let Some(kem) = kem else {
+            // Forward route (3 intermediates + holder, Phase 7).
+            let peer_id = *peer;
+            let Some(fwd) = runner.transport.build_route_to_destination(peer_id).await else {
                 continue;
             };
             let route = Route {
-                hops: vec![RouteHop {
-                    public_key,
-                    node_id: *peer,
-                }],
-                destination: *peer,
+                hops: fwd
+                    .hops
+                    .iter()
+                    .map(|h| RouteHop {
+                        public_key: h.classical_public_key,
+                        node_id: h.node_id,
+                    })
+                    .collect(),
+                destination: fwd.destination,
             };
-            let peer_id = *peer;
-            let kem_lookup = single_peer_kem_lookup(peer_id, kem);
+            let kem_map: HashMap<NodeId, Vec<u8>> = {
+                let table = runner.transport.routing_table.read().await;
+                table
+                    .nodes
+                    .iter()
+                    .filter_map(|(id, n)| {
+                        n.kem_public_key.as_ref().map(|k| (*id, k.clone()))
+                    })
+                    .collect()
+            };
+            let kem_lookup = move |id: &NodeId| kem_map.get(id).cloned();
             let Ok(packets) =
                 static_mesh::retrieval::create_hybrid_payload_packets(&payload, &route, &kem_lookup)
             else {
                 continue;
             };
             for pkt in packets {
-                let _ = send_sphinx(&runner.transport, peer_id, pkt).await;
+                let first_hop = route.hops[0].node_id;
+                let _ = send_sphinx(&runner.transport, first_hop, pkt).await;
             }
             notified += 1;
             debug!(
@@ -4215,7 +4474,7 @@ async fn rotation_loop(
             if peer.node_id == node_id {
                 continue;
             }
-            let Some(sender) = senders.get(&peer.node_id) else {
+            let Some(_sender) = senders.get(&peer.node_id) else {
                 continue;
             };
 
@@ -4235,19 +4494,18 @@ async fn rotation_loop(
             // are time-validated barters. Content auth binds to an
             // ephemeral per-proposal identity (stable attribution future
             // work; Merkle still proves chunk integrity).
-            let (content_id, content_pub, content_sk) = {
+            let (content_pub, content_sk) = {
                 use ed25519_dalek::SigningKey;
                 use rand::RngCore;
                 let mut bytes = [0u8; 32];
                 rand::rngs::OsRng.fill_bytes(&mut bytes);
                 let sk = SigningKey::from_bytes(&bytes);
                 let pk = sk.verifying_key().to_bytes();
-                let id = *blake3::hash(&pk).as_bytes();
-                (id, pk, sk)
+                (pk, sk)
             };
             // Metadata-only proposal (the chunk itself stays in our
             // holder; the peer fetches its data via the retrieval
-            // protocol).
+            // protocol). Phase 7: no content_id; Sphinx-wrapped send.
             let proposal = static_storage::swap::create_swap_proposal(
                 node_id,
                 *chunk_id,
@@ -4255,16 +4513,18 @@ async fn rotation_loop(
                 static_storage::swap::DEFAULT_LEASE_DURATION_SECS,
                 content_root,
                 merkle_proof,
-                content_id,
                 content_pub,
                 Some(&content_sk),
             );
             swaps.lock().await.record_proposal(&proposal);
-            if sender
-                .send(WireMessage::SwapProposal(proposal))
-                .await
-                .is_ok()
-            {
+            if let Ok(json) = serde_json::to_vec(&proposal) {
+                static_mesh::transport::send_maintenance_sphinx(
+                    &transport,
+                    peer.node_id,
+                    static_mesh::wire::MSG_BODY_SWAP_PROPOSAL,
+                    &json,
+                )
+                .await;
                 dispatched.push(*chunk_id);
                 // L6 host buffer: keep copy for quick reseed (retain created_at).
                 let created = chunk_metadata
@@ -5783,7 +6043,6 @@ mod tests {
         rand::rngs::OsRng.fill_bytes(&mut sk_bytes);
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
         let content_public_key = signing_key.verifying_key().to_bytes();
-        let content_id = *blake3::hash(&content_public_key).as_bytes();
         let proposal = static_storage::swap::create_swap_proposal(
             from,
             chunk.id,
@@ -5791,7 +6050,6 @@ mod tests {
             static_storage::swap::DEFAULT_LEASE_DURATION_SECS,
             content_root,
             proofs.into_iter().next().expect("one chunk, one proof"),
-            content_id,
             content_public_key,
             Some(&signing_key),
         );
@@ -5894,10 +6152,17 @@ mod tests {
             .get(&b.transport.node_id)
             .cloned()
             .expect("connected to B");
-        sender
-            .send(static_mesh::wire::WireMessage::SwapProposal(proposal.clone()))
-            .await
-            .unwrap();
+        // Phase 7: proposal travels Sphinx-wrapped (no direct wire).
+        {
+            let json = serde_json::to_vec(&proposal).unwrap();
+            static_mesh::transport::send_maintenance_sphinx(
+                &a.transport,
+                b.transport.node_id,
+                static_mesh::wire::MSG_BODY_SWAP_PROPOSAL,
+                &json,
+            )
+            .await;
+        }
 
         // Both sides finalize: A stores B's return chunk, B stores A's
         // offered chunk. Each poll also runs the reconcile tick (what
@@ -5994,10 +6259,17 @@ mod tests {
             .get(&b.transport.node_id)
             .cloned()
             .expect("connected to B");
-        sender
-            .send(static_mesh::wire::WireMessage::SwapProposal(proposal))
-            .await
-            .unwrap();
+        // Phase 7: proposal travels Sphinx-wrapped (no direct wire).
+        {
+            let json = serde_json::to_vec(&proposal).unwrap();
+            static_mesh::transport::send_maintenance_sphinx(
+                &a.transport,
+                b.transport.node_id,
+                static_mesh::wire::MSG_BODY_SWAP_PROPOSAL,
+                &json,
+            )
+            .await;
+        }
 
         // B is in the prepare phase over the wire (reserved, not
         // stored, no data buffered).

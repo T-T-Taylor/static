@@ -16,15 +16,16 @@
 use crate::{
     Route, SphinxHeader, SphinxPacket, SphinxError,
     NodeId, MAX_HOPS, NODE_ID_SIZE, FLAG_SIZE, MAC_SIZE, SLOT_SIZE, Mac,
-    ROUTING_INFO_SIZE, BODY_SIZE,
+    ROUTING_INFO_SIZE, BODY_SIZE, WIRE_BODY_SIZE,
     RoutingFlag,
     SymmetricKey, derive_hop_keys, compute_mac, xor_slot, xor_body,
     blinding_factor, random_bytes, random_scalar,
+    derive_body_aead_key, aead_encrypt_body,
     BASE_POINT,
     SPHINX_VERSION_CLASSICAL, SPHINX_VERSION_HYBRID,
     HybridRoute, HybridMixNode, HybridProcessedPacket,
     process_packet_hybrid,
-    KEM_CIPHERTEXT_SIZE,
+    KEM_CIPHERTEXT_SIZE, KEM_BLOCK_SIZE,
 };
 use static_crypto::{KemKeypair, derive_hybrid_shared_secret};
 use crate::HYBRID_HOP_CONTEXT;
@@ -35,17 +36,22 @@ use curve25519_dalek::montgomery::MontgomeryPoint;
 /// Contains everything a responder needs to send a Sphinx packet
 /// back to the requester without knowing the route:
 /// - The pre-built Sphinx header (opaque to responder)
-/// - The ML-KEM ciphertexts for hybrid headers (opaque, empty if classical)
-/// - The body encryption keys for each hop
+/// - The ML-KEM block for hybrid headers (opaque, empty if classical)
+/// - The body XOR keys for each hop (responder onion-encrypts)
+/// - The body AEAD key + destination AAD (responder end-to-end encrypts)
 /// - The first hop's node ID (where to send the packet)
 #[derive(Clone)]
 pub struct Surb {
     /// The pre-built Sphinx header (opaque to responder)
     pub header: SphinxHeader,
-    /// ML-KEM ciphertexts for hybrid headers (empty for classical SURBs)
+    /// ML-KEM block for hybrid headers (empty for classical SURBs)
     pub kem_ciphertexts: Vec<u8>,
-    /// Body encryption keys for each hop (responder encrypts, mixnet peels)
+    /// Body XOR keys for each hop (responder encrypts, mixnet peels)
     pub body_keys: Vec<SymmetricKey>,
+    /// Innermost body AEAD key (responder end-to-end encrypts)
+    pub body_aead_key: SymmetricKey,
+    /// AAD for the body AEAD (the return destination)
+    pub aad_destination: NodeId,
     /// The first hop's node ID (where the responder sends the packet)
     pub first_hop: NodeId,
 }
@@ -64,6 +70,10 @@ pub struct SurbSecret {
 /// The requester calls this with a route back to themselves.
 /// Returns (Surb, SurbSecret) — the Surb is sent to the responder,
 /// the SurbSecret is kept locally for tracking.
+///
+/// Header MACs cover a zero placeholder body (payload unknown at build
+/// time); mix nodes accept via the SURB fallback path, and the payload
+/// stays end-to-end AEAD-protected.
 pub fn create_surb(route: &Route) -> Result<(Surb, SurbSecret), SphinxError> {
     let n = route.hops.len();
     if n == 0 || n > MAX_HOPS {
@@ -77,6 +87,7 @@ pub fn create_surb(route: &Route) -> Result<(Surb, SurbSecret), SphinxError> {
     // Compute shared secrets with running scalar blinding
     let mut hop_keys = Vec::with_capacity(n);
     let mut alphas = Vec::with_capacity(n);
+    let mut shared_secrets: Vec<SymmetricKey> = Vec::with_capacity(n);
     let mut current_alpha = ephemeral_pub;
     let mut current_scalar = ephemeral_scalar.clone();
 
@@ -84,6 +95,7 @@ pub fn create_surb(route: &Route) -> Result<(Surb, SurbSecret), SphinxError> {
         let pub_point = MontgomeryPoint(route.hops[i].public_key);
         let shared_point = &pub_point * &current_scalar;
         let shared = SymmetricKey::from_bytes(shared_point.0);
+        shared_secrets.push(shared.clone());
         let keys = derive_hop_keys(&shared);
         hop_keys.push(keys);
 
@@ -96,6 +108,11 @@ pub fn create_surb(route: &Route) -> Result<(Surb, SurbSecret), SphinxError> {
             current_alpha = (&alpha_point * &blind).0;
         }
     }
+
+    let body_aead_key = derive_body_aead_key(&shared_secrets[n - 1]);
+    // Placeholder body for pre-built MACs (responder's real body verified
+    // via SURB fallback + end-to-end AEAD).
+    let placeholder = vec![0u8; WIRE_BODY_SIZE];
 
     // Build routing blocks and compute MACs from last hop to first
     let mut blocks: Vec<[u8; SLOT_SIZE]> = vec![[0u8; SLOT_SIZE]; n];
@@ -115,7 +132,13 @@ pub fn create_surb(route: &Route) -> Result<(Surb, SurbSecret), SphinxError> {
 
         enc_blocks[i] = blocks[i];
         xor_slot(&hop_keys[i].stream_key, &mut enc_blocks[i]);
-        macs[i] = compute_mac(&hop_keys[i].mac_key, &alphas[i], &enc_blocks[i]);
+        macs[i] = compute_mac(
+            &hop_keys[i].mac_key,
+            SPHINX_VERSION_CLASSICAL,
+            &alphas[i],
+            &enc_blocks[i],
+            &placeholder,
+        );
     }
 
     // Build routing info with padding
@@ -142,6 +165,8 @@ pub fn create_surb(route: &Route) -> Result<(Surb, SurbSecret), SphinxError> {
         header,
         kem_ciphertexts: Vec::new(),
         body_keys,
+        body_aead_key,
+        aad_destination: route.destination,
         first_hop,
     };
 
@@ -156,8 +181,8 @@ pub fn create_surb(route: &Route) -> Result<(Surb, SurbSecret), SphinxError> {
 /// Wrap a payload with a SURB to create a Sphinx packet
 ///
 /// The responder calls this with the SURB and their payload.
-/// The payload is encrypted in layers (last hop first, first hop last),
-/// matching the order that mix nodes will peel (first hop first).
+/// The payload is padded, AEAD-encrypted, then onion-encrypted in layers
+/// (last hop first, first hop last), matching normal packet construction.
 ///
 /// The resulting Sphinx packet is sent to the SURB's first hop.
 pub fn wrap_with_surb(surb: &Surb, payload: &[u8]) -> Result<SphinxPacket, SphinxError> {
@@ -165,12 +190,12 @@ pub fn wrap_with_surb(surb: &Surb, payload: &[u8]) -> Result<SphinxPacket, Sphin
         return Err(SphinxError::BodyTooLarge);
     }
 
-    // Pad payload to BODY_SIZE
-    let mut body = vec![0u8; BODY_SIZE];
-    body[..payload.len()].copy_from_slice(payload);
+    // Pad, AEAD-encrypt, then onion-layer.
+    let mut padded = vec![0u8; BODY_SIZE];
+    padded[..payload.len()].copy_from_slice(payload);
+    let mut body = aead_encrypt_body(&surb.body_aead_key, &padded, &surb.aad_destination);
 
     // Encrypt body in layers (last hop first, first hop last)
-    // This matches create_packet's behavior
     for i in (0..surb.body_keys.len()).rev() {
         xor_body(&surb.body_keys[i], &mut body);
     }
@@ -185,8 +210,8 @@ pub fn wrap_with_surb(surb: &Surb, payload: &[u8]) -> Result<SphinxPacket, Sphin
 /// Create a hybrid SURB for a return route
 ///
 /// Mirrors [`create_surb`] but derives per-hop keys with the hybrid
-/// X25519 + ML-KEM combination. The KEM ciphertexts ride opaquely in
-/// the SURB and are copied into the wrapped packet.
+/// X25519 + ML-KEM combination. The fixed KEM block rides opaquely in
+/// the SURB and is copied into the wrapped packet.
 pub fn create_surb_hybrid(route: &HybridRoute) -> Result<(Surb, SurbSecret), SphinxError> {
     use crate::KEM_PUBLIC_KEY_SIZE;
 
@@ -205,7 +230,8 @@ pub fn create_surb_hybrid(route: &HybridRoute) -> Result<(Surb, SurbSecret), Sph
 
     let mut hop_keys = Vec::with_capacity(n);
     let mut alphas = Vec::with_capacity(n);
-    let mut kem_ciphertexts: Vec<u8> = Vec::with_capacity(n * KEM_CIPHERTEXT_SIZE);
+    let mut hybrid_secrets: Vec<SymmetricKey> = Vec::with_capacity(n);
+    let mut real_cts: Vec<Vec<u8>> = Vec::with_capacity(n);
     let mut current_alpha = ephemeral_pub;
     let mut current_scalar = ephemeral_scalar.clone();
 
@@ -217,10 +243,11 @@ pub fn create_surb_hybrid(route: &HybridRoute) -> Result<(Surb, SurbSecret), Sph
         let (kem_shared, ciphertext) =
             KemKeypair::encapsulate_to(&route.hops[i].kem_public_key)
                 .map_err(|_| SphinxError::InvalidKemPublicKey)?;
-        kem_ciphertexts.extend_from_slice(&ciphertext);
+        real_cts.push(ciphertext);
 
         let hybrid_shared =
             derive_hybrid_shared_secret(&classical_shared, &kem_shared, HYBRID_HOP_CONTEXT);
+        hybrid_secrets.push(hybrid_shared.clone());
         let keys = derive_hop_keys(&hybrid_shared);
         hop_keys.push(keys);
 
@@ -233,6 +260,15 @@ pub fn create_surb_hybrid(route: &HybridRoute) -> Result<(Surb, SurbSecret), Sph
             current_alpha = (&alpha_point * &blind).0;
         }
     }
+
+    let mut kem_block: Vec<u8> = Vec::with_capacity(KEM_BLOCK_SIZE);
+    for ct in &real_cts {
+        kem_block.extend_from_slice(ct);
+    }
+    kem_block.extend_from_slice(&random_bytes(KEM_BLOCK_SIZE - n * KEM_CIPHERTEXT_SIZE));
+
+    let body_aead_key = derive_body_aead_key(&hybrid_secrets[n - 1]);
+    let placeholder = vec![0u8; WIRE_BODY_SIZE];
 
     let mut blocks: Vec<[u8; SLOT_SIZE]> = vec![[0u8; SLOT_SIZE]; n];
     let mut enc_blocks: Vec<[u8; SLOT_SIZE]> = vec![[0u8; SLOT_SIZE]; n];
@@ -250,7 +286,13 @@ pub fn create_surb_hybrid(route: &HybridRoute) -> Result<(Surb, SurbSecret), Sph
 
         enc_blocks[i] = blocks[i];
         xor_slot(&hop_keys[i].stream_key, &mut enc_blocks[i]);
-        macs[i] = compute_mac(&hop_keys[i].mac_key, &alphas[i], &enc_blocks[i]);
+        macs[i] = compute_mac(
+            &hop_keys[i].mac_key,
+            SPHINX_VERSION_HYBRID,
+            &alphas[i],
+            &enc_blocks[i],
+            &placeholder,
+        );
     }
 
     let mut routing_info = vec![0u8; ROUTING_INFO_SIZE];
@@ -271,8 +313,10 @@ pub fn create_surb_hybrid(route: &HybridRoute) -> Result<(Surb, SurbSecret), Sph
 
     let surb = Surb {
         header,
-        kem_ciphertexts,
+        kem_ciphertexts: kem_block,
         body_keys,
+        body_aead_key,
+        aad_destination: route.destination,
         first_hop,
     };
 
@@ -296,8 +340,9 @@ pub fn wrap_with_surb_hybrid(surb: &Surb, payload: &[u8]) -> Result<SphinxPacket
         return Err(SphinxError::BodyTooLarge);
     }
 
-    let mut body = vec![0u8; BODY_SIZE];
-    body[..payload.len()].copy_from_slice(payload);
+    let mut padded = vec![0u8; BODY_SIZE];
+    padded[..payload.len()].copy_from_slice(payload);
+    let mut body = aead_encrypt_body(&surb.body_aead_key, &padded, &surb.aad_destination);
 
     for i in (0..surb.body_keys.len()).rev() {
         xor_body(&surb.body_keys[i], &mut body);
@@ -329,6 +374,23 @@ pub fn create_surb_batch(route: &Route, count: usize) -> Result<Vec<(Surb, SurbS
     let mut surbs = Vec::with_capacity(count);
     for i in 0..count {
         let (surb, mut secret) = create_surb(route)?;
+        secret.fragment_id = i as u32;
+        surbs.push((surb, secret));
+    }
+    Ok(surbs)
+}
+
+/// Create multiple hybrid SURBs at once (for fragmented responses)
+///
+/// Hybrid counterpart of [`create_surb_batch`] using
+/// [`create_surb_hybrid`]; each SURB gets a unique fragment ID.
+pub fn create_surb_batch_hybrid(
+    route: &HybridRoute,
+    count: usize,
+) -> Result<Vec<(Surb, SurbSecret)>, SphinxError> {
+    let mut surbs = Vec::with_capacity(count);
+    for i in 0..count {
+        let (surb, mut secret) = create_surb_hybrid(route)?;
         secret.fragment_id = i as u32;
         surbs.push((surb, secret));
     }
@@ -456,7 +518,7 @@ mod tests {
         assert_eq!(surb.header.version, SPHINX_VERSION_HYBRID);
         assert_eq!(surb.body_keys.len(), 3);
         assert_eq!(surb.first_hop, nodes[0].node_id());
-        assert_eq!(surb.kem_ciphertexts.len(), 3 * KEM_CIPHERTEXT_SIZE);
+        assert_eq!(surb.kem_ciphertexts.len(), KEM_BLOCK_SIZE);
         assert_eq!(secret.hop_count, 3);
     }
 
@@ -482,5 +544,42 @@ mod tests {
 
         let body = result2.body.unwrap();
         assert_eq!(&body[..payload.len()], payload);
+    }
+
+    #[test]
+    fn test_surb_return_route_hides_requester() {
+        // Phase 7 Task 2: the holder (responder) cannot see the
+        // requester's node_id. The SURB's route is opaque: the
+        // destination only emerges at the final hop, inside encrypted
+        // routing slots — never in any cleartext field the holder reads.
+        let (mut nodes, route) = create_hybrid_route(3);
+        let requester_id = route.destination;
+
+        let (surb, _secret) = create_surb_hybrid(&route).unwrap();
+        // The SURB itself contains no plaintext destination.
+        let surb_bytes = format!("{:?}", surb.header);
+        assert!(!surb_bytes.contains(&hex_encode(&requester_id)));
+
+        let packet = wrap_with_surb_hybrid(&surb, b"anonymous reply").unwrap();
+        // Holder-side check: the first hop processes the packet with the
+        // Forward flag; the requester id is not visible in the wire bytes.
+        let result = process_surb_hybrid(&mut nodes[0], packet).unwrap();
+        assert_eq!(result.flag, RoutingFlag::Forward);
+        assert!(result.body.is_none());
+
+        // End-to-end: only the final hop recovers the payload.
+        let (surb2, _s2) = create_surb_hybrid(&route).unwrap();
+        let packet2 = wrap_with_surb_hybrid(&surb2, b"roundtrip").unwrap();
+        let r0 = process_surb_hybrid(&mut nodes[0], packet2).unwrap();
+        let r1 = process_surb_hybrid(&mut nodes[1], r0.forward_packet.unwrap()).unwrap();
+        let r2 = process_surb_hybrid(&mut nodes[2], r1.forward_packet.unwrap()).unwrap();
+        assert_eq!(r2.flag, RoutingFlag::Destination);
+        assert_eq!(r2.next_hop, requester_id);
+        assert_eq!(&r2.body.unwrap()[..9], b"roundtrip");
+    }
+
+    /// Lowercase-hex helper for the blindness assertion.
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
     }
 }

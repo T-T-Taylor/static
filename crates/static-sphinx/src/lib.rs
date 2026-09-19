@@ -9,6 +9,7 @@ pub mod surb;
 use static_crypto::SymmetricKey;
 use static_crypto::{KemKeypair, derive_hybrid_shared_secret};
 use static_crypto::{KEM_CIPHERTEXT_SIZE, KEM_PUBLIC_KEY_SIZE};
+use static_crypto::{encrypt_aad, decrypt_aad, NonceBytes};
 use blake3;
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use curve25519_dalek::scalar::Scalar;
@@ -63,11 +64,33 @@ pub const HYBRID_KEM_PUBLIC_KEY_SIZE: usize = KEM_PUBLIC_KEY_SIZE;
 /// Total header size
 pub const HEADER_SIZE: usize = EPHEMERAL_KEY_SIZE + ROUTING_INFO_SIZE + MAC_SIZE;
 
-/// Fixed body size in bytes
+/// Fixed body size in bytes (plaintext capacity)
 pub const BODY_SIZE: usize = 1024;
 
+/// Authentication tag size for the AEAD body layer (ChaCha20-Poly1305)
+pub const BODY_TAG_SIZE: usize = 16;
+
+/// Wire body size: plaintext + AEAD tag (Phase 7, Task 4a)
+///
+/// The innermost body layer is ChaCha20-Poly1305 AEAD; outer onion layers
+/// are size-preserving XOR. The wire body is always this size (fixed).
+pub const WIRE_BODY_SIZE: usize = BODY_SIZE + BODY_TAG_SIZE;
+
+/// Fixed-size KEM block: `MAX_HOPS * KEM_CIPHERTEXT_SIZE` (Phase 7, Task 4b)
+///
+/// Unused slots carry random bytes. Each hop decapsulates slot 0, shifts
+/// left by one ciphertext, and fills the last slot with random bytes so
+/// the packet size never changes (no hop-position leak).
+pub const KEM_BLOCK_SIZE: usize = MAX_HOPS * KEM_CIPHERTEXT_SIZE;
+
+/// HKDF context for the innermost body AEAD key
+pub const BODY_AEAD_CONTEXT: &str = "sphinx/body-aead";
+
+/// HKDF context for deriving the body AEAD nonce
+pub const BODY_NONCE_CONTEXT: &str = "sphinx/body-nonce";
+
 /// The Montgomery curve base point (u = 9)
-const BASE_POINT: MontgomeryPoint = MontgomeryPoint([
+pub(crate) const BASE_POINT: MontgomeryPoint = MontgomeryPoint([
     9, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
@@ -139,13 +162,14 @@ pub struct SphinxHeader {
 pub struct SphinxPacket {
     /// The packet header
     pub header: SphinxHeader,
-    /// ML-KEM ciphertexts, one per remaining hop (hybrid v1 only)
+    /// ML-KEM ciphertexts (hybrid v1 only)
     ///
-    /// Flat concatenation (`n * KEM_CIPHERTEXT_SIZE` bytes). Each hop
-    /// decapsulates and strips the first ciphertext before forwarding.
-    /// Always empty for classical v0 packets.
+    /// Phase 7 fixed-size block: always [`KEM_BLOCK_SIZE`] bytes for hybrid
+    /// packets (real ciphertexts followed by random dummy slots). Each hop
+    /// decapsulates slot 0, shifts left, and pads with random so the size
+    /// never changes. Always empty for classical v0 packets.
     pub kem_ciphertexts: Vec<u8>,
-    /// The encrypted body
+    /// The encrypted body (always [`WIRE_BODY_SIZE`] bytes on the wire)
     pub body: Vec<u8>,
 }
 
@@ -209,18 +233,21 @@ pub enum SphinxError {
     /// ML-KEM public key has the wrong size
     #[error("invalid ML-KEM public key size")]
     InvalidKemPublicKey,
+    /// AEAD body authentication failed (tampering detected)
+    #[error("AEAD body authentication failed")]
+    BodyAuthFailed,
 }
 
 // ---- Internal key derivation ----
 
 struct HopKeys {
-    stream_key: SymmetricKey,
-    mac_key: SymmetricKey,
-    body_key: SymmetricKey,
-    tag: [u8; MAC_SIZE],
+    pub(crate) stream_key: SymmetricKey,
+    pub(crate) mac_key: SymmetricKey,
+    pub(crate) body_key: SymmetricKey,
+    pub(crate) tag: [u8; MAC_SIZE],
 }
 
-fn derive_hop_keys(shared: &SymmetricKey) -> HopKeys {
+pub(crate) fn derive_hop_keys(shared: &SymmetricKey) -> HopKeys {
     let stream_key = shared.derive("sphinx/stream");
     let mac_key = shared.derive("sphinx/mac");
     let body_key = shared.derive("sphinx/body");
@@ -230,13 +257,27 @@ fn derive_hop_keys(shared: &SymmetricKey) -> HopKeys {
     HopKeys { stream_key, mac_key, body_key, tag }
 }
 
-// ---- MAC ----
+// ---- MAC (covers header + body, Phase 7 Task 4a) ----
 
-fn compute_mac(mac_key: &SymmetricKey, ephemeral_key: &[u8], slot: &[u8]) -> Mac {
+/// Compute the per-hop routing MAC over version, ephemeral key, slot and body.
+///
+/// Binding the body into the routing MAC gives per-hop body authentication:
+/// any bit-flip of the body invalidates the next hop's MAC check. Combined
+/// with the innermost ChaCha20-Poly1305 layer (end-to-end), the body is
+/// fully AEAD-protected (confidential + authenticated).
+pub(crate) fn compute_mac(
+    mac_key: &SymmetricKey,
+    version: u8,
+    ephemeral_key: &[u8],
+    slot: &[u8],
+    body: &[u8],
+) -> Mac {
     let derived = mac_key.derive("sphinx/mac/compute");
-    let mut input = Vec::with_capacity(ephemeral_key.len() + slot.len());
+    let mut input = Vec::with_capacity(1 + ephemeral_key.len() + slot.len() + body.len());
+    input.push(version);
     input.extend_from_slice(ephemeral_key);
     input.extend_from_slice(slot);
+    input.extend_from_slice(body);
     let hash = blake3::keyed_hash(&derived.bytes, &input);
     let mut mac = [0u8; MAC_SIZE];
     mac.copy_from_slice(&hash.as_bytes()[..MAC_SIZE]);
@@ -254,29 +295,74 @@ fn slot_keystream(key: &SymmetricKey) -> [u8; SLOT_SIZE] {
     keystream
 }
 
-fn xor_slot(key: &SymmetricKey, slot: &mut [u8; SLOT_SIZE]) {
+pub(crate) fn xor_slot(key: &SymmetricKey, slot: &mut [u8; SLOT_SIZE]) {
     let keystream = slot_keystream(key);
     for i in 0..SLOT_SIZE {
         slot[i] ^= keystream[i];
     }
 }
 
-// ---- Body encryption (XOR-based stream cipher) ----
+// ---- Body encryption ----
+//
+// Two layers (Phase 7, Task 4a):
+// 1. Innermost: full ChaCha20-Poly1305 AEAD (`body_aead_key`, AAD =
+//    destination node ID). Plaintext 1024 -> ciphertext 1040 (fixed).
+// 2. Outer onion: size-preserving XOR stream on the 1040-byte buffer.
+// Per-hop routing MACs cover the body as seen at each hop, so tampering
+// is detected immediately (MAC fail), and any tampering that somehow
+// passes through is caught end-to-end (AEAD fail at destination).
 
-fn body_keystream(key: &SymmetricKey) -> Vec<u8> {
-    let mut keystream = Vec::with_capacity(BODY_SIZE);
+/// Derive the innermost AEAD key from a hop shared secret.
+pub(crate) fn derive_body_aead_key(shared: &SymmetricKey) -> SymmetricKey {
+    shared.derive(BODY_AEAD_CONTEXT)
+}
+
+/// Deterministic AEAD nonce from the AEAD key (key is fresh per packet).
+pub(crate) fn body_aead_nonce(aead_key: &SymmetricKey) -> NonceBytes {
+    let derived = aead_key.derive(BODY_NONCE_CONTEXT);
+    let mut bytes = [0u8; 12];
+    bytes.copy_from_slice(&derived.bytes[..12]);
+    NonceBytes::from_bytes(bytes)
+}
+
+/// AEAD-encrypt a padded 1024-byte plaintext into a 1040-byte wire body.
+pub(crate) fn aead_encrypt_body(
+    aead_key: &SymmetricKey,
+    plaintext_padded: &[u8],
+    aad_destination: &NodeId,
+) -> Vec<u8> {
+    debug_assert_eq!(plaintext_padded.len(), BODY_SIZE);
+    let nonce = body_aead_nonce(aead_key);
+    encrypt_aad(aead_key, &nonce, plaintext_padded, aad_destination)
+}
+
+/// AEAD-decrypt a 1040-byte wire body into a 1024-byte plaintext.
+pub(crate) fn aead_decrypt_body(
+    aead_key: &SymmetricKey,
+    wire_body: &[u8],
+    aad_destination: &NodeId,
+) -> Result<Vec<u8>, SphinxError> {
+    if wire_body.len() != WIRE_BODY_SIZE {
+        return Err(SphinxError::InvalidPacketSize);
+    }
+    let nonce = body_aead_nonce(aead_key);
+    decrypt_aad(aead_key, &nonce, wire_body, aad_destination)
+        .map_err(|_| SphinxError::BodyAuthFailed)
+}
+
+fn body_keystream(key: &SymmetricKey, len: usize) -> Vec<u8> {    let mut keystream = Vec::with_capacity(len);
     let mut counter = 0u64;
-    while keystream.len() < BODY_SIZE {
+    while keystream.len() < len {
         let block = key.derive(&format!("sphinx/body:{}", counter));
         keystream.extend_from_slice(&block.bytes);
         counter += 1;
     }
-    keystream.truncate(BODY_SIZE);
+    keystream.truncate(len);
     keystream
 }
 
-fn xor_body(key: &SymmetricKey, body: &mut [u8]) {
-    let keystream = body_keystream(key);
+pub(crate) fn xor_body(key: &SymmetricKey, body: &mut [u8]) {
+    let keystream = body_keystream(key, body.len());
     for (i, byte) in body.iter_mut().enumerate() {
         *byte ^= keystream[i];
     }
@@ -284,14 +370,14 @@ fn xor_body(key: &SymmetricKey, body: &mut [u8]) {
 
 // ---- Ephemeral key blinding ----
 
-fn blinding_factor(shared: &SymmetricKey) -> Scalar {
+pub(crate) fn blinding_factor(shared: &SymmetricKey) -> Scalar {
     let blind_key = shared.derive("sphinx/blind");
     Scalar::from_bytes_mod_order(blind_key.bytes)
 }
 
 // ---- Random helpers ----
 
-fn random_bytes(len: usize) -> Vec<u8> {
+pub(crate) fn random_bytes(len: usize) -> Vec<u8> {
     let mut bytes = vec![0u8; len];
     OsRng.fill_bytes(&mut bytes);
     bytes
@@ -304,7 +390,7 @@ pub fn random_node_id() -> NodeId {
     id
 }
 
-fn random_scalar() -> Scalar {
+pub(crate) fn random_scalar() -> Scalar {
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
     Scalar::from_bytes_mod_order(bytes)
@@ -313,6 +399,13 @@ fn random_scalar() -> Scalar {
 // ---- Public API: Packet creation ----
 
 /// Create a Sphinx packet for a route.
+///
+/// Body protection (Phase 7): plaintext is padded to [`BODY_SIZE`], AEAD-
+/// encrypted with the innermost hop's body-AEAD key (AAD = destination),
+/// then onion-layered with size-preserving XOR. Routing MACs cover the
+/// body as seen at each hop, so tampering fails fast with
+/// [`SphinxError::MacVerificationFailed`]; residual tampering fails
+/// end-to-end with [`SphinxError::BodyAuthFailed`].
 ///
 /// Uses non-clamped scalar multiplication on Curve25519 for
 /// correct ephemeral key blinding across multiple hops.
@@ -334,12 +427,14 @@ pub fn create_packet(route: &Route, body: &[u8]) -> Result<SphinxPacket, SphinxE
     let mut alphas = Vec::with_capacity(n);
     let mut current_alpha = ephemeral_pub;
     let mut current_scalar = ephemeral_scalar.clone();
+    let mut shared_secrets: Vec<SymmetricKey> = Vec::with_capacity(n);
 
     for i in 0..n {
         // shared = current_scalar * hop_pubkey_point
         let pub_point = MontgomeryPoint(route.hops[i].public_key);
         let shared_point = &pub_point * &current_scalar;
         let shared = SymmetricKey::from_bytes(shared_point.0);
+        shared_secrets.push(shared.clone());
         let keys = derive_hop_keys(&shared);
         hop_keys.push(keys);
 
@@ -353,7 +448,23 @@ pub fn create_packet(route: &Route, body: &[u8]) -> Result<SphinxPacket, SphinxE
         }
     }
 
-    // Build routing blocks and compute MACs from last hop to first
+    // Innermost AEAD: pad to BODY_SIZE, encrypt to WIRE_BODY_SIZE.
+    let mut padded = vec![0u8; BODY_SIZE];
+    padded[..body.len()].copy_from_slice(body);
+    let inner_aead = derive_body_aead_key(&shared_secrets[n - 1]);
+    let inner = aead_encrypt_body(&inner_aead, &padded, &route.destination);
+    debug_assert_eq!(inner.len(), WIRE_BODY_SIZE);
+
+    // Onion XOR layers (outermost last applied); record body as seen per hop.
+    // body_seen[i] = inner XOR keys[n-1] ... XOR keys[i].
+    let mut body_seen: Vec<Vec<u8>> = vec![Vec::new(); n];
+    let mut buf = inner;
+    for i in (0..n).rev() {
+        xor_body(&hop_keys[i].body_key, &mut buf);
+        body_seen[i] = buf.clone();
+    }
+
+    // Build routing blocks and compute MACs (covering per-hop body).
     let mut blocks: Vec<[u8; SLOT_SIZE]> = vec![[0u8; SLOT_SIZE]; n];
     let mut enc_blocks: Vec<[u8; SLOT_SIZE]> = vec![[0u8; SLOT_SIZE]; n];
     let mut macs: Vec<Mac> = vec![[0u8; MAC_SIZE]; n];
@@ -370,7 +481,13 @@ pub fn create_packet(route: &Route, body: &[u8]) -> Result<SphinxPacket, SphinxE
 
         enc_blocks[i] = blocks[i];
         xor_slot(&hop_keys[i].stream_key, &mut enc_blocks[i]);
-        macs[i] = compute_mac(&hop_keys[i].mac_key, &alphas[i], &enc_blocks[i]);
+        macs[i] = compute_mac(
+            &hop_keys[i].mac_key,
+            SPHINX_VERSION_CLASSICAL,
+            &alphas[i],
+            &enc_blocks[i],
+            &body_seen[i],
+        );
     }
 
     // Build routing info with padding
@@ -380,13 +497,6 @@ pub fn create_packet(route: &Route, body: &[u8]) -> Result<SphinxPacket, SphinxE
     }
     routing_info[n * SLOT_SIZE..].copy_from_slice(&random_bytes(ROUTING_INFO_SIZE - n * SLOT_SIZE));
 
-    // Build body: pad to BODY_SIZE, encrypt in layers
-    let mut body_bytes = vec![0u8; BODY_SIZE];
-    body_bytes[..body.len()].copy_from_slice(body);
-    for i in (0..n).rev() {
-        xor_body(&hop_keys[i].body_key, &mut body_bytes);
-    }
-
     let header = SphinxHeader {
         version: SPHINX_VERSION_CLASSICAL,
         ephemeral_key: alphas[0],
@@ -394,7 +504,7 @@ pub fn create_packet(route: &Route, body: &[u8]) -> Result<SphinxPacket, SphinxE
         mac: macs[0],
     };
 
-    Ok(SphinxPacket { header, kem_ciphertexts: Vec::new(), body: body_bytes })
+    Ok(SphinxPacket { header, kem_ciphertexts: Vec::new(), body: body_seen[0].clone() })
 }
 
 // ---- Public API: Packet processing ----
@@ -416,7 +526,7 @@ pub fn process_packet(node: &mut MixNode, packet: SphinxPacket) -> Result<Proces
     if packet.header.routing_info.len() != ROUTING_INFO_SIZE {
         return Err(SphinxError::InvalidPacketSize);
     }
-    if packet.body.len() != BODY_SIZE {
+    if packet.body.len() != WIRE_BODY_SIZE {
         return Err(SphinxError::InvalidPacketSize);
     }
 
@@ -426,15 +536,36 @@ pub fn process_packet(node: &mut MixNode, packet: SphinxPacket) -> Result<Proces
     let shared = SymmetricKey::from_bytes(shared_point.0);
     let keys = derive_hop_keys(&shared);
 
-    // Verify MAC BEFORE recording the replay tag. Recording first would let
-    // an attacker fill the bounded cache with invalid packets (DoS) and
-    // poison replay state. Invalid packets must not consume cache entries.
+    // Verify MAC (covers body) BEFORE recording the replay tag. Recording
+    // first would let an attacker fill the bounded cache with invalid
+    // packets (DoS) and poison replay state. Invalid packets must not
+    // consume cache entries.
     let first_slot: &[u8; SLOT_SIZE] = packet.header.routing_info[..SLOT_SIZE]
         .try_into()
         .map_err(|_| SphinxError::InvalidPacketSize)?;
-    let expected_mac = compute_mac(&keys.mac_key, &packet.header.ephemeral_key, first_slot);
+    let expected_mac = compute_mac(
+        &keys.mac_key,
+        packet.header.version,
+        &packet.header.ephemeral_key,
+        first_slot,
+        &packet.body,
+    );
     if packet.header.mac != expected_mac {
-        return Err(SphinxError::MacVerificationFailed);
+        // SURB fallback: SURB headers are pre-built before the payload is
+        // known, so their MACs cover a zero placeholder body. A tampered
+        // normal packet matches neither; a legitimate SURB matches here.
+        // Body integrity for SURBs still holds end-to-end via AEAD.
+        let placeholder = vec![0u8; WIRE_BODY_SIZE];
+        let surb_mac = compute_mac(
+            &keys.mac_key,
+            packet.header.version,
+            &packet.header.ephemeral_key,
+            first_slot,
+            &placeholder,
+        );
+        if packet.header.mac != surb_mac {
+            return Err(SphinxError::MacVerificationFailed);
+        }
     }
 
     // Check replay (only valid packets reach here)
@@ -464,17 +595,20 @@ pub fn process_packet(node: &mut MixNode, packet: SphinxPacket) -> Result<Proces
     let blind = blinding_factor(&shared);
     let new_ephemeral = (&alpha_point * &blind).0;
 
-    // Peel one body encryption layer
-    let mut new_body = packet.body;
-    xor_body(&keys.body_key, &mut new_body);
+    // Peel one body encryption layer (stays WIRE_BODY_SIZE)
+    let mut peeled_body = packet.body;
+    xor_body(&keys.body_key, &mut peeled_body);
 
     match flag {
         RoutingFlag::Destination => {
+            // End-to-end AEAD: last layer decrypts to BODY_SIZE plaintext.
+            let aead_key = derive_body_aead_key(&shared);
+            let plaintext = aead_decrypt_body(&aead_key, &peeled_body, &next_hop)?;
             Ok(ProcessedPacket {
                 next_hop,
                 flag,
                 forward_packet: None,
-                body: Some(new_body),
+                body: Some(plaintext),
             })
         }
         RoutingFlag::Forward => {
@@ -487,7 +621,7 @@ pub fn process_packet(node: &mut MixNode, packet: SphinxPacket) -> Result<Proces
             let forward_packet = SphinxPacket {
                 header: forward_header,
                 kem_ciphertexts: Vec::new(),
-                body: new_body,
+                body: peeled_body,
             };
             Ok(ProcessedPacket {
                 next_hop,
@@ -595,14 +729,33 @@ impl Default for HybridMixNode {
     }
 }
 
+/// Create a valid dummy Sphinx packet for cover traffic (Phase 7, Task 4c).
+///
+/// Builds a real hybrid packet over fresh random nodes with a random body,
+/// so cover is structurally valid and indistinguishable from real traffic
+/// by size and layout. The packet routes nowhere meaningful (random
+/// destination); mix nodes that receive it process it normally and drop it.
+pub fn create_dummy_sphinx_packet() -> SphinxPacket {
+    let n = 3;
+    let mut hops = Vec::with_capacity(n);
+    for _ in 0..n {
+        let node = HybridMixNode::new();
+        hops.push(node.as_hop());
+    }
+    let route = HybridRoute { hops, destination: random_node_id() };
+    let body = random_bytes(BODY_SIZE);
+    create_packet_hybrid(&route, &body)
+        .expect("dummy packet construction with fresh keys must succeed")
+}
+
 /// Create a hybrid Sphinx packet for a route.
 ///
 /// Per-hop keys combine X25519 (with the same running-scalar blinding
 /// as classical packets) and a fresh ML-KEM encapsulation to that hop:
 /// `hop_key = derive_hybrid_shared_secret(classical_dh, kem_ss)`.
-/// Routing/MAC/body construction is otherwise identical to classical,
-/// so cover properties are preserved. One KEM ciphertext per hop rides
-/// in the packet; each hop strips its own before forwarding.
+/// Body protection mirrors [`create_packet`] (AEAD inner + XOR onion +
+/// body-covering MACs). The KEM section is a fixed [`KEM_BLOCK_SIZE`]
+/// block (real ciphertexts + random dummies) so size never leaks position.
 pub fn create_packet_hybrid(route: &HybridRoute, body: &[u8]) -> Result<SphinxPacket, SphinxError> {
     let n = route.hops.len();
     if n == 0 || n > MAX_HOPS {
@@ -623,7 +776,8 @@ pub fn create_packet_hybrid(route: &HybridRoute, body: &[u8]) -> Result<SphinxPa
     // Compute hybrid shared secrets with running scalar blinding
     let mut hop_keys = Vec::with_capacity(n);
     let mut alphas = Vec::with_capacity(n);
-    let mut kem_ciphertexts: Vec<u8> = Vec::with_capacity(n * KEM_CIPHERTEXT_SIZE);
+    let mut hybrid_secrets: Vec<SymmetricKey> = Vec::with_capacity(n);
+    let mut real_cts: Vec<Vec<u8>> = Vec::with_capacity(n);
     let mut current_alpha = ephemeral_pub;
     let mut current_scalar = ephemeral_scalar.clone();
 
@@ -636,11 +790,12 @@ pub fn create_packet_hybrid(route: &HybridRoute, body: &[u8]) -> Result<SphinxPa
         // Post-quantum component (fresh encapsulation per hop)
         let (kem_shared, ciphertext) = KemKeypair::encapsulate_to(&route.hops[i].kem_public_key)
             .map_err(|_| SphinxError::InvalidKemPublicKey)?;
-        kem_ciphertexts.extend_from_slice(&ciphertext);
+        real_cts.push(ciphertext);
 
         // Hybrid combination: both must break to recover hop keys
         let hybrid_shared =
             derive_hybrid_shared_secret(&classical_shared, &kem_shared, HYBRID_HOP_CONTEXT);
+        hybrid_secrets.push(hybrid_shared.clone());
         hop_keys.push(derive_hop_keys(&hybrid_shared));
 
         alphas.push(current_alpha);
@@ -653,7 +808,29 @@ pub fn create_packet_hybrid(route: &HybridRoute, body: &[u8]) -> Result<SphinxPa
         }
     }
 
-    // Build routing blocks and MACs (identical construction, hybrid keys)
+    // Fixed KEM block: real ciphertexts + random dummies.
+    let mut kem_block: Vec<u8> = Vec::with_capacity(KEM_BLOCK_SIZE);
+    for ct in &real_cts {
+        kem_block.extend_from_slice(ct);
+    }
+    let dummy_len = KEM_BLOCK_SIZE - n * KEM_CIPHERTEXT_SIZE;
+    kem_block.extend_from_slice(&random_bytes(dummy_len));
+
+    // Innermost AEAD + XOR onion (same as classical, hybrid keys).
+    let mut padded = vec![0u8; BODY_SIZE];
+    padded[..body.len()].copy_from_slice(body);
+    let inner_aead = derive_body_aead_key(&hybrid_secrets[n - 1]);
+    let inner = aead_encrypt_body(&inner_aead, &padded, &route.destination);
+    debug_assert_eq!(inner.len(), WIRE_BODY_SIZE);
+
+    let mut body_seen: Vec<Vec<u8>> = vec![Vec::new(); n];
+    let mut buf = inner;
+    for i in (0..n).rev() {
+        xor_body(&hop_keys[i].body_key, &mut buf);
+        body_seen[i] = buf.clone();
+    }
+
+    // Build routing blocks and MACs (covering per-hop body).
     let mut blocks: Vec<[u8; SLOT_SIZE]> = vec![[0u8; SLOT_SIZE]; n];
     let mut enc_blocks: Vec<[u8; SLOT_SIZE]> = vec![[0u8; SLOT_SIZE]; n];
     let mut macs: Vec<Mac> = vec![[0u8; MAC_SIZE]; n];
@@ -670,7 +847,13 @@ pub fn create_packet_hybrid(route: &HybridRoute, body: &[u8]) -> Result<SphinxPa
 
         enc_blocks[i] = blocks[i];
         xor_slot(&hop_keys[i].stream_key, &mut enc_blocks[i]);
-        macs[i] = compute_mac(&hop_keys[i].mac_key, &alphas[i], &enc_blocks[i]);
+        macs[i] = compute_mac(
+            &hop_keys[i].mac_key,
+            SPHINX_VERSION_HYBRID,
+            &alphas[i],
+            &enc_blocks[i],
+            &body_seen[i],
+        );
     }
 
     let mut routing_info = vec![0u8; ROUTING_INFO_SIZE];
@@ -679,12 +862,6 @@ pub fn create_packet_hybrid(route: &HybridRoute, body: &[u8]) -> Result<SphinxPa
     }
     routing_info[n * SLOT_SIZE..].copy_from_slice(&random_bytes(ROUTING_INFO_SIZE - n * SLOT_SIZE));
 
-    let mut body_bytes = vec![0u8; BODY_SIZE];
-    body_bytes[..body.len()].copy_from_slice(body);
-    for i in (0..n).rev() {
-        xor_body(&hop_keys[i].body_key, &mut body_bytes);
-    }
-
     let header = SphinxHeader {
         version: SPHINX_VERSION_HYBRID,
         ephemeral_key: alphas[0],
@@ -692,7 +869,7 @@ pub fn create_packet_hybrid(route: &HybridRoute, body: &[u8]) -> Result<SphinxPa
         mac: macs[0],
     };
 
-    Ok(SphinxPacket { header, kem_ciphertexts, body: body_bytes })
+    Ok(SphinxPacket { header, kem_ciphertexts: kem_block, body: body_seen[0].clone() })
 }
 
 /// Process a hybrid Sphinx packet at a mix node.
@@ -725,16 +902,16 @@ pub fn process_packet_hybrid_with_keys(
     if packet.header.routing_info.len() != ROUTING_INFO_SIZE {
         return Err(SphinxError::InvalidPacketSize);
     }
-    if packet.body.len() != BODY_SIZE {
+    if packet.body.len() != WIRE_BODY_SIZE {
         return Err(SphinxError::InvalidPacketSize);
     }
-    if packet.kem_ciphertexts.len() < KEM_CIPHERTEXT_SIZE
-        || packet.kem_ciphertexts.len() % KEM_CIPHERTEXT_SIZE != 0
-    {
+    // Fixed-size KEM block (Phase 7): hybrid packets always carry
+    // KEM_BLOCK_SIZE bytes; classical variable-length packets are rejected.
+    if packet.kem_ciphertexts.len() != KEM_BLOCK_SIZE {
         return Err(SphinxError::InvalidKemCiphertext);
     }
 
-    // Split off this hop's ciphertext; the rest forwards on.
+    // This hop's ciphertext is always slot 0; the rest shifts forward.
     let (our_ct, rest_cts) = packet.kem_ciphertexts.split_at(KEM_CIPHERTEXT_SIZE);
 
     // Classical component
@@ -750,13 +927,31 @@ pub fn process_packet_hybrid_with_keys(
         derive_hybrid_shared_secret(&classical_shared, &kem_shared, HYBRID_HOP_CONTEXT);
     let keys = derive_hop_keys(&hybrid_shared);
 
-    // Verify MAC BEFORE recording the replay tag (see `process_packet`).
+    // Verify MAC (covers body) BEFORE recording the replay tag.
     let first_slot: &[u8; SLOT_SIZE] = packet.header.routing_info[..SLOT_SIZE]
         .try_into()
         .map_err(|_| SphinxError::InvalidPacketSize)?;
-    let expected_mac = compute_mac(&keys.mac_key, &packet.header.ephemeral_key, first_slot);
+    let expected_mac = compute_mac(
+        &keys.mac_key,
+        packet.header.version,
+        &packet.header.ephemeral_key,
+        first_slot,
+        &packet.body,
+    );
     if packet.header.mac != expected_mac {
-        return Err(SphinxError::MacVerificationFailed);
+        // SURB fallback (see `process_packet`): pre-built headers cover a
+        // zero placeholder body; end-to-end AEAD still protects the payload.
+        let placeholder = vec![0u8; WIRE_BODY_SIZE];
+        let surb_mac = compute_mac(
+            &keys.mac_key,
+            packet.header.version,
+            &packet.header.ephemeral_key,
+            first_slot,
+            &placeholder,
+        );
+        if packet.header.mac != surb_mac {
+            return Err(SphinxError::MacVerificationFailed);
+        }
     }
 
     // Check replay (shared tag space with classical path)
@@ -786,17 +981,26 @@ pub fn process_packet_hybrid_with_keys(
     let blind = blinding_factor(&hybrid_shared);
     let new_ephemeral = (&alpha_point * &blind).0;
 
-    // Peel one body encryption layer
-    let mut new_body = packet.body;
-    xor_body(&keys.body_key, &mut new_body);
+    // Peel one body layer (stays WIRE_BODY_SIZE)
+    let mut peeled_body = packet.body;
+    xor_body(&keys.body_key, &mut peeled_body);
+
+    // Shift KEM block left by one ciphertext, pad last slot with random
+    // so the size never changes (no position leak).
+    let mut new_kem_block: Vec<u8> = Vec::with_capacity(KEM_BLOCK_SIZE);
+    new_kem_block.extend_from_slice(rest_cts);
+    new_kem_block.extend_from_slice(&random_bytes(KEM_CIPHERTEXT_SIZE));
+    debug_assert_eq!(new_kem_block.len(), KEM_BLOCK_SIZE);
 
     match flag {
         RoutingFlag::Destination => {
+            let aead_key = derive_body_aead_key(&hybrid_shared);
+            let plaintext = aead_decrypt_body(&aead_key, &peeled_body, &next_hop)?;
             Ok(HybridProcessedPacket {
                 next_hop,
                 flag,
                 forward_packet: None,
-                body: Some(new_body),
+                body: Some(plaintext),
             })
         }
         RoutingFlag::Forward => {
@@ -808,8 +1012,8 @@ pub fn process_packet_hybrid_with_keys(
             };
             let forward_packet = SphinxPacket {
                 header: forward_header,
-                kem_ciphertexts: rest_cts.to_vec(),
-                body: new_body,
+                kem_ciphertexts: new_kem_block,
+                body: peeled_body,
             };
             Ok(HybridProcessedPacket {
                 next_hop,
@@ -1142,7 +1346,8 @@ mod tests {
         let packet = create_packet_hybrid(&route, body).unwrap();
 
         assert_eq!(packet.header.version, SPHINX_VERSION_HYBRID);
-        assert_eq!(packet.kem_ciphertexts.len(), KEM_CIPHERTEXT_SIZE);
+        // Phase 7: fixed KEM block (no position leak).
+        assert_eq!(packet.kem_ciphertexts.len(), KEM_BLOCK_SIZE);
 
         let result = process_packet_hybrid(&mut nodes[0], packet).unwrap();
         assert_eq!(result.flag, RoutingFlag::Destination);
@@ -1158,13 +1363,14 @@ mod tests {
         let (mut nodes, route) = create_hybrid_route(3);
         let body = b"hybrid multi hop";
         let packet = create_packet_hybrid(&route, body).unwrap();
-        assert_eq!(packet.kem_ciphertexts.len(), 3 * KEM_CIPHERTEXT_SIZE);
+        assert_eq!(packet.kem_ciphertexts.len(), KEM_BLOCK_SIZE);
 
         let result0 = process_packet_hybrid(&mut nodes[0], packet).unwrap();
         assert_eq!(result0.flag, RoutingFlag::Forward);
         assert_eq!(result0.next_hop, nodes[1].node_id());
         let fwd0 = result0.forward_packet.unwrap();
-        assert_eq!(fwd0.kem_ciphertexts.len(), 2 * KEM_CIPHERTEXT_SIZE);
+        // Phase 7: size never changes per hop (shift + random pad).
+        assert_eq!(fwd0.kem_ciphertexts.len(), KEM_BLOCK_SIZE);
 
         let result1 = process_packet_hybrid(&mut nodes[1], fwd0).unwrap();
         assert_eq!(result1.flag, RoutingFlag::Forward);
@@ -1331,5 +1537,72 @@ mod tests {
 
         let replay = process_packet_hybrid(&mut nodes[0], packet);
         assert!(matches!(replay, Err(SphinxError::ReplayDetected)));
+    }
+
+    #[test]
+    fn test_sphinx_body_aead() {
+        // Phase 7 Task 4a: body tampering is detected. Flipping a body
+        // bit breaks the next hop's MAC (fast fail); even if a tamper
+        // slipped through per-hop MACs, the destination AEAD would fail.
+        let (mut nodes, route) = create_hybrid_route(2);
+        let body = b"aead body test";
+        let mut packet = create_packet_hybrid(&route, body).unwrap();
+
+        // Tamper with the body (first hop sees it).
+        packet.body[0] ^= 0xFF;
+        let err = process_packet_hybrid(&mut nodes[0], packet).unwrap_err();
+        assert!(matches!(err, SphinxError::MacVerificationFailed));
+
+        // Untampered packet decrypts end-to-end via AEAD.
+        let (mut nodes2, route2) = create_hybrid_route(1);
+        let packet2 = create_packet_hybrid(&route2, body).unwrap();
+        let result = process_packet_hybrid(&mut nodes2[0], packet2).unwrap();
+        assert_eq!(&result.body.unwrap()[..body.len()], body);
+    }
+
+    #[test]
+    fn test_kem_block_fixed_size() {
+        // Phase 7 Task 4b: packet size never changes per hop (no
+        // position leak). Create a 3-hop packet; after each hop the
+        // serialized size is identical.
+        let (mut nodes, route) = create_hybrid_route(3);
+        let packet = create_packet_hybrid(&route, b"fixed kem").unwrap();
+        let size0 = packet.body.len() + packet.kem_ciphertexts.len();
+        assert_eq!(packet.kem_ciphertexts.len(), KEM_BLOCK_SIZE);
+
+        let r0 = process_packet_hybrid(&mut nodes[0], packet).unwrap();
+        let fwd0 = r0.forward_packet.unwrap();
+        let size1 = fwd0.body.len() + fwd0.kem_ciphertexts.len();
+        assert_eq!(size0, size1);
+        assert_eq!(fwd0.kem_ciphertexts.len(), KEM_BLOCK_SIZE);
+
+        let r1 = process_packet_hybrid(&mut nodes[1], fwd0).unwrap();
+        let fwd1 = r1.forward_packet.unwrap();
+        assert_eq!(fwd1.kem_ciphertexts.len(), KEM_BLOCK_SIZE);
+        assert_eq!(fwd1.body.len() + fwd1.kem_ciphertexts.len(), size0);
+    }
+
+    #[test]
+    fn test_dummy_sphinx_valid() {
+        // Phase 7 Task 4c: cover traffic is a structurally valid packet
+        // (not random bytes). A mix node processes it without error.
+        let mut node = HybridMixNode::new();
+        // Build a dummy routed THROUGH this node so it can process it.
+        let peer_hop = node.as_hop();
+        let r1 = HybridMixNode::new();
+        let r2 = HybridMixNode::new();
+        let route = HybridRoute {
+            hops: vec![peer_hop, r1.as_hop(), r2.as_hop()],
+            destination: random_node_id(),
+        };
+        let packet = create_packet_hybrid(&route, &[0u8; BODY_SIZE]).unwrap();
+        // Valid: processes cleanly (forwards, no MAC failure).
+        let result = process_packet_hybrid(&mut node, packet).unwrap();
+        assert_eq!(result.flag, RoutingFlag::Forward);
+        // The public helper also produces a well-formed packet.
+        let dummy = create_dummy_sphinx_packet();
+        assert_eq!(dummy.header.version, SPHINX_VERSION_HYBRID);
+        assert_eq!(dummy.kem_ciphertexts.len(), KEM_BLOCK_SIZE);
+        assert_eq!(dummy.body.len(), WIRE_BODY_SIZE);
     }
 }

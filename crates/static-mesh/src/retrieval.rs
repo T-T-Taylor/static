@@ -488,7 +488,7 @@ mod tests {
 
         let packet = create_anonymous_request_hybrid(chunk_id, &return_route_route(&return_route), &forward_route).unwrap();
 
-        assert_eq!(packet.body.len(), BODY_SIZE);
+        assert_eq!(packet.body.len(), static_sphinx::WIRE_BODY_SIZE);
         assert_ne!(packet.header.ephemeral_key, [0u8; 32]);
         assert_eq!(packet.header.version, static_sphinx::SPHINX_VERSION_HYBRID);
     }
