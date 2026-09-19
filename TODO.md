@@ -318,6 +318,60 @@ via direct `handle_message` (mesh tests + the new runner-level
 `bridge_runners` loopback). Fixing wire transport for large swap
 payloads (binary framing or chunked transfer) is future work.
 
+## Phase 4 Notes (2026-09-18) — Swap Wire MTU Fix & TCP Integration (S0)
+
+Closes the Phase 3 constraint above. Swap messages are now
+metadata-only; the 1 MiB chunks travel via the existing
+Sphinx-fragmented retrieval protocol (type bytes 0x01/0x02). Suite: 395
+tests, release build zero warnings. Full 2-phase barter proven over real
+loopback TCP (`test_atomic_swap_over_tcp`), including the retrieval
+phase and both timeout/abort paths.
+
+- `SwapProposal`/`SwapAccept` carry `chunk_id` instead of `EncryptedChunk`;
+  `create_swap_proposal`/`create_swap_accept` take `ChunkId`. Serialized
+  proposal ≈ 1 KB — fits `PADDED_MESSAGE_SIZE` (proven by
+  `test_swap_proposal_fits_mtu` with a 20-sibling proof).
+- Validation split: `validate_swap_proposal` checks lease + content
+  signature at proposal time; the Merkle check moves to retrieval time
+  (the proof carries no leaf hash — the leaf is blake3 of the data — so
+  metadata alone cannot verify integrity). Accepter-side retrieved data
+  is verified against the stashed `content_root`/`merkle_proof`
+  (`PendingSwap` grew those fields); bad data aborts the swap,
+  releases the reservation, and notifies the peer
+  (`test_swap_bad_chunk_data_aborts`). The proposer-side return chunk
+  has no content binding — zero `content_root` marks "no Merkle gate",
+  same trust level as the in-band accepts it replaces.
+- Retrieval phase: a runner-side reconcile tick
+  (`process_swap_retrievals`, spawned as a 2 s loop) fires
+  Sphinx-wrapped `ChunkRequest`s for pending swaps awaiting data
+  (one attempt per swap; the pending-swap timeout covers failure).
+  Response fragments land in the existing `handle_inbound` path; a
+  completed response matching a pending swap is consumed by
+  `transport::handle_swap_chunk_retrieval` (verify → buffer → commit →
+  finalize) and never pollutes `single_chunks`.
+- Commit timing: neither side commits until it holds the peer's chunk
+  data; `SwapCommit` no longer auto-replies (the old commit-on-commit
+  race path is obsolete — finalization needs data + both commits).
+  Crash-proofness unchanged: abort/timeout release reservations and
+  store nothing.
+- **Deadlock fix (pre-existing, latent)**: the chunk-request serving
+  path built and pushed ~1038 fragment packets into the node's own
+  outbound channel (cap 256) from INSIDE `handle_message`, which runs
+  inline in the connection loop's read arm — the server blocked on a
+  channel only its own task could drain. Response serving now runs in
+  a detached task. This never triggered before because every previous
+  Sphinx response was a single fragment.
+- Test-infrastructure notes: `NodeRunner::new` now honors
+  `config.cover_traffic_enabled` (config default `true`, production
+  behavior unchanged). The cover tick sizes its dummy to the full
+  interval budget (rate × interval), so tests use a high rate with
+  cover disabled; `bridge_runners`/`bridge_one_way` deleted (real
+  `tcp_pair` connections now carry swap traffic). A 1 MiB swap
+  retrieval is ~1038 hybrid Sphinx packets per direction (~7 MB wire,
+  2 KEM ops each) — at the production default 100 KiB/s shaped rate
+  that is ~70 s, well within the 5-minute pending-swap timeout;
+  retrieval throughput tuning is future work.
+
 ## Phase 2 Hotfix Notes (2026-09-18) — Hybrid Packet Migration
 
 All five Sphinx-body paths (retrieval, compute, verification, payment,

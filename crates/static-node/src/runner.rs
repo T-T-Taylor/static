@@ -427,7 +427,10 @@ impl NodeRunner {
         let (target_rate, cover_enabled) = match config.mode {
             NodeMode::SeedOnly => (1024, false),
             NodeMode::Client => (50 * 1024, true),
-            _ => (config.cover_traffic_rate_bps, true),
+            // Full/BackupOnly honor the configured cover switch (the
+            // config default is enabled, so production behavior is
+            // unchanged; tests can disable cover explicitly).
+            _ => (config.cover_traffic_rate_bps, config.cover_traffic_enabled),
         };
         let cover_config = static_mesh::CoverTrafficConfig {
             target_rate_bps: target_rate,
@@ -625,6 +628,13 @@ impl NodeRunner {
         let runner_for_heartbeat = self.clone();
         tokio::spawn(async move {
             heartbeat_sender_loop(runner_for_heartbeat).await;
+        });
+
+        // Start swap retrieval loop (S0): fetch peer chunks for pending
+        // 2-phase swaps over the Sphinx retrieval protocol.
+        let runner_for_swaps = self.clone();
+        tokio::spawn(async move {
+            swap_retrieval_loop(runner_for_swaps).await;
         });
 
         // Start peer gossip loop (seed-only nodes are rate-limited: they only
@@ -834,7 +844,23 @@ impl NodeRunner {
                 {
                     let mut manager = self.retriever.lock().await;
                     if let Ok(Some(response)) = manager.process_fragment(&packet.body) {
-                        if response.found {
+                        // Swap retrieval phase (S0): a completed response may
+                        // belong to a pending 2-phase swap. Consume it there
+                        // first (Merkle-verify, buffer, commit); only fall
+                        // through to the ordinary retrieval path when no
+                        // swap is waiting for this chunk.
+                        let consumed = response.found && static_mesh::transport::handle_swap_chunk_retrieval(
+                            &self.transport,
+                            &response.chunk_id,
+                            response.chunk_data.clone(),
+                        )
+                        .await;
+                        if consumed {
+                            debug!(
+                                "Chunk {:02x?} routed to pending swap (retrieval phase)",
+                                response.chunk_id
+                            );
+                        } else if response.found {
                             let chunk = EncryptedChunk {
                                 id: response.chunk_id,
                                 data: response.chunk_data,
@@ -2762,6 +2788,84 @@ impl NodeRunner {
         )?)
     }
 
+    /// Issue `ChunkRequest`s for pending swaps still waiting for data (S0)
+    ///
+    /// The swap wire messages are metadata-only (chunk payloads exceed
+    /// the padded MTU), so each side fetches the peer's chunk over the
+    /// Sphinx-fragmented retrieval protocol. This reconcile tick scans
+    /// the pending swaps for entries whose data has not arrived and
+    /// whose retrieval request is not yet in flight, opens a
+    /// `RetrievalManager` session (keyed by proposal ID so the response
+    /// fragments are accepted) and sends the request. One attempt per
+    /// swap: a failed retrieval eventually hits the pending-swap
+    /// timeout, which aborts and releases the reservation. Returns the
+    /// number of requests sent.
+    pub async fn process_swap_retrievals(&self) -> usize {
+        // Snapshot the swaps that need retrieval (lock dropped before
+        // any await-heavy work).
+        let targets: Vec<([u8; 32], NodeId, ChunkId)> = {
+            let swaps = self.transport.swap_state.lock().await;
+            swaps
+                .pending_swaps
+                .values()
+                .filter(|s| {
+                    !s.received_their_chunk
+                        && !s.retrieval_requested
+                        && s.their_chunk_id != [0u8; 32]
+                })
+                .map(|s| (s.proposal_id, s.peer, s.their_chunk_id))
+                .collect()
+        };
+        if targets.is_empty() {
+            return 0;
+        }
+
+        // Return route back to ourselves (1 hop: us).
+        let our_pubkey = self.transport.mix_node.lock().await.public_key;
+        let our_node_id = self.transport.node_id;
+        let return_route = Route {
+            hops: vec![RouteHop {
+                public_key: our_pubkey,
+                node_id: our_node_id,
+            }],
+            destination: our_node_id,
+        };
+
+        let mut sent = 0;
+        for (pid, peer, chunk_id) in targets {
+            let known = self.transport.routing_table.read().await.nodes.get(&peer).cloned();
+            let Some(peer_node) = known else {
+                debug!(
+                    "Swap {:02x?}: peer {:02x?} unknown to routing, retrieval deferred",
+                    pid, peer
+                );
+                continue;
+            };
+            let packet = match Self::build_forward_request(chunk_id, &peer_node, &return_route) {
+                Ok(pkt) => pkt,
+                Err(e) => {
+                    debug!("Swap {:02x?}: cannot build retrieval request: {}", pid, e);
+                    continue;
+                }
+            };
+            // Open the response session keyed by proposal ID so the
+            // returning fragments have a reassembler to land in.
+            self.retriever.lock().await.start_retrieval(pid);
+            if static_mesh::transport::send_sphinx(&self.transport, peer, packet)
+                .await
+                .is_ok()
+            {
+                self.transport
+                    .swap_state
+                    .lock()
+                    .await
+                    .mark_retrieval_requested(&pid);
+                sent += 1;
+            }
+        }
+        sent
+    }
+
     /// Retrieve content from the network using the hidden service model
     ///
     /// Phase 0 (L12 fix): checks local holder first (covers same-node
@@ -3416,8 +3520,25 @@ async fn lease_expiration_and_repair_loop(runner: Arc<NodeRunner>) {
     }
 }
 
-/// One repair tick (Phase 1): check content health, then repair.
+/// Swap retrieval loop (S0): drive the retrieval phase of pending
+/// 2-phase swaps
 ///
+/// The swap messages are metadata-only, so each side must fetch the
+/// peer's chunk over the Sphinx retrieval protocol; this fast tick
+/// fires those requests shortly after the metadata exchange instead of
+/// waiting for the 60s lifecycle loop.
+async fn swap_retrieval_loop(runner: Arc<NodeRunner>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    loop {
+        interval.tick().await;
+        let sent = runner.process_swap_retrievals().await;
+        if sent > 0 {
+            debug!("Swap retrieval tick: dispatched {} chunk request(s)", sent);
+        }
+    }
+}
+
+/// One repair tick (Phase 1): check content health, then repair.
 /// Processes at most [`MAX_REPAIRS_PER_TICK`] content items per tick and
 /// skips entirely while a user retrieval occupies the shared
 /// `content_retriever` (repair reuses it via `fetch_shards`).
@@ -4015,10 +4136,6 @@ async fn rotation_loop(
                 continue;
             };
 
-            let chunk = EncryptedChunk {
-                id: *chunk_id,
-                data: data.clone(),
-            };
             // Chunks without a stored proof (cached chunks, manifest
             // chunks) can never pass receiver validation, so they are
             // skipped rather than sent to certain rejection.
@@ -4045,9 +4162,12 @@ async fn rotation_loop(
                 let id = *blake3::hash(&pk).as_bytes();
                 (id, pk, sk)
             };
+            // Metadata-only proposal (the chunk itself stays in our
+            // holder; the peer fetches its data via the retrieval
+            // protocol).
             let proposal = static_storage::swap::create_swap_proposal(
                 node_id,
-                chunk,
+                *chunk_id,
                 &master_key,
                 static_storage::swap::DEFAULT_LEASE_DURATION_SECS,
                 content_root,
@@ -5383,12 +5503,26 @@ mod tests {
     /// `handle_inbound`. When `b_compute` is set, B's own transport also
     /// accepts compute requests.
     async fn tcp_pair(b_compute: bool) -> (Arc<NodeRunner>, Arc<NodeRunner>) {
+        // High test bandwidth, cover traffic off: the token-bucket shaper
+        // paces traffic to cover_traffic_rate_bps, and a 1 MiB swap chunk
+        // retrieved via Sphinx fragments is ~7 MB of wire traffic — ~70 s
+        // at the production default (100 KiB/s). The cover tick sizes its
+        // dummy to the full interval budget (rate * interval), so a high
+        // rate with cover enabled would flood the link with multi-MB
+        // dummies and starve the fragment stream; tests disable cover and
+        // keep the high rate for the swap retrieval.
+        let mut cfg_a = NodeConfig::default();
+        cfg_a.cover_traffic_rate_bps = 64 * 1024 * 1024;
+        cfg_a.cover_traffic_enabled = false;
+        let mut cfg_b = NodeConfig::default();
+        cfg_b.cover_traffic_rate_bps = 64 * 1024 * 1024;
+        cfg_b.cover_traffic_enabled = false;
         let a = Arc::new(NodeRunner::new(
-            NodeConfig::default(),
+            cfg_a,
             [0xAAu8; 16],
             MixNode::new(),
         ));
-        let mut runner_b = NodeRunner::new(NodeConfig::default(), [0xBBu8; 16], MixNode::new());
+        let mut runner_b = NodeRunner::new(cfg_b, [0xBBu8; 16], MixNode::new());
         if b_compute {
             if let Some(t) = Arc::get_mut(&mut runner_b.transport) {
                 t.compute_enabled = true;
@@ -5427,65 +5561,6 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("timed out waiting for condition");
-    }
-
-    /// Wire two runners' swap-control channels together in-process.
-    ///
-    /// Swap proposal payloads (1 MiB chunks JSON-encoded) exceed the
-    /// padded wire size, so a full 2-phase swap cannot traverse real
-    /// TCP framing. The bridge routes each side's outbound swap
-    /// messages straight into the peer's `handle_message`, exercising
-    /// the complete protocol across both runners' real transport state
-    /// (capacity, swap registry, chunk holders, leases).
-    async fn bridge_runners(a: &Arc<NodeRunner>, b: &Arc<NodeRunner>) {
-        let (tx_ab, mut rx_ab) =
-            tokio::sync::mpsc::channel::<static_mesh::wire::WireMessage>(64);
-        let (tx_ba, mut rx_ba) =
-            tokio::sync::mpsc::channel::<static_mesh::wire::WireMessage>(64);
-        a.transport
-            .connections
-            .write()
-            .await
-            .insert(b.transport.node_id, tx_ab);
-        b.transport
-            .connections
-            .write()
-            .await
-            .insert(a.transport.node_id, tx_ba);
-        let id_a = a.transport.node_id;
-        let id_b = b.transport.node_id;
-        let state_a = a.transport.clone();
-        let state_b = b.transport.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = rx_ba.recv().await {
-                let _ = static_mesh::transport::handle_message(msg, &state_a, id_b).await;
-            }
-        });
-        tokio::spawn(async move {
-            while let Some(msg) = rx_ab.recv().await {
-                let _ = static_mesh::transport::handle_message(msg, &state_b, id_a).await;
-            }
-        });
-    }
-
-    /// One-way variant of [`bridge_runners`]: only messages from
-    /// `from` are delivered to `to`; `to`'s replies are dropped (the
-    /// peer appears unresponsive — the timeout scenario).
-    async fn bridge_one_way(from: &Arc<NodeRunner>, to: &Arc<NodeRunner>) {
-        let (tx, mut rx) =
-            tokio::sync::mpsc::channel::<static_mesh::wire::WireMessage>(64);
-        from.transport
-            .connections
-            .write()
-            .await
-            .insert(to.transport.node_id, tx);
-        let id_from = from.transport.node_id;
-        let state_to = to.transport.clone();
-        tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                let _ = static_mesh::transport::handle_message(msg, &state_to, id_from).await;
-            }
-        });
     }
 
     #[tokio::test]
@@ -5628,7 +5703,7 @@ mod tests {
         let content_id = *blake3::hash(&content_public_key).as_bytes();
         let proposal = static_storage::swap::create_swap_proposal(
             from,
-            chunk,
+            chunk.id,
             &master,
             static_storage::swap::DEFAULT_LEASE_DURATION_SECS,
             content_root,
@@ -5692,13 +5767,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_atomic_swap_complete() {
-        // Full 2-phase barter over TCP: A proposes (chunk in-band), B
-        // accepts + commits, A commits back. Neither side stores until
-        // both commits have been exchanged; both chunks end up stored
-        // with the barter recorded.
+    async fn test_atomic_swap_over_tcp() {
+        // Full 2-phase barter over real loopback TCP (S0): the
+        // metadata-only proposal/accept fit the padded wire MTU; each
+        // side fetches the peer's chunk over the Sphinx-fragmented
+        // retrieval protocol (driven here by the reconcile tick, the
+        // same code the spawned loop runs); commits finalize. Neither
+        // side stores until both commits have been exchanged.
         let (a, b) = tcp_pair(false).await;
-        bridge_runners(&a, &b).await;
 
         // B's return chunk (what B offers back).
         let ret_id: ChunkId = [0xB0u8; 32];
@@ -5709,13 +5785,19 @@ mod tests {
             .await
             .add_chunk(ret_id, ret_data.clone(), [0u8; 32]);
 
-        // A's offered chunk with a genuine content binding.
+        // A's offered chunk with a genuine content binding. It must be
+        // in A's holder: B fetches its data via the retrieval protocol.
         let our_id: ChunkId = [0xB1u8; 32];
         let our_data = vec![0xC7u8; static_storage::CHUNK_SIZE + 16];
         let (proposal, _signing_key) = make_signed_proposal(
             a.transport.node_id,
             static_storage::EncryptedChunk { id: our_id, data: our_data.clone() },
         );
+        a.transport
+            .chunk_holder
+            .lock()
+            .await
+            .add_chunk(our_id, our_data.clone(), [0u8; 32]);
 
         let pid = a
             .transport
@@ -5735,12 +5817,25 @@ mod tests {
             .unwrap();
 
         // Both sides finalize: A stores B's return chunk, B stores A's
-        // offered chunk.
-        wait_until(async || {
-            a.transport.chunk_holder.lock().await.get_chunk(&ret_id).is_some()
-                && b.transport.chunk_holder.lock().await.get_chunk(&our_id).is_some()
-        })
-        .await;
+        // offered chunk. Each poll also runs the reconcile tick (what
+        // the 2s swap_retrieval_loop does in production). Retrieving a
+        // 1 MiB chunk means ~1038 hybrid Sphinx packets per direction
+        // (each a KEM op), so the deadline is generous.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let _ = a.process_swap_retrievals().await;
+            let _ = b.process_swap_retrievals().await;
+            let done = a.transport.chunk_holder.lock().await.get_chunk(&ret_id).is_some()
+                && b.transport.chunk_holder.lock().await.get_chunk(&our_id).is_some();
+            if done {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for swap to complete over TCP"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
 
         // Barter recorded on both sides; reservations fully converted.
         let a_cap = a.transport.storage_capacity.lock().await;
@@ -5777,15 +5872,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_atomic_swap_abort() {
-        // The proposer times out: it aborts its pending swap and
-        // notifies B, whose prepare-phase reservation is released.
-        // Neither side stores anything; the 1:1 ratio is preserved.
+    async fn test_atomic_swap_abort_over_tcp() {
+        // The proposer times out: it aborts its pending swap and the
+        // SwapAbort travels over the real wire, releasing B's
+        // prepare-phase reservation. Neither side stores anything (even
+        // chunks already retrieved); the 1:1 ratio is preserved.
         let (a, b) = tcp_pair(false).await;
-        // One-way bridge (A -> B): B's accept/commit never reach A, so
-        // A's pending swap survives until the timeout fires — the
-        // crash-mid-swap scenario the abort path exists for.
-        bridge_one_way(&a, &b).await;
 
         let ret_id: ChunkId = [0xB8u8; 32];
         let ret_data = vec![0xB9u8; static_storage::CHUNK_SIZE + 16];
@@ -5801,6 +5893,11 @@ mod tests {
             a.transport.node_id,
             static_storage::EncryptedChunk { id: our_id, data: our_data.clone() },
         );
+        a.transport
+            .chunk_holder
+            .lock()
+            .await
+            .add_chunk(our_id, our_data.clone(), [0u8; 32]);
 
         let pid = a
             .transport
@@ -5819,7 +5916,8 @@ mod tests {
             .await
             .unwrap();
 
-        // B is in the prepare phase (reserved, not stored).
+        // B is in the prepare phase over the wire (reserved, not
+        // stored, no data buffered).
         wait_until(async || {
             b.transport
                 .swap_state
@@ -5838,17 +5936,19 @@ mod tests {
             .is_none());
         assert!(b.transport.storage_capacity.lock().await.reserved_bytes > 0);
 
-        // Age A's pending swap past the timeout and run the sweep.
-        {
-            let mut swaps = a.transport.swap_state.lock().await;
+        // Age BOTH pending swaps past the timeout and run both sweeps
+        // (the retrieval ticks never fire — neither side ever fetched
+        // the peer's chunk).
+        for runner in [&a, &b] {
+            let mut swaps = runner.transport.swap_state.lock().await;
             let started = swaps.get_pending_swap(&pid).unwrap().started_at;
             swaps.pending_swaps.get_mut(&pid).unwrap().started_at = started
-                .saturating_sub(a.transport.pending_swap_timeout_secs + 1);
+                .saturating_sub(runner.transport.pending_swap_timeout_secs + 1);
         }
-        let aborted = a.transport.expire_pending_swaps().await;
-        assert_eq!(aborted, 1);
+        assert_eq!(a.transport.expire_pending_swaps().await, 1);
+        assert_eq!(b.transport.expire_pending_swaps().await, 1);
 
-        // B received the abort: reservation released, nothing stored.
+        // A's SwapAbort crossed the wire: B's pending is gone too.
         wait_until(async || {
             b.transport
                 .swap_state
@@ -5861,6 +5961,10 @@ mod tests {
         let b_cap = b.transport.storage_capacity.lock().await;
         assert_eq!(b_cap.reserved_bytes, 0);
         drop(b_cap);
+        let a_cap = a.transport.storage_capacity.lock().await;
+        assert_eq!(a_cap.reserved_bytes, 0);
+        drop(a_cap);
+        // Nothing stored on either side.
         assert!(b
             .transport
             .chunk_holder

@@ -1154,6 +1154,61 @@ use static_sphinx::{Route, RouteHop, MixNode, create_packet, process_packet};
     }
 
     #[test]
+    fn test_swap_proposal_fits_mtu() {
+        // S0: swap messages are metadata-only (chunk payloads travel via
+        // the Sphinx retrieval protocol), so a full proposal — lease,
+        // Merkle proof, content signature — must fit the padded wire MTU.
+        // Before the fix a 1 MiB chunk JSON-encoded inside the proposal
+        // was ~4.2 MB and `serialize_message` rejected it.
+        // Realistic worst case: a deep proof (20 siblings = 1 Mi-tree of
+        // 1 KiB leaves) plus a signed content binding.
+        let proof = static_storage::integrity::MerkleProof {
+            leaf_index: 1_048_575,
+            siblings: vec![[0xABu8; 32]; 20],
+        };
+        let content_sk = ed25519_dalek::SigningKey::from_bytes(&[0x5Au8; 32]);
+        let content_pub = content_sk.verifying_key().to_bytes();
+        let content_id = *blake3::hash(&content_pub).as_bytes();
+        let proposal = static_storage::swap::create_swap_proposal(
+            [0x42u8; 16],
+            [0x77u8; 32],
+            &static_crypto::SymmetricKey::random(),
+            86400,
+            [0x11u8; 32],
+            proof,
+            content_id,
+            content_pub,
+            Some(&content_sk),
+        );
+        let msg = WireMessage::SwapProposal(proposal.clone());
+        let serialized = serialize_message(&msg).expect("metadata proposal must fit the MTU");
+        assert_eq!(serialized[0], MSG_SWAP_PROPOSAL);
+        assert_eq!(serialized.len(), 1 + 4 + PADDED_MESSAGE_SIZE);
+        let (deserialized, consumed) = deserialize_message(&serialized).unwrap();
+        assert_eq!(consumed, serialized.len());
+        match deserialized {
+            WireMessage::SwapProposal(p) => {
+                assert_eq!(p.chunk_id, proposal.chunk_id);
+                assert_eq!(p.content_signature, proposal.content_signature);
+                assert_eq!(p.merkle_proof.siblings.len(), 20);
+                assert_eq!(p.lease.expires_at, proposal.lease.expires_at);
+            }
+            _ => panic!("expected swap proposal"),
+        }
+        // Same for the metadata-only accept.
+        let accept = static_storage::swap::create_swap_accept(
+            [0x43u8; 16],
+            [0x78u8; 32],
+            &static_crypto::SymmetricKey::random(),
+            [0x99u8; 32],
+            86400,
+        );
+        let serialized = serialize_message(&WireMessage::SwapAccept(accept)).unwrap();
+        assert_eq!(serialized[0], MSG_SWAP_ACCEPT);
+        assert_eq!(serialized.len(), 1 + 4 + PADDED_MESSAGE_SIZE);
+    }
+
+    #[test]
     fn test_prepayment_serialization() {
         use ed25519_dalek::SigningKey;
         let sk_bytes = [0x77u8; 32];

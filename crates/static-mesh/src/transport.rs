@@ -465,7 +465,9 @@ impl TransportState {
     /// Records a pending swap for the proposal we are about to send so
     /// the peer's `SwapAccept` can be matched back to it. Call this
     /// immediately before sending the `SwapProposal`; the returned ID is
-    /// the proposal ID the accept/commit/abort messages will carry.
+    /// the proposal ID the accept/commit/abort messages will carry. The
+    /// pending swap waits for the retrieval phase (the return chunk's
+    /// data arrives via `ChunkResponse` after the accept names it).
     pub async fn begin_swap_proposal(
         &self,
         peer: NodeId,
@@ -480,11 +482,22 @@ impl TransportState {
         swaps.start_pending_swap(PendingSwap {
             proposal_id: pid,
             peer,
-            our_chunk_id: proposal.chunk.id,
+            our_chunk_id: proposal.chunk_id,
             their_chunk_id: [0u8; 32],
             their_chunk_data: Vec::new(),
             reserved_bytes: 0,
             received_their_chunk: false,
+            retrieval_requested: false,
+            // The proposal's root/proof bind OUR offered chunk (which
+            // the PEER will verify against). The return chunk we are
+            // about to receive has no content binding in chunk-level
+            // barter, so the all-zero root marks "no Merkle gate" for
+            // our own retrieval.
+            content_root: [0u8; 32],
+            merkle_proof: static_storage::integrity::MerkleProof {
+                leaf_index: 0,
+                siblings: vec![],
+            },
             sent_commit: false,
             received_commit: false,
             // The proposal's terms describe OUR offered chunk; the
@@ -1026,9 +1039,9 @@ struct HopOutcome {
 /// Handle an incoming message from a peer
 /// Dispatch one inbound wire message against a transport state
 ///
-/// Public so tests and loopback bridges can drive the protocol state
-/// machine directly (swap proposal payloads exceed the padded wire size
-/// and cannot traverse a real framing link; see `PADDED_MESSAGE_SIZE`).
+/// Public so tests (and the node runner) can drive the protocol state
+/// machine directly, including the swap retrieval hook
+/// ([`handle_swap_chunk_retrieval`]).
 pub async fn handle_message(
     msg: WireMessage,
     state: &Arc<TransportState>,
@@ -1098,15 +1111,17 @@ pub async fn handle_message(
                         return Ok(());
                     }
                     // Select a real return chunk (first held, excluding offered).
-                    let return_entry: Option<(static_storage::ChunkId, Vec<u8>)> = {
+                    // Only its ID goes on the wire; the peer fetches the
+                    // data via the Sphinx retrieval protocol.
+                    let return_entry: Option<static_storage::ChunkId> = {
                         let holder = state.chunk_holder.lock().await;
                         holder
                             .chunks
                             .iter()
-                            .find(|(id, _)| **id != proposal.chunk.id)
-                            .map(|(id, data)| (*id, data.clone()))
+                            .find(|(id, _)| **id != proposal.chunk_id)
+                            .map(|(id, _data)| *id)
                     };
-                    let Some((ret_id, ret_data)) = return_entry else {
+                    let Some(ret_id) = return_entry else {
                         // Nothing real to offer: reject instead of dummy.
                         let proposal_id = static_storage::swap::proposal_id(&proposal);
                         let reject = create_swap_reject(state.node_id, proposal_id, static_storage::swap::SwapRejectReason::NoCapacity);
@@ -1132,7 +1147,9 @@ pub async fn handle_message(
                     }
                     // Prepare phase: reserve capacity atomically (re-check
                     // under the same lock that reserves) but store nothing.
-                    let chunk_len = proposal.chunk.data.len() as u64;
+                    // The proposal carries no data (metadata-only wire),
+                    // so we reserve the fixed chunk size up front.
+                    let chunk_len = (static_storage::CHUNK_SIZE + 16) as u64;
                     {
                         let mut capacity = state.storage_capacity.lock().await;
                         if !capacity.can_accept(chunk_len, peer_chunks) {
@@ -1146,8 +1163,10 @@ pub async fn handle_message(
                         }
                         capacity.reserve(chunk_len);
                     }
-                    // Track the pending 2-phase swap: their chunk arrived
-                    // in-band and is buffered here, not in the holder.
+                    // Track the pending 2-phase swap. Their chunk data is
+                    // NOT on the wire: it arrives via the Sphinx-fragmented
+                    // retrieval phase, is verified against the proposal's
+                    // Merkle proof, and only then do we commit.
                     let pid = static_storage::swap::proposal_id(&proposal);
                     {
                         let mut swaps = state.swap_state.lock().await;
@@ -1156,10 +1175,13 @@ pub async fn handle_message(
                             proposal_id: pid,
                             peer: from,
                             our_chunk_id: ret_id,
-                            their_chunk_id: proposal.chunk.id,
-                            their_chunk_data: proposal.chunk.data.clone(),
+                            their_chunk_id: proposal.chunk_id,
+                            their_chunk_data: Vec::new(),
                             reserved_bytes: chunk_len,
-                            received_their_chunk: true,
+                            received_their_chunk: false,
+                            retrieval_requested: false,
+                            content_root: proposal.content_root,
+                            merkle_proof: proposal.merkle_proof.clone(),
                             sent_commit: false,
                             received_commit: false,
                             renewal_token: proposal.lease.renewal_token,
@@ -1170,34 +1192,24 @@ pub async fn handle_message(
                     }
 
                     let master_key = state.storage_key.lock().await.clone();
-                    let return_chunk = static_storage::EncryptedChunk {
-                        id: ret_id,
-                        data: ret_data,
-                    };
                     let accept = create_swap_accept(
                         state.node_id,
-                        return_chunk,
+                        ret_id,
                         &master_key,
                         pid,
                         86400,
                     );
 
-                    // Send the acceptance back; our own commit follows it
-                    // (we already hold their chunk, so we are ready).
+                    // Send the acceptance back. No commit yet: we still
+                    // have to retrieve and verify their chunk data via
+                    // the Sphinx retrieval protocol before we are ready
+                    // to finalize.
                     {
                         let connections = state.connections.read().await;
                         if let Some(sender) = connections.get(&from) {
                             let _ = sender.send(WireMessage::SwapAccept(accept)).await;
-                            let _ = sender
-                                .send(WireMessage::SwapCommit(crate::wire::SwapCommit {
-                                    proposal_id: pid,
-                                    from_node: state.node_id,
-                                }))
-                                .await;
                         }
                     }
-                    let mut swaps = state.swap_state.lock().await;
-                    swaps.mark_commit_sent(&pid);
                 }
                 Err(reason) => {
                     let proposal_id = static_storage::swap::proposal_id(&proposal);
@@ -1213,12 +1225,11 @@ pub async fn handle_message(
             }
         }
         WireMessage::SwapAccept(accept) => {
-            // Proposer side of the prepare phase: the accept carries their
-            // return chunk in-band. Validate, reserve capacity, buffer the
-            // chunk in the pending swap — and store nothing.
-            if accept.chunk.data.len() != static_storage::CHUNK_SIZE + 16 {
-                return Ok(());
-            }
+            // Proposer side of the prepare phase: the accept is
+            // metadata-only and names the return chunk by ID. Validate,
+            // reserve capacity for the (fixed-size) return chunk — and
+            // store nothing. The chunk data itself arrives via the
+            // Sphinx retrieval phase.
             let pid = accept.proposal_id;
             let has_pending = {
                 let swaps = state.swap_state.lock().await;
@@ -1228,7 +1239,7 @@ pub async fn handle_message(
                 // Stale or duplicate accept (no proposal in flight).
                 return Ok(());
             }
-            let chunk_len = accept.chunk.data.len() as u64;
+            let chunk_len = (static_storage::CHUNK_SIZE + 16) as u64;
             // Reserve capacity for their return chunk; abort the swap if
             // we cannot honor the barter.
             let fits = {
@@ -1259,10 +1270,8 @@ pub async fn handle_message(
             {
                 let mut swaps = state.swap_state.lock().await;
                 if let Some(swap) = swaps.pending_swaps.get_mut(&pid) {
-                    swap.their_chunk_id = accept.chunk.id;
-                    swap.their_chunk_data = accept.chunk.data.clone();
+                    swap.their_chunk_id = accept.chunk_id;
                     swap.reserved_bytes = chunk_len;
-                    swap.received_their_chunk = true;
                     // The return chunk's lease terms come from the
                     // accepter (it minted the lease). The return chunk
                     // carries no content binding in chunk-level barter,
@@ -1273,40 +1282,15 @@ pub async fn handle_message(
                     swap.lease_expires_at = accept.lease.expires_at;
                 }
             }
-            // We hold their chunk: send our commit (unless their commit
-            // already raced in and committed for us).
-            let need_commit = {
-                let mut swaps = state.swap_state.lock().await;
-                let already = swaps
-                    .get_pending_swap(&pid)
-                    .map(|s| s.sent_commit)
-                    .unwrap_or(false);
-                if !already {
-                    swaps.mark_commit_sent(&pid);
-                    true
-                } else {
-                    false
-                }
-            };
-            if need_commit {
-                send_swap_control(
-                    state,
-                    from,
-                    WireMessage::SwapCommit(crate::wire::SwapCommit {
-                        proposal_id: pid,
-                        from_node: state.node_id,
-                    }),
-                )
-                .await;
-            }
-            // Their commit may already have arrived (it travels with the
-            // accept): finalize now if both sides have committed.
-            finalize_swap_if_ready(state, &pid).await;
+            // No commit yet: we must first retrieve their chunk over the
+            // Sphinx retrieval protocol, verify it, and only then commit.
         }
         WireMessage::SwapCommit(commit) => {
             // Commit phase: the peer holds our chunk and is ready to
             // store. Finalize only when we have both sent and received
-            // a commit for the proposal (and hold their chunk).
+            // a commit for the proposal (and hold their chunk — it
+            // arrives via the retrieval phase, see
+            // `handle_swap_chunk_retrieval`).
             if commit.from_node != from {
                 return Ok(());
             }
@@ -1322,33 +1306,6 @@ pub async fn handle_message(
                     // Unknown proposal or wrong peer: ignore.
                     return Ok(());
                 }
-            }
-            // If we had not committed yet (their commit raced ahead of
-            // our send path), send ours now — we hold their chunk from
-            // the prepare phase, so we are ready.
-            let need_commit = {
-                let mut swaps = state.swap_state.lock().await;
-                let already = swaps
-                    .get_pending_swap(&pid)
-                    .map(|s| s.sent_commit)
-                    .unwrap_or(false);
-                if !already {
-                    swaps.mark_commit_sent(&pid);
-                    true
-                } else {
-                    false
-                }
-            };
-            if need_commit {
-                send_swap_control(
-                    state,
-                    from,
-                    WireMessage::SwapCommit(crate::wire::SwapCommit {
-                        proposal_id: pid,
-                        from_node: state.node_id,
-                    }),
-                )
-                .await;
             }
             {
                 let mut swaps = state.swap_state.lock().await;
@@ -1478,25 +1435,41 @@ pub async fn handle_message(
                                         })
                                         .collect()
                                 };
-                                let kem_lookup = |id: &NodeId| kem_map.get(id).cloned();
+                                let kem_lookup = move |id: &NodeId| kem_map.get(id).cloned();
 
-                                // Handle the retrieval request
-                                match handle_retrieval_request(&body, chunk_data.as_deref(), &kem_lookup) {
-                                    Ok(response_packets) => {
-                                        if request.return_route.hops.is_empty() {
-                                            return Ok(());
-                                        }
-                                        // Send each response packet to the first hop of the return route
-                                        let first_hop = request.return_route.hops[0].node_id;
-                                        for resp_packet in response_packets {
-                                            let connections = state.connections.read().await;
-                                            if let Some(sender) = connections.get(&first_hop) {
-                                                let _ = sender.send(WireMessage::Sphinx(resp_packet)).await;
+                                // Handle the retrieval request. The response
+                                // for a full-size chunk is ~1038 fragment
+                                // packets — more than the outbound channel
+                                // buffer — so building and sending runs in
+                                // a detached task: this handler executes
+                                // INLINE in the peer connection's read loop,
+                                // and blocking here on the node's own
+                                // outbound channel would deadlock (the
+                                // connection loop is the only drainer).
+                                let state_for_serve = state.clone();
+                                let body_for_serve = body.clone();
+                                tokio::spawn(async move {
+                                    match handle_retrieval_request(
+                                        &body_for_serve,
+                                        chunk_data.as_deref(),
+                                        &kem_lookup,
+                                    ) {
+                                        Ok(response_packets) => {
+                                            if request.return_route.hops.is_empty() {
+                                                return;
+                                            }
+                                            // Send each response packet to the first hop of the return route
+                                            let first_hop = request.return_route.hops[0].node_id;
+                                            for resp_packet in response_packets {
+                                                let connections = state_for_serve.connections.read().await;
+                                                if let Some(sender) = connections.get(&first_hop) {
+                                                    let _ = sender.send(WireMessage::Sphinx(resp_packet)).await;
+                                                }
                                             }
                                         }
+                                        Err(_) => {}
                                     }
-                                    Err(_) => {}
-                                }
+                                });
                             }
                             Err(_) => {
                                 // Not a chunk request - send to inbound channel
@@ -1537,14 +1510,129 @@ pub async fn handle_message(
     Ok(())
 }
 
+/// Feed a chunk retrieved via the Sphinx retrieval protocol into a
+/// pending 2-phase swap
+///
+/// Called by the node runner when a `ChunkResponse` completes: if the
+/// response's chunk ID matches a pending swap still waiting for data,
+/// the chunk is verified against the swap's stashed Merkle
+/// proof/root and buffered in the pending swap. On success we send our
+/// [`SwapCommit`](crate::wire::SwapCommit) (if not already sent) and
+/// finalize when both commits are in. On verification failure the swap
+/// is aborted, the reservation released, and a `SwapAbort` sent to the
+/// peer — nothing is ever stored.
+///
+/// Returns `true` when the chunk was consumed by a pending swap (the
+/// caller must then skip its normal retrieval path); `false` when the
+/// data belongs to an ordinary content retrieval.
+pub async fn handle_swap_chunk_retrieval(
+    state: &Arc<TransportState>,
+    chunk_id: &static_storage::ChunkId,
+    data: Vec<u8>,
+) -> bool {
+    // A swap chunk is always a full encrypted chunk; anything else
+    // belongs to the normal content retrieval path.
+    if data.len() != static_storage::CHUNK_SIZE + 16 {
+        return false;
+    }
+    // Find the pending swap waiting for this chunk (never nested locks:
+    // the swap lock is dropped before any other lock or send).
+    let (pid, peer, root, proof) = {
+        let swaps = state.swap_state.lock().await;
+        match swaps
+            .pending_swaps
+            .values()
+            .find(|s| !s.received_their_chunk && s.their_chunk_id == *chunk_id)
+        {
+            Some(swap) => (
+                swap.proposal_id,
+                swap.peer,
+                swap.content_root,
+                swap.merkle_proof.clone(),
+            ),
+            None => return false,
+        }
+    };
+    // Integrity gate (deferred from proposal time, where no data was
+    // present): the retrieved chunk must hash up the proposal's Merkle
+    // proof to its content root. An all-zero root marks a barter return
+    // chunk with no content binding (the proposer's side): the data is
+    // accepted as-is, exactly like the in-band accepts it replaces.
+    if root != [0u8; 32] {
+        let chunk = static_storage::EncryptedChunk {
+            id: *chunk_id,
+            data: data.clone(),
+        };
+        if !static_storage::integrity::verify_chunk(&chunk, &proof, &root) {
+            let swap = state.swap_state.lock().await.abort_swap(&pid);
+            if let Some(swap) = swap {
+                state
+                    .storage_capacity
+                    .lock()
+                    .await
+                    .release_reserved(swap.reserved_bytes, false);
+            }
+            send_swap_control(
+                state,
+                peer,
+                WireMessage::SwapAbort(crate::wire::SwapAbort {
+                    proposal_id: pid,
+                    from_node: state.node_id,
+                    reason: "retrieved chunk failed integrity verification".to_string(),
+                }),
+            )
+            .await;
+            warn!(
+                "Swap {:02x?}: retrieved chunk {:02x?} failed Merkle verification; aborted",
+                pid, chunk_id
+            );
+            return true;
+        }
+    }
+    let mut swaps = state.swap_state.lock().await;
+    if !swaps.receive_their_chunk(&pid, data) {
+        return false;
+    }
+    drop(swaps);
+    // We now hold their chunk: send our commit (unless it is already
+    // in flight), then finalize if their commit also arrived.
+    let need_commit = {
+        let mut swaps = state.swap_state.lock().await;
+        let already = swaps
+            .get_pending_swap(&pid)
+            .map(|s| s.sent_commit)
+            .unwrap_or(false);
+        if !already {
+            swaps.mark_commit_sent(&pid);
+            true
+        } else {
+            false
+        }
+    };
+    if need_commit {
+        send_swap_control(
+            state,
+            peer,
+            WireMessage::SwapCommit(crate::wire::SwapCommit {
+                proposal_id: pid,
+                from_node: state.node_id,
+            }),
+        )
+        .await;
+    }
+    finalize_swap_if_ready(state, &pid).await;
+    true
+}
+
 /// Finalize a pending 2-phase swap when both commits are in
 ///
-/// Called from the `SwapAccept` and `SwapCommit` handlers: whichever
-/// message completes the (sent_commit && received_commit &&
-/// received_their_chunk) condition finalizes. Stores the peer's chunk,
-/// converts the reserved capacity into stored bytes, records the barter
-/// and inserts the owner-keyed lease. Locks are taken one at a time
-/// (never nested). Returns `true` if the swap was finalized here.
+/// Called from the retrieval hook (`handle_swap_chunk_retrieval`) and
+/// the `SwapCommit` handler: whichever completes the (sent_commit &&
+/// received_commit && received_their_chunk) condition finalizes. Stores
+/// the peer's chunk, converts the reserved capacity into stored bytes,
+/// records the barter and inserts the owner-keyed lease. Locks are taken
+/// one at a time (never nested). Returns `true` if the swap was
+/// finalized here.
 async fn finalize_swap_if_ready(state: &Arc<TransportState>, pid: &[u8; 32]) -> bool {
     let Some(swap) = ({
         let mut swaps = state.swap_state.lock().await;
@@ -2182,12 +2270,13 @@ mod tests {
         server.await.unwrap();
     }
 
-    /// Build a swap proposal carrying a real chunk
+    /// Build a metadata-only swap proposal
     ///
-    /// Chunk data must be exactly `CHUNK_SIZE + 16` bytes and the lease
-    /// must be valid, or `decide_on_swap` rejects the proposal. A genuine
-    /// single-chunk Merkle proof is generated so the integrity check
-    /// passes.
+    /// The proposal carries only the chunk ID; `data` is used to
+    /// generate a genuine Merkle proof (which rides along for
+    /// retrieval-time verification of the chunk data). The lease must
+    /// be valid and the proposal Ed25519-signed with an ephemeral
+    /// content key so `decide_on_swap` accepts it.
     fn test_swap_proposal(from: NodeId, chunk_id: [u8; 32], data: Vec<u8>) -> static_storage::swap::SwapProposal {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2202,7 +2291,7 @@ mod tests {
         let content_id = *blake3::hash(&content_pub).as_bytes();
         let mut proposal = static_storage::swap::SwapProposal {
             from_node: from,
-            chunk,
+            chunk_id,
             lease: static_storage::ChunkLease {
                 chunk_id,
                 expires_at: now + 86400,
@@ -2226,10 +2315,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_swap_proposal_prepares_without_storing_then_commit_stores() {
-        // 2-phase accepter side: the proposal reserves capacity and
-        // buffers the offered chunk, but nothing is stored until the
-        // peer's SwapCommit arrives. The commit finalizes storage,
-        // converts the reservation, and inserts the owner-keyed lease.
+        // 2-phase accepter side, metadata-only wire: the proposal
+        // reserves capacity but nothing is stored and no data arrives.
+        // The retrieved chunk (fed via handle_swap_chunk_retrieval) is
+        // buffered pending commit; the peer's SwapCommit finalizes
+        // storage, converts the reservation, and inserts the
+        // owner-keyed lease.
         let leases: Arc<Mutex<LeaseManager>> = Arc::new(Mutex::new(LeaseManager::new()));
         let (state, _rx) = create_transport_state(
             random_node_id(),
@@ -2254,7 +2345,7 @@ mod tests {
         let proposal = test_swap_proposal(from, chunk_id, data.clone());
         let pid = static_storage::swap::proposal_id(&proposal);
 
-        // Prepare phase: reserve + buffer, store nothing.
+        // Prepare phase: reserve, store nothing (no data on the wire).
         handle_message(WireMessage::SwapProposal(proposal.clone()), &state, from)
             .await
             .unwrap();
@@ -2268,11 +2359,29 @@ mod tests {
         {
             let swaps = state.swap_state.lock().await;
             let pending = swaps.get_pending_swap(&pid).expect("pending swap recorded");
-            assert_eq!(pending.their_chunk_data, data);
-            assert_eq!(pending.peer, from);
-            assert!(pending.sent_commit, "accepter commits alongside the accept");
+            assert!(pending.their_chunk_data.is_empty());
+            assert!(!pending.received_their_chunk);
+            assert!(!pending.sent_commit, "no commit until data is retrieved");
             assert!(!pending.received_commit);
+            assert_eq!(pending.peer, from);
         }
+
+        // Retrieval phase: the peer's chunk data arrives via the Sphinx
+        // retrieval protocol and is consumed by the pending swap (which
+        // also emits our commit — dropped here, no connection).
+        let consumed =
+            handle_swap_chunk_retrieval(&state, &chunk_id, data.clone()).await;
+        assert!(consumed, "retrieved chunk matched the pending swap");
+
+        {
+            let swaps = state.swap_state.lock().await;
+            let pending = swaps.get_pending_swap(&pid).unwrap();
+            assert_eq!(pending.their_chunk_data, data);
+            assert!(pending.received_their_chunk);
+            assert!(pending.sent_commit, "commit sent after data retrieved");
+        }
+        // Still nothing stored before their commit.
+        assert!(state.chunk_holder.lock().await.get_chunk(&chunk_id).is_none());
 
         // Commit phase: the peer's commit finalizes the swap.
         handle_message(
@@ -2306,9 +2415,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_swap_proposer_commits_after_accept() {
-        // 2-phase proposer side: begin_swap_proposal tracks the pending
-        // swap; the accept reserves + buffers the return chunk (no
-        // storage); our commit + their commit finalize it.
+        // 2-phase proposer side, metadata-only: begin_swap_proposal
+        // tracks the pending swap; the metadata accept names the return
+        // chunk and reserves capacity (no storage); the retrieved data
+        // emits our commit; their commit finalizes it.
         let (state, _rx) = test_state(
             random_node_id(),
             MixNode::new(),
@@ -2323,12 +2433,12 @@ mod tests {
         );
         let pid = state.begin_swap_proposal(peer, &proposal).await;
 
-        // The accept carries their return chunk in-band.
+        // The metadata accept names their return chunk by ID.
         let their_id = [0xC2u8; 32];
         let their_data = vec![0x6Bu8; static_storage::CHUNK_SIZE + 16];
         let accept = create_swap_accept(
             peer,
-            static_storage::EncryptedChunk { id: their_id, data: their_data.clone() },
+            their_id,
             &static_crypto::SymmetricKey::random(),
             pid,
             86400,
@@ -2337,7 +2447,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Prepare phase on the proposer side: reserved, buffered, not stored.
+        // Prepare phase on the proposer side: reserved, not stored.
         assert!(state.chunk_holder.lock().await.get_chunk(&their_id).is_none());
         {
             let capacity = state.storage_capacity.lock().await;
@@ -2348,9 +2458,15 @@ mod tests {
             let swaps = state.swap_state.lock().await;
             let pending = swaps.get_pending_swap(&pid).expect("pending swap tracked");
             assert_eq!(pending.their_chunk_id, their_id);
-            assert_eq!(pending.their_chunk_data, their_data);
-            assert!(pending.sent_commit);
+            assert!(pending.their_chunk_data.is_empty());
+            assert!(!pending.sent_commit);
         }
+
+        // Retrieval phase: their chunk data arrives; our commit goes out
+        // (dropped here, no connection).
+        let consumed =
+            handle_swap_chunk_retrieval(&state, &their_id, their_data.clone()).await;
+        assert!(consumed);
 
         // Their commit arrives: finalize.
         handle_message(
@@ -2500,43 +2616,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dormant_swap_rejects_tampered_chunk() {
-        // Garbage-flooding protection end-to-end: a chunk tampered after
-        // proof generation must not be materialized by a dormant backup.
+    async fn test_swap_bad_chunk_data_aborts() {
+        // Garbage-flooding protection, retrieval phase: data fetched
+        // from the peer must verify against the proposal's Merkle proof
+        // before it can be stored. A tampered same-size payload aborts
+        // the swap: reservation released, nothing stored, abort recorded.
         let (state, _rx) = test_state(
             random_node_id(),
             MixNode::new(),
             crate::CoverTrafficConfig::default(),
             );
+        let existing_id = [0xB0u8; 32];
         state
-            .serve_enabled
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+            .chunk_holder
+            .lock()
+            .await
+            .add_chunk(existing_id, vec![0xAAu8; static_storage::CHUNK_SIZE + 16], [0u8; 32]);
+        state.storage_capacity.lock().await.record_accept((static_storage::CHUNK_SIZE + 16) as u64);
 
+        let from = random_node_id();
         let chunk_id = [0xB3u8; 32];
-        let mut proposal = test_swap_proposal(
-            random_node_id(),
-            chunk_id,
-            vec![0x5Eu8; static_storage::CHUNK_SIZE + 16],
-        );
-        let proof = proposal.merkle_proof.clone();
-        let root = proposal.content_root;
-        // Same size, different bytes: passes the size gate, fails integrity.
-        proposal.chunk.data[0] ^= 0xFF;
-        assert!(!static_storage::integrity::verify_chunk(
-            &proposal.chunk,
-            &proof,
-            &root
-        ));
+        let data = vec![0x5Eu8; static_storage::CHUNK_SIZE + 16];
+        let proposal = test_swap_proposal(from, chunk_id, data);
+        let pid = static_storage::swap::proposal_id(&proposal);
 
-        handle_message(WireMessage::SwapProposal(proposal), &state, random_node_id())
+        // Metadata proposal is accepted (integrity is data-bound and
+        // deferred to the retrieval phase).
+        handle_message(WireMessage::SwapProposal(proposal.clone()), &state, from)
+            .await
+            .unwrap();
+        assert!(state.swap_state.lock().await.get_pending_swap(&pid).is_some());
+
+        // Same size, different bytes than the proof was generated over.
+        let mut tampered = vec![0x5Eu8; static_storage::CHUNK_SIZE + 16];
+        tampered[0] ^= 0xFF;
+        let consumed = handle_swap_chunk_retrieval(&state, &chunk_id, tampered).await;
+        assert!(consumed, "bad data is consumed (and rejected), not stashed");
+
+        // The swap aborted: reservation released, nothing stored.
+        assert!(state.chunk_holder.lock().await.get_chunk(&chunk_id).is_none());
+        let capacity = state.storage_capacity.lock().await;
+        assert_eq!(capacity.reserved_bytes, 0);
+        assert_eq!(capacity.current_bytes, (static_storage::CHUNK_SIZE + 16) as u64);
+        drop(capacity);
+        let swaps = state.swap_state.lock().await;
+        assert!(swaps.get_pending_swap(&pid).is_none());
+        assert_eq!(swaps.aborted_swaps, vec![pid]);
+        assert!(swaps.completed_swaps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_swap_retrieval_unrelated_data_passes_through() {
+        // Data that does not match any pending swap chunk ID (e.g. an
+        // ordinary content retrieval response) is not consumed by the
+        // swap path.
+        let (state, _rx) = test_state(
+            random_node_id(),
+            MixNode::new(),
+            crate::CoverTrafficConfig::default(),
+        );
+        let from = random_node_id();
+        let chunk_id = [0xB6u8; 32];
+        let proposal = test_swap_proposal(from, chunk_id, vec![0x61u8; static_storage::CHUNK_SIZE + 16]);
+        handle_message(WireMessage::SwapProposal(proposal), &state, from)
             .await
             .unwrap();
 
-        // The tampered chunk was rejected (InvalidIntegrityTag), so the
-        // dormant backup stored nothing.
-        assert!(state.chunk_holder.lock().await.get_chunk(&chunk_id).is_none());
-        assert_eq!(state.storage_capacity.lock().await.current_bytes, 0);
-    }
+        let other_id = [0xB7u8; 32];
+        let other_data = vec![0x62u8; static_storage::CHUNK_SIZE + 16];
+        let consumed = handle_swap_chunk_retrieval(&state, &other_id, other_data).await;
+        assert!(!consumed);
+        // Wrong-size data is also passed through.
+        let consumed = handle_swap_chunk_retrieval(&state, &chunk_id, vec![1, 2, 3]).await;
+        assert!(!consumed);
+}
 
     #[tokio::test]
     async fn test_dormant_backup_ignores_chunk_request() {

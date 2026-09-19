@@ -3,22 +3,26 @@
 //! Implements the 1:1 storage barter system where nodes exchange
 //! opaque encrypted chunks without knowing what they contain.
 //!
-//! Protocol flow:
-//! 1. Node A wants to store 1 MiB. It creates a SwapProposal
-//!    containing one of its chunks and sends it to Node B.
-//! 2. Node B receives the proposal. If it has storage capacity and
-//!    accepts the barter, it creates a SwapAccept containing one of
-//!    its own chunks and sends it back.
-//! 3. Node A receives the acceptance. Both nodes now hold each
-//!    other's chunks and track the barter locally.
-//! 4. If Node B rejects, it sends a SwapReject.
+//! Protocol flow (2-phase commit, metadata-only wire messages):
+//! 1. Node A creates a metadata-only SwapProposal (chunk ID, lease,
+//!    Merkle root/proof, content signature) and sends it to Node B.
+//! 2. Node B validates and, if it accepts, reserves capacity and
+//!    replies with a metadata-only SwapAccept naming its own chunk.
+//! 3. Both sides retrieve each other's chunk over the Sphinx-fragmented
+//!    retrieval protocol (chunk payloads exceed the wire MTU and never
+//!    travel in the swap messages), verify the data against the
+//!    proposal's Merkle proof, and exchange SwapCommit.
+//! 4. On commit both sides store the retrieved chunk; on abort or
+//!    timeout (`DEFAULT_PENDING_SWAP_TIMEOUT_SECS`) reserved capacity
+//!    is released and nothing is stored.
+//! 5. If Node B rejects outright, it sends a SwapReject.
 //!
 //! The swap happens at the chunk level. Neither node knows what
 //! the chunks contain. The swap is a barter of opaque storage slots,
 //! not a barter of identified content.
 
 use crate::{
-    EncryptedChunk, ChunkLease, ChunkId, NodeId,
+    ChunkLease, ChunkId, NodeId,
     StorageError, create_lease, is_lease_valid,
     integrity::{MerkleProof, MerkleRoot},
 };
@@ -47,8 +51,9 @@ pub const DEFAULT_PENDING_SWAP_TIMEOUT_SECS: u64 = 300;
 
 /// Maximum concurrent pending 2-phase swaps (DoS bound)
 ///
-/// Each pending swap buffers two ~1 MiB chunk payloads until commit;
-/// the cap bounds the memory a flood of proposals can pin.
+/// Each pending swap reserves ~1 MiB of capacity and may buffer a
+/// retrieved chunk until commit; the cap bounds the memory a flood of
+/// proposals can pin.
 pub const MAX_PENDING_SWAPS: usize = 32;
 
 /// Get current unix timestamp
@@ -60,12 +65,17 @@ fn current_timestamp() -> u64 {
 }
 
 /// A swap proposal from one node to another
+///
+/// Metadata-only: chunk payloads exceed the padded wire MTU
+/// (`PADDED_MESSAGE_SIZE`), so the proposal carries the chunk ID and
+/// the cryptographic binding; the data itself is fetched via the
+/// Sphinx-fragmented retrieval protocol after the accept.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SwapProposal {
     /// The proposing node's ID
     pub from_node: NodeId,
     /// The chunk being offered
-    pub chunk: EncryptedChunk,
+    pub chunk_id: ChunkId,
     /// The lease associated with the chunk
     pub lease: ChunkLease,
     /// The master key (encrypted to the receiving node, or shared for barter)
@@ -85,7 +95,7 @@ pub struct SwapProposal {
     #[serde(default)]
     pub content_public_key: [u8; 32],
     /// Ed25519 signature over [`SwapProposal::signing_bytes`]
-    /// (`content_root || chunk.id || from_node`), 64 bytes when signed.
+    /// (`content_root || chunk_id || from_node`), 64 bytes when signed.
     ///
     /// Empty (`vec![]`) means unsigned — [`validate_swap_proposal`]
     /// rejects it with [`SwapRejectReason::InvalidSignature`].
@@ -96,13 +106,13 @@ pub struct SwapProposal {
 impl SwapProposal {
     /// Bytes covered by the content signature.
     ///
-    /// `content_root (32) || chunk.id (32) || from_node (16)` = 80 bytes.
+    /// `content_root (32) || chunk_id (32) || from_node (16)` = 80 bytes.
     /// Binds the offered chunk and its Merkle root to the sender so a
     /// captured signature cannot be replayed for a different root/chunk.
     pub fn signing_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(32 + 32 + 16);
         buf.extend_from_slice(&self.content_root);
-        buf.extend_from_slice(&self.chunk.id);
+        buf.extend_from_slice(&self.chunk_id);
         buf.extend_from_slice(&self.from_node);
         buf
     }
@@ -151,12 +161,15 @@ impl SwapProposal {
 }
 
 /// A swap acceptance
+///
+/// Metadata-only (see [`SwapProposal`]): names the return chunk by ID;
+/// the data is retrieved separately.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SwapAccept {
     /// The accepting node's ID
     pub from_node: NodeId,
     /// The chunk being offered in return
-    pub chunk: EncryptedChunk,
+    pub chunk_id: ChunkId,
     /// The lease associated with the return chunk
     pub lease: ChunkLease,
     /// The proposal ID this accepts (hash of the original proposal)
@@ -248,11 +261,10 @@ impl TryFrom<u8> for SwapRejectReason {
 /// State of a pending 2-phase swap
 ///
 /// Created in the prepare phase (proposal sent / accept sent): capacity
-/// is reserved and chunk payloads are buffered, but nothing is stored in
-/// the chunk holder. Storage happens only when both sides have sent and
-/// received their [`SwapCommit`]-equivalent (see `SwapState::mark_commit_
-/// received` callers); any failure or timeout aborts and releases the
-/// reservation.
+/// is reserved but nothing is stored in the chunk holder. The peer's
+/// chunk is fetched over the Sphinx-fragmented retrieval protocol and
+/// verified against the stashed `content_root`/`merkle_proof` before
+/// storage; any failure or timeout aborts and releases the reservation.
 #[derive(Debug, Clone)]
 pub struct PendingSwap {
     /// The proposal ID
@@ -265,15 +277,30 @@ pub struct PendingSwap {
     pub their_chunk_id: ChunkId,
     /// The chunk data they offered (held in reserve until commit)
     ///
-    /// Swaps carry chunks in-band (inside [`SwapProposal`] /
-    /// [`SwapAccept`]), so this is populated as soon as the peer's
-    /// message arrives; it is held here — not in the chunk holder —
-    /// until the commit phase.
+    /// Populated by the retrieval phase ([`SwapState::receive_their_
+    /// chunk`]); it is held here — not in the chunk holder — until the
+    /// commit phase.
     pub their_chunk_data: Vec<u8>,
     /// Size of the reserved capacity (bytes of `their_chunk_data`)
     pub reserved_bytes: u64,
-    /// Whether we've received their chunk (always true for in-band swaps)
+    /// Whether we've received their chunk (via the retrieval phase)
     pub received_their_chunk: bool,
+    /// Whether we've already sent a `ChunkRequest` for their chunk
+    ///
+    /// Set when the retrieval tick fires the request so it is not
+    /// re-sent every tick while the response is in flight.
+    pub retrieval_requested: bool,
+    /// Merkle root the retrieved chunk must verify against
+    ///
+    /// Stashed from the swap context because Merkle verification needs
+    /// the chunk data, which only arrives in the retrieval phase. An
+    /// all-zero root marks a barter return chunk with no content
+    /// binding (the proposer's side): its data is accepted without
+    /// Merkle verification, exactly like the in-band accepts it
+    /// replaces.
+    pub content_root: MerkleRoot,
+    /// Merkle proof for the retrieved chunk against `content_root`
+    pub merkle_proof: MerkleProof,
     /// Whether we've sent our commit
     pub sent_commit: bool,
     /// Whether we've received their commit
@@ -356,6 +383,35 @@ impl SwapState {
     pub fn mark_chunk_received(&mut self, proposal_id: &[u8; 32]) {
         if let Some(swap) = self.pending_swaps.get_mut(proposal_id) {
             swap.received_their_chunk = true;
+        }
+    }
+
+    /// Record their chunk data as received in a pending swap
+    ///
+    /// Called by the retrieval phase when the Sphinx-fragmented
+    /// `ChunkResponse` for `their_chunk_id` completes. Stores the data
+    /// in the pending swap (not the chunk holder — that happens at
+    /// commit) and marks it received. Returns `true` when a matching
+    /// pending swap existed.
+    pub fn receive_their_chunk(
+        &mut self,
+        proposal_id: &[u8; 32],
+        data: Vec<u8>,
+    ) -> bool {
+        match self.pending_swaps.get_mut(proposal_id) {
+            Some(swap) => {
+                swap.their_chunk_data = data;
+                swap.received_their_chunk = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Mark the retrieval request as in-flight for a pending swap
+    pub fn mark_retrieval_requested(&mut self, proposal_id: &[u8; 32]) {
+        if let Some(swap) = self.pending_swaps.get_mut(proposal_id) {
+            swap.retrieval_requested = true;
         }
     }
 
@@ -462,7 +518,7 @@ pub struct SwapStats {
 
 /// Compute a proposal ID (C2 idempotency).
 ///
-/// `blake3(chunk.id || from_node || content_root || lease.expires_at_be)`.
+/// `blake3(chunk_id || from_node || content_root || lease.expires_at_be)`.
 ///
 /// Binding the content root and lease expiry makes the ID unique per
 /// (chunk, sender, content, lease): re-proposals for the same lease
@@ -472,7 +528,7 @@ pub struct SwapStats {
 pub fn proposal_id(proposal: &SwapProposal) -> [u8; 32] {
     use blake3;
     let mut input = Vec::with_capacity(32 + 16 + 32 + 8);
-    input.extend_from_slice(&proposal.chunk.id);
+    input.extend_from_slice(&proposal.chunk_id);
     input.extend_from_slice(&proposal.from_node);
     input.extend_from_slice(&proposal.content_root);
     input.extend_from_slice(&proposal.lease.expires_at.to_be_bytes());
@@ -484,19 +540,22 @@ pub fn proposal_id(proposal: &SwapProposal) -> [u8; 32] {
 
 /// Create a swap proposal for a chunk
 ///
+/// Metadata-only: pass the offered chunk's ID (the data stays in the
+/// holder and is fetched by the peer via the retrieval protocol).
+///
 /// `content_root` and `merkle_proof` come from
 /// [`crate::integrity::generate_proofs`] over the content's chunks; the
-/// receiver verifies them before accepting.
+/// receiver verifies the retrieved data against them before committing.
 ///
 /// `content_id` must be `blake3(content_public_key)`. If
 /// `content_signing_key` is `Some`, the proposal is signed over
 /// [`SwapProposal::signing_bytes`] (Ed25519 over
-/// `content_root || chunk.id || from_node`); if `None`, the signature
+/// `content_root || chunk_id || from_node`); if `None`, the signature
 /// is left empty (unsigned — validation rejects it, useful for tests
 /// that exercise the unsigned path).
 pub fn create_swap_proposal(
     from_node: NodeId,
-    chunk: EncryptedChunk,
+    chunk_id: ChunkId,
     master_key: &SymmetricKey,
     lease_duration_secs: u64,
     content_root: MerkleRoot,
@@ -506,7 +565,7 @@ pub fn create_swap_proposal(
     content_signing_key: Option<&ed25519_dalek::SigningKey>,
 ) -> SwapProposal {
     let lease = create_lease(
-        &chunk.id,
+        &chunk_id,
         master_key,
         lease_duration_secs,
         current_timestamp(),
@@ -518,7 +577,7 @@ pub fn create_swap_proposal(
     // In a real implementation, this would be encrypted to the receiver's public key
     let mut proposal = SwapProposal {
         from_node,
-        chunk,
+        chunk_id,
         lease,
         encrypted_master_key: vec![],
         content_root,
@@ -541,15 +600,18 @@ pub fn create_swap_proposal(
 }
 
 /// Create a swap acceptance
+///
+/// Metadata-only: names the return chunk by ID; the proposer fetches
+/// its data via the retrieval protocol.
 pub fn create_swap_accept(
     from_node: NodeId,
-    chunk: EncryptedChunk,
+    chunk_id: ChunkId,
     master_key: &SymmetricKey,
     proposal_id: [u8; 32],
     lease_duration_secs: u64,
 ) -> SwapAccept {
     let lease = create_lease(
-        &chunk.id,
+        &chunk_id,
         master_key,
         lease_duration_secs,
         current_timestamp(),
@@ -557,7 +619,7 @@ pub fn create_swap_accept(
 
     SwapAccept {
         from_node,
-        chunk,
+        chunk_id,
         lease,
         proposal_id,
         encrypted_master_key: vec![],
@@ -577,49 +639,34 @@ pub fn create_swap_reject(
     }
 }
 
-/// Validate a swap proposal
+/// Validate a swap proposal (metadata-only)
 ///
 /// Checks:
-/// 1. Chunk size is correct (1 MiB + 16 byte tag)
-/// 2. Lease is valid
-/// 3. Content binding: `blake3(content_public_key) == content_id`
-/// 4. Content signature: 64-byte Ed25519 over
-///    `content_root || chunk.id || from_node` verifies
-/// 5. Chunk verifies against its Merkle proof and content root
+/// 1. Lease is valid
+/// 2. Content binding: `blake3(content_public_key) == content_id`
+/// 3. Content signature: 64-byte Ed25519 over
+///    `content_root || chunk_id || from_node` verifies
+///
+/// The proposal carries no chunk data, so chunk size and Merkle
+/// integrity cannot be checked here; the retrieved data is verified
+/// against `content_root`/`merkle_proof` in the retrieval phase
+/// (see `PendingSwap`).
 ///
 /// Binding/signature failures return [`SwapRejectReason::InvalidSignature`].
-/// The signature is checked before the Merkle proof so a tampered
-/// `content_root` fails as `InvalidSignature` (auth), not
-/// `InvalidIntegrityTag`.
 pub fn validate_swap_proposal(
     proposal: &SwapProposal,
-    expected_chunk_size: usize,
     current_time: u64,
 ) -> Result<(), SwapRejectReason> {
-    // Check chunk size
-    if proposal.chunk.data.len() != expected_chunk_size {
-        return Err(SwapRejectReason::InvalidChunkSize);
-    }
-
     // Check lease
     if !is_lease_valid(&proposal.lease, current_time) {
         return Err(SwapRejectReason::InvalidLease);
     }
 
-    // Check content auth (binding + signature) before Merkle so root
-    // tampering is attributed as an auth failure.
+    // Check content auth (binding + signature). The signature covers
+    // the content root, so root tampering is attributed as an auth
+    // failure; Merkle verification of the actual data happens at
+    // retrieval time.
     proposal.verify_content_signature()?;
-
-    // Check integrity: the chunk must hash up the Merkle proof to the
-    // content root, proving it is a real shard of some published content
-    // (garbage-flooding protection).
-    if !crate::integrity::verify_chunk(
-        &proposal.chunk,
-        &proposal.merkle_proof,
-        &proposal.content_root,
-    ) {
-        return Err(SwapRejectReason::InvalidIntegrityTag);
-    }
 
     Ok(())
 }
@@ -709,8 +756,11 @@ impl StorageCapacity {
 /// Considers:
 /// 1. Available storage capacity
 /// 2. Number of chunks already from this peer
-/// 3. Chunk validity
+/// 3. Proposal validity (lease + content signature)
 /// 4. Peer's credit (from accounting)
+///
+/// `expected_chunk_size` is the size the retrieved chunk is expected to
+/// occupy (reserved up front; the proposal itself carries no data).
 pub fn decide_on_swap(
     proposal: &SwapProposal,
     capacity: &StorageCapacity,
@@ -719,10 +769,10 @@ pub fn decide_on_swap(
     current_time: u64,
 ) -> Result<(), SwapRejectReason> {
     // Validate the proposal
-    validate_swap_proposal(proposal, expected_chunk_size, current_time)?;
+    validate_swap_proposal(proposal, current_time)?;
 
     // Check capacity
-    if !capacity.can_accept(proposal.chunk.data.len() as u64, peer_chunks) {
+    if !capacity.can_accept(expected_chunk_size as u64, peer_chunks) {
         if peer_chunks >= capacity.max_chunks_per_peer {
             return Err(SwapRejectReason::TooManyFromPeer);
         }
@@ -758,12 +808,12 @@ mod tests {
         encrypt_chunk(&master, &nonce, 0, &plaintext).unwrap()
     }
 
-    /// Build a swap proposal carrying a genuine Merkle proof for its chunk
+    /// Build a metadata-only swap proposal carrying a genuine Merkle
+    /// proof for its chunk
     ///
-    /// Validation now verifies integrity and content auth, so every
-    /// proposal under test must carry a real proof generated over the
-    /// chunk data plus a valid Ed25519 content signature with
-    /// `content_id = blake3(content_public_key)`.
+    /// Validation verifies content auth (lease + Ed25519 signature with
+    /// `content_id = blake3(content_public_key)`); the proof rides along
+    /// for retrieval-time integrity verification of the chunk data.
     fn make_proposal(
         node_id: NodeId,
         chunk: EncryptedChunk,
@@ -780,7 +830,7 @@ mod tests {
         let content_id = *blake3::hash(&content_public_key).as_bytes();
         create_swap_proposal(
             node_id,
-            chunk,
+            chunk.id,
             master,
             lease_duration_secs,
             root,
@@ -806,7 +856,7 @@ mod tests {
         let cid = *blake3::hash(&pk).as_bytes();
         create_swap_proposal(
             node_id,
-            chunk,
+            chunk.id,
             master,
             lease_duration_secs,
             root,
@@ -831,7 +881,7 @@ mod tests {
         );
 
         assert_eq!(proposal.from_node, node_id);
-        assert_eq!(proposal.chunk.id, chunk.id);
+        assert_eq!(proposal.chunk_id, chunk.id);
         assert!(is_lease_valid(&proposal.lease, current_timestamp()));
         // Content auth is bound: blake3(pub) == content_id and signature verifies.
         assert_eq!(*blake3::hash(&proposal.content_public_key).as_bytes(), proposal.content_id);
@@ -848,14 +898,14 @@ mod tests {
 
         let accept = create_swap_accept(
             node_id,
-            chunk.clone(),
+            chunk.id,
             &master,
             proposal_id,
             DEFAULT_LEASE_DURATION_SECS,
         );
 
         assert_eq!(accept.from_node, node_id);
-        assert_eq!(accept.chunk.id, chunk.id);
+        assert_eq!(accept.chunk_id, chunk.id);
         assert_eq!(accept.proposal_id, proposal_id);
         assert!(is_lease_valid(&accept.lease, current_timestamp()));
     }
@@ -932,21 +982,22 @@ mod tests {
 
         let proposal = make_proposal(node_id, chunk, &master, 3600);
 
-        let result = validate_swap_proposal(&proposal, CHUNK_SIZE + 16, current_timestamp());
+        let result = validate_swap_proposal(&proposal, current_timestamp());
         assert!(result.is_ok());
     }
 
     #[test]
-    fn test_validate_invalid_chunk_size() {
+    fn test_validate_metadata_only() {
+        // Validation succeeds with no chunk data present: the proposal
+        // is metadata-only and integrity is deferred to retrieval time.
         let node_id = random_node_id();
         let chunk = random_chunk();
         let master = SymmetricKey::random();
 
         let proposal = make_proposal(node_id, chunk, &master, 3600);
 
-        // Wrong expected size
-        let result = validate_swap_proposal(&proposal, 512, current_timestamp());
-        assert_eq!(result.unwrap_err(), SwapRejectReason::InvalidChunkSize);
+        assert_eq!(proposal.chunk_id.len(), 32);
+        assert!(validate_swap_proposal(&proposal, current_timestamp()).is_ok());
     }
 
     #[test]
@@ -959,36 +1010,33 @@ mod tests {
 
         // Check with time far in the future
         let future_time = current_timestamp() + 7200;
-        let result = validate_swap_proposal(&proposal, CHUNK_SIZE + 16, future_time);
+        let result = validate_swap_proposal(&proposal, future_time);
         assert_eq!(result.unwrap_err(), SwapRejectReason::InvalidLease);
     }
 
     #[test]
-    fn test_validate_valid_integrity() {
-        // A proposal carrying a genuine proof passes the integrity check.
+    fn test_retrieval_data_verifies_against_proof() {
+        // The Merkle check deferred to the retrieval phase: data fetched
+        // from the peer must verify against the proposal's proof/root.
         let node_id = random_node_id();
         let chunk = random_chunk();
         let master = SymmetricKey::random();
 
-        let proposal = make_proposal(node_id, chunk, &master, 3600);
+        let proposal = make_proposal(node_id, chunk.clone(), &master, 3600);
+        assert!(crate::integrity::verify_chunk(
+            &chunk,
+            &proposal.merkle_proof,
+            &proposal.content_root
+        ));
 
-        let result = validate_swap_proposal(&proposal, CHUNK_SIZE + 16, current_timestamp());
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_validate_invalid_integrity() {
-        // Tampering with the chunk data after proof generation (same size,
-        // different bytes) fails with InvalidIntegrityTag.
-        let node_id = random_node_id();
-        let master = SymmetricKey::random();
-
-        let proposal = make_proposal(node_id, random_chunk(), &master, 3600);
-        let mut tampered = proposal;
-        tampered.chunk.data[0] ^= 0xFF;
-
-        let result = validate_swap_proposal(&tampered, CHUNK_SIZE + 16, current_timestamp());
-        assert_eq!(result.unwrap_err(), SwapRejectReason::InvalidIntegrityTag);
+        // Tampered same-size data fails verification.
+        let mut bad = chunk;
+        bad.data[0] ^= 0xFF;
+        assert!(!crate::integrity::verify_chunk(
+            &bad,
+            &proposal.merkle_proof,
+            &proposal.content_root
+        ));
     }
 
     #[test]
@@ -1003,7 +1051,7 @@ mod tests {
         let mut tampered = proposal;
         tampered.content_root[0] ^= 0xFF;
 
-        let result = validate_swap_proposal(&tampered, CHUNK_SIZE + 16, current_timestamp());
+        let result = validate_swap_proposal(&tampered, current_timestamp());
         assert_eq!(result.unwrap_err(), SwapRejectReason::InvalidSignature);
     }
 
@@ -1018,7 +1066,7 @@ mod tests {
         let mut tampered = proposal;
         tampered.content_id = [0xFFu8; 32];
 
-        let result = validate_swap_proposal(&tampered, CHUNK_SIZE + 16, current_timestamp());
+        let result = validate_swap_proposal(&tampered, current_timestamp());
         assert_eq!(result.unwrap_err(), SwapRejectReason::InvalidSignature);
     }
 
@@ -1031,7 +1079,7 @@ mod tests {
         let proposal = make_unsigned_proposal(node_id, random_chunk(), &master, 3600);
         assert!(proposal.content_signature.is_empty());
 
-        let result = validate_swap_proposal(&proposal, CHUNK_SIZE + 16, current_timestamp());
+        let result = validate_swap_proposal(&proposal, current_timestamp());
         assert_eq!(result.unwrap_err(), SwapRejectReason::InvalidSignature);
     }
 
@@ -1045,7 +1093,7 @@ mod tests {
         let mut tampered = proposal;
         tampered.content_signature[0] ^= 0xFF;
 
-        let result = validate_swap_proposal(&tampered, CHUNK_SIZE + 16, current_timestamp());
+        let result = validate_swap_proposal(&tampered, current_timestamp());
         assert_eq!(result.unwrap_err(), SwapRejectReason::InvalidSignature);
     }
 
@@ -1067,7 +1115,7 @@ mod tests {
         let bytes = proposal.signing_bytes();
         assert_eq!(bytes.len(), 32 + 32 + 16);
         assert_eq!(&bytes[..32], &proposal.content_root);
-        assert_eq!(&bytes[32..64], &proposal.chunk.id);
+        assert_eq!(&bytes[32..64], &proposal.chunk_id);
         assert_eq!(&bytes[64..], &proposal.from_node);
     }
 
@@ -1220,6 +1268,12 @@ mod tests {
             their_chunk_data: vec![0xEEu8; 64],
             reserved_bytes: 64,
             received_their_chunk: true,
+            retrieval_requested: false,
+            content_root: [0u8; 32],
+            merkle_proof: crate::integrity::MerkleProof {
+                leaf_index: 0,
+                siblings: vec![],
+            },
             sent_commit: false,
             received_commit: false,
             renewal_token: [0u8; 32],
@@ -1249,6 +1303,35 @@ mod tests {
     }
 
     #[test]
+    fn test_receive_their_chunk_via_retrieval() {
+        // A fresh pending swap has no data; receive_their_chunk fills it
+        // in and flips the flag, mark_retrieval_requested records the
+        // in-flight request, and unknown IDs are ignored.
+        let peer = random_node_id();
+        let chunk_id = random_chunk_id();
+        let pid = [0x06u8; 32];
+        let mut state = SwapState::new();
+        let mut swap = test_pending_swap(peer, pid, chunk_id);
+        swap.their_chunk_data = vec![];
+        swap.received_their_chunk = false;
+        state.start_pending_swap(swap);
+
+        assert!(!state.mark_commit_received(&pid)); // no data yet
+        assert!(!state.receive_their_chunk(&[0xFFu8; 32], vec![1]));
+        assert!(state.receive_their_chunk(&pid, vec![0xEEu8; 64]));
+
+        let swap = state.get_pending_swap(&pid).unwrap();
+        assert!(swap.received_their_chunk);
+        assert_eq!(swap.their_chunk_data, vec![0xEEu8; 64]);
+
+        state.mark_commit_sent(&pid);
+        assert!(state.mark_commit_received(&pid));
+
+        state.mark_retrieval_requested(&pid);
+        assert!(state.get_pending_swap(&pid).unwrap().retrieval_requested);
+    }
+
+    #[test]
     fn test_pending_swap_both_commit() {
         // Both commits -> swap completes: chunk becomes active, pending
         // entry removed, completion recorded.
@@ -1259,8 +1342,9 @@ mod tests {
         state.start_pending_swap(test_pending_swap(peer, pid, chunk_id));
 
         state.mark_commit_sent(&pid);
-        // Their chunk arrived in-band with the proposal, so receiving
-        // their commit completes the swap on our side immediately.
+        // Their chunk arrived via the retrieval phase before their
+        // commit, so receiving their commit completes the swap on our
+        // side immediately.
         assert!(state.mark_commit_received(&pid));
         let swap = state.complete_swap(&pid).unwrap();
 
